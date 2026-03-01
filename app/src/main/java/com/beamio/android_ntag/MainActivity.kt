@@ -104,11 +104,25 @@ import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.tooling.preview.Preview
+import coil.compose.AsyncImage
 import com.beamio.android_ntag.ui.theme.AndroidNTAGTheme
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 
-/** getUIDAssets API 返回结构 */
+/** getUIDAssets API 返回结构；多卡时使用 cards，兼容单卡 legacy 字段。cardBackground/cardImage 来自该卡用户拥有的最佳 NFT 的 tier metadata；tierName/tierDescription 来自 tier 或卡级 metadata。 */
+internal data class CardItem(
+    val cardAddress: String,
+    val cardName: String,
+    val cardType: String,
+    val points: String,
+    val points6: String,
+    val cardCurrency: String,
+    val nfts: List<NftItem>,
+    val cardBackground: String? = null,
+    val cardImage: String? = null,
+    val tierName: String? = null,
+    val tierDescription: String? = null
+)
 internal data class UIDAssets(
     val ok: Boolean,
     val address: String? = null,
@@ -118,6 +132,7 @@ internal data class UIDAssets(
     val usdcBalance: String? = null,
     val cardCurrency: String? = null,
     val nfts: List<NftItem>? = null,
+    val cards: List<CardItem>? = null,
     val error: String? = null
 )
 internal data class NftItem(
@@ -177,6 +192,10 @@ class MainActivity : ComponentActivity() {
         const val SUN_BASE_URL = "https://api.beamio.app/api/sun"
         /** 与 SilentPassUI utils/constants.ts beamioApi 一致 */
         const val BEAMIO_API = "https://beamio.app"
+        /** 基础设施卡（与 SilentPassUI BEAMIO_USER_CARD_ASSET_ADDRESS 一致，新创建卡合约地址） */
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xB7644DDb12656F4854dC746464af47D33C206F0E"
+        /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
+        private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
     }
 
     private var showTopupScreen by mutableStateOf(false)
@@ -190,6 +209,9 @@ class MainActivity : ComponentActivity() {
     private var topupScreenPostBalance by mutableStateOf<String?>(null)
     private var topupScreenCardCurrency by mutableStateOf<String?>(null)
     private var topupScreenAddress by mutableStateOf<String?>(null)
+    private var topupScreenCardBackground by mutableStateOf<String?>(null)
+    private var topupScreenCardImage by mutableStateOf<String?>(null)
+    private var topupScreenTierDescription by mutableStateOf<String?>(null)
     private var topupArmed by mutableStateOf(false)
 
     private var showReadScreen by mutableStateOf(false)
@@ -294,6 +316,9 @@ class MainActivity : ComponentActivity() {
                 topupScreenPostBalance = null
                 topupScreenCardCurrency = null
                 topupScreenAddress = null
+                topupScreenCardBackground = null
+                topupScreenCardImage = null
+                topupScreenTierDescription = null
                 topupArmed = false
                 executeWalletTopup(wallet, topupScreenAmount)
             }
@@ -350,6 +375,9 @@ class MainActivity : ComponentActivity() {
                         postBalance = topupScreenPostBalance,
                         cardCurrency = topupScreenCardCurrency,
                         address = topupScreenAddress,
+                        cardBackground = topupScreenCardBackground,
+                        cardImage = topupScreenCardImage,
+                        tierDescription = topupScreenTierDescription,
                         onBack = { closeTopupScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -598,6 +626,9 @@ class MainActivity : ComponentActivity() {
                 topupScreenPostBalance = null
                 topupScreenCardCurrency = null
                 topupScreenAddress = null
+                topupScreenCardBackground = null
+                topupScreenCardImage = null
+                topupScreenTierDescription = null
                 topupArmed = true
                 readArmed = false
                 initArmed = false
@@ -650,6 +681,9 @@ class MainActivity : ComponentActivity() {
                 topupScreenPostBalance = null
                 topupScreenCardCurrency = null
                 topupScreenAddress = null
+                topupScreenCardBackground = null
+                topupScreenCardImage = null
+                topupScreenTierDescription = null
                 topupArmed = true
                 readArmed = false
                 initArmed = false
@@ -713,11 +747,6 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                runOnUiThread {
-                    topupScreenPreBalance = preAssets.points
-                    topupScreenCardCurrency = preAssets.cardCurrency
-                    topupScreenAddress = preAssets.address
-                }
 
                 val prepare = nfcTopupPrepare(uid, amount)
                 if (prepare.error != null) {
@@ -732,6 +761,20 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
+                // 多卡时使用 topup 所使用的卡的余额与货币，而非首卡/CCSA
+                val cardAddr = prepare.cardAddr!!
+                val topupCard = preAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
+                val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
+                val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
+                runOnUiThread {
+                    topupScreenPreBalance = preBalanceStr
+                    topupScreenCardCurrency = preCurrency
+                    topupScreenAddress = preAssets.address
+                    topupScreenCardBackground = topupCard?.cardBackground
+                    topupScreenCardImage = topupCard?.cardImage
+                    topupScreenTierDescription = topupCard?.tierDescription
+                }
+
                 val adminSig = BeamioWeb3Wallet.signExecuteForAdmin(
                     prepare.cardAddr!!,
                     prepare.data!!,
@@ -742,7 +785,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     val fromScan = nfcFetchingInfo
                     if (result.success) {
-                        val preNum = topupScreenPreBalance?.toDoubleOrNull() ?: 0.0
+                        val preNum = preBalanceStr.toDoubleOrNull() ?: 0.0
                         val amtNum = amount.toDoubleOrNull() ?: 0.0
                         topupScreenPostBalance = "%.2f".format(preNum + amtNum)
                         topupScreenStatus = TopupStatus.Success
@@ -804,6 +847,7 @@ class MainActivity : ComponentActivity() {
             if (wallet != null) put("wallet", wallet)
             put("amount", amount)
             put("currency", "CAD")
+            put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
         }.toString()
         conn.outputStream.use { os ->
             os.write(body.toByteArray(Charsets.UTF_8))
@@ -838,11 +882,6 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                runOnUiThread {
-                    topupScreenPreBalance = preAssets.points
-                    topupScreenCardCurrency = preAssets.cardCurrency
-                    topupScreenAddress = preAssets.address
-                }
 
                 val prepare = nfcTopupPrepareWithWallet(wallet, amount)
                 if (prepare.error != null) {
@@ -852,6 +891,20 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
+                // 多卡时使用 topup 所使用的卡的余额与货币，而非首卡/CCSA
+                val cardAddr = prepare.cardAddr!!
+                val topupCard = preAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
+                val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
+                val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
+                runOnUiThread {
+                    topupScreenPreBalance = preBalanceStr
+                    topupScreenCardCurrency = preCurrency
+                    topupScreenAddress = preAssets.address
+                    topupScreenCardBackground = topupCard?.cardBackground
+                    topupScreenCardImage = topupCard?.cardImage
+                    topupScreenTierDescription = topupCard?.tierDescription
+                }
+
                 val adminSig = BeamioWeb3Wallet.signExecuteForAdmin(
                     prepare.cardAddr!!,
                     prepare.data!!,
@@ -861,7 +914,7 @@ class MainActivity : ComponentActivity() {
                 val result = nfcTopupWithWallet(wallet, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig)
                 runOnUiThread {
                     if (result.success) {
-                        val preNum = topupScreenPreBalance?.toDoubleOrNull() ?: 0.0
+                        val preNum = preBalanceStr.toDoubleOrNull() ?: 0.0
                         val amtNum = amount.toDoubleOrNull() ?: 0.0
                         topupScreenPostBalance = "%.2f".format(preNum + amtNum)
                         topupScreenStatus = TopupStatus.Success
@@ -1206,7 +1259,10 @@ class MainActivity : ComponentActivity() {
                 val respBody = if (code in 200..299) conn.inputStream else conn.errorStream
                 val json = respBody?.use { it.bufferedReader().readText() } ?: "{}"
                 conn.disconnect()
+                // Debug: 与服务器返回一致，便于排查 cardBackground 未解析/未渲染
+                Log.d("getUIDAssets", "response JSON length=${json.length} preview=${json.take(800)}")
                 val parsed = parseUidAssetsJson(json)
+                Log.d("getUIDAssets", "parsed cards: ${parsed.cards?.joinToString { "${it.cardName}(cardBackground=${it.cardBackground})" } ?: "null"}")
                 val displayError = if (parsed.ok) null else (parsed.error ?: "查询失败")
                 runOnUiThread {
                     val fromScan = nfcFetchingInfo
@@ -1245,7 +1301,7 @@ class MainActivity : ComponentActivity() {
 
     private fun parseUidAssetsJson(json: String): UIDAssets {
         return try {
-            val root = org.json.JSONObject(json) // Android SDK built-in
+            val root = org.json.JSONObject(json)
             val nftsArr = root.optJSONArray("nfts")
             val nfts = mutableListOf<NftItem>()
             if (nftsArr != null) {
@@ -1260,17 +1316,72 @@ class MainActivity : ComponentActivity() {
                     ))
                 }
             }
-            UIDAssets(
-                ok = root.optBoolean("ok", false),
-                address = root.optString("address").takeIf { it.isNotEmpty() },
-                cardAddress = root.optString("cardAddress").takeIf { it.isNotEmpty() },
-                points = root.optString("points").takeIf { it.isNotEmpty() },
-                points6 = root.optString("points6").takeIf { it.isNotEmpty() },
-                usdcBalance = root.optString("usdcBalance").takeIf { it.isNotEmpty() },
-                cardCurrency = root.optString("cardCurrency").takeIf { it.isNotEmpty() },
-                nfts = nfts.takeIf { it.isNotEmpty() },
-                error = root.optString("error").takeIf { it.isNotEmpty() }
-            )
+            val cardsArr = root.optJSONArray("cards")
+            val rawCards = if (cardsArr != null && cardsArr.length() > 0) {
+                (0 until cardsArr.length()).map { idx ->
+                    val c = cardsArr.getJSONObject(idx)
+                    val cnfts = c.optJSONArray("nfts") ?: org.json.JSONArray()
+                    val nftList = (0 until cnfts.length()).map { i ->
+                        val o = cnfts.getJSONObject(i)
+                        NftItem(
+                            tokenId = o.optString("tokenId", ""),
+                            attribute = o.optString("attribute", ""),
+                            tier = o.optString("tier", ""),
+                            expiry = o.optString("expiry", ""),
+                            isExpired = o.optBoolean("isExpired", false)
+                        )
+                    }
+                    val cardBgRaw = c.optString("cardBackground", "")
+                    if (cardBgRaw.isNotEmpty()) Log.d("getUIDAssets", "card[$idx] ${c.optString("cardName")} cardBackground raw=\"$cardBgRaw\"")
+                    CardItem(
+                        cardAddress = c.optString("cardAddress", ""),
+                        cardName = c.optString("cardName", "Card"),
+                        cardType = c.optString("cardType", ""),
+                        points = c.optString("points", "0"),
+                        points6 = c.optString("points6", "0"),
+                        cardCurrency = c.optString("cardCurrency", "CAD"),
+                        nfts = nftList,
+                        cardBackground = cardBgRaw.takeIf { it.isNotEmpty() },
+                        cardImage = c.optString("cardImage").takeIf { it.isNotEmpty() },
+                        tierName = c.optString("tierName").takeIf { it.isNotEmpty() },
+                        tierDescription = c.optString("tierDescription").takeIf { it.isNotEmpty() }
+                    )
+                }
+            } else {
+                null
+            }
+            // 过滤掉已废弃的旧卡地址
+            val cards = rawCards?.filter { !it.cardAddress.equals(DEPRECATED_CARD_ADDRESS, ignoreCase = true) }?.takeIf { it.isNotEmpty() }
+            if (cards != null) {
+                val first = cards.firstOrNull()
+                UIDAssets(
+                    ok = root.optBoolean("ok", false),
+                    address = root.optString("address").takeIf { it.isNotEmpty() },
+                    cardAddress = first?.cardAddress,
+                    points = first?.points,
+                    points6 = first?.points6,
+                    usdcBalance = root.optString("usdcBalance").takeIf { it.isNotEmpty() },
+                    cardCurrency = first?.cardCurrency,
+                    nfts = first?.nfts?.takeIf { it.isNotEmpty() },
+                    cards = cards,
+                    error = root.optString("error").takeIf { it.isNotEmpty() }
+                )
+            } else {
+                val legacyCardAddr = root.optString("cardAddress").takeIf { it.isNotEmpty() }
+                val isDeprecatedLegacy = legacyCardAddr?.equals(DEPRECATED_CARD_ADDRESS, ignoreCase = true) == true
+                UIDAssets(
+                    ok = root.optBoolean("ok", false),
+                    address = root.optString("address").takeIf { it.isNotEmpty() },
+                    cardAddress = if (isDeprecatedLegacy) null else legacyCardAddr,
+                    points = if (isDeprecatedLegacy) null else root.optString("points").takeIf { it.isNotEmpty() },
+                    points6 = if (isDeprecatedLegacy) null else root.optString("points6").takeIf { it.isNotEmpty() },
+                    usdcBalance = root.optString("usdcBalance").takeIf { it.isNotEmpty() },
+                    cardCurrency = if (isDeprecatedLegacy) null else root.optString("cardCurrency").takeIf { it.isNotEmpty() },
+                    nfts = if (isDeprecatedLegacy) null else nfts.takeIf { it.isNotEmpty() },
+                    cards = null,
+                    error = root.optString("error").takeIf { it.isNotEmpty() }
+                )
+            }
         } catch (_: Exception) {
             UIDAssets(ok = false, error = "解析响应失败")
         }
@@ -1906,6 +2017,9 @@ internal fun TopupScreen(
     postBalance: String?,
     cardCurrency: String?,
     address: String?,
+    cardBackground: String?,
+    cardImage: String?,
+    tierDescription: String?,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1955,6 +2069,9 @@ internal fun TopupScreen(
                 postBalance = postBalance,
                 cardCurrency = cardCurrency,
                 address = address,
+                cardBackground = cardBackground,
+                cardImage = cardImage,
+                tierDescription = tierDescription,
                 onDone = onBack
             )
             is TopupStatus.Error -> {
@@ -1986,6 +2103,9 @@ private fun TopupSuccessContent(
     postBalance: String?,
     cardCurrency: String?,
     address: String?,
+    cardBackground: String?,
+    cardImage: String?,
+    tierDescription: String?,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1996,6 +2116,7 @@ private fun TopupSuccessContent(
     val timeString = java.text.SimpleDateFormat("h:mm a", java.util.Locale.US).format(java.util.Date())
     val shortAddr = address?.let { if (it.length > 10) "${it.take(6)}...${it.takeLast(4)}" else it } ?: "—"
     val shortTxHash = if (txHash.length > 12) "${txHash.take(7)}...${txHash.takeLast(5)}" else txHash
+    val cardBgColor = parseHexColor(cardBackground) ?: Color.Black
 
     Column(
         modifier = modifier
@@ -2050,7 +2171,7 @@ private fun TopupSuccessContent(
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.Black)
+                colors = CardDefaults.cardColors(containerColor = cardBgColor)
             ) {
                 Box(modifier = Modifier.fillMaxWidth()) {
                     Box(
@@ -2067,6 +2188,17 @@ private fun TopupSuccessContent(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (cardImage != null && cardImage.isNotBlank()) {
+                                AsyncImage(
+                                    model = cardImage,
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .size(56.dp)
+                                        .clip(RoundedCornerShape(16.dp))
+                                )
+                                Spacer(modifier = Modifier.width(16.dp))
+                            }
                         Column {
                             Text(
                                 "Card Balance",
@@ -2080,7 +2212,16 @@ private fun TopupSuccessContent(
                                 fontSize = 38.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 color = Color.White
-                            )
+                                )
+                                if (tierDescription != null && tierDescription.isNotBlank()) {
+                                    Text(
+                                        tierDescription,
+                                        fontSize = 11.sp,
+                                        color = Color.White.copy(alpha = 0.9f),
+                                        modifier = Modifier.padding(top = 4.dp)
+                                    )
+                                }
+                            }
                         }
                         Box(
                             modifier = Modifier
@@ -2182,6 +2323,24 @@ private fun formatWithThousands(s: String?): String {
     return java.util.Locale.US.run { "%,.2f".format(n) }
 }
 
+/** 解析 metadata 中的 background_color（#RRGGBB 或 RRGGBB）为 Compose Color，解析失败返回 null */
+private fun parseHexColor(hex: String?): Color? {
+    if (hex.isNullOrBlank()) return null
+    val s = hex.trim().removePrefix("#")
+    if (s.length != 6 && s.length != 8) {
+        Log.d("parseHexColor", "skip: length not 6 or 8 (was ${s.length}) hex=$hex")
+        return null
+    }
+    return try {
+        val value = s.toLong(16).toInt()
+        val rgb = if (s.length == 8) value else (0xFF shl 24) or (value and 0xFFFFFF)
+        Color(rgb)
+    } catch (e: Exception) {
+        Log.d("parseHexColor", "parse failed: hex=$hex", e)
+        null
+    }
+}
+
 @Composable
 internal fun ReadScreen(
     uid: String,
@@ -2244,95 +2403,201 @@ internal fun ReadScreen(
                 }
             }
             is ReadStatus.Success -> {
+                val cardList = assets?.cards?.takeIf { it.isNotEmpty() }
+                    ?: listOfNotNull(assets?.cardAddress?.let { addr ->
+                        CardItem(
+                            cardAddress = addr,
+                            cardName = "CCSA CARD",
+                            cardType = "ccsa",
+                            points = assets.points ?: "0",
+                            points6 = assets.points6 ?: "0",
+                            cardCurrency = assets.cardCurrency ?: "CAD",
+                            nfts = assets.nfts ?: emptyList(),
+                            cardBackground = null,
+                            cardImage = null,
+                            tierName = null,
+                            tierDescription = null
+                        )
+                    }).takeIf { it.isNotEmpty() }
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .verticalScroll(rememberScrollState())
                 ) {
-                    // Header: Check icon + Balance Checked
+                    // Header
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 64.dp, bottom = 24.dp),
+                            .padding(top = 32.dp, bottom = 16.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(80.dp)
+                                .size(64.dp)
                                 .background(Color.White, CircleShape)
-                                .padding(16.dp),
+                                .padding(12.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.CheckCircle, null, Modifier.size(48.dp), tint = Color(0xFF34C759))
+                            Icon(Icons.Filled.CheckCircle, null, Modifier.size(40.dp), tint = Color(0xFF34C759))
                         }
                         Text(
                             "Balance Checked",
-                            fontSize = 24.sp,
+                            fontSize = 20.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.Black,
-                            modifier = Modifier.padding(top = 16.dp)
+                            modifier = Modifier.padding(top = 12.dp)
                         )
                     }
 
-                    // Content
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 24.dp)
+                            .padding(horizontal = 20.dp)
                             .padding(bottom = 24.dp)
                     ) {
-                        // Balance Card
+                        // USDC on Base (like web EOA layer)
+                        val usdcBal = assets?.usdcBalance?.toDoubleOrNull() ?: 0.0
                         Card(
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(24.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.Black)
+                            shape = RoundedCornerShape(20.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1c1c1e))
                         ) {
-                            Box(modifier = Modifier.fillMaxWidth()) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(128.dp)
-                                        .align(Alignment.TopEnd)
-                                        .offset(x = 40.dp, y = (-40).dp)
-                                        .background(Color.White.copy(alpha = 0.1f), CircleShape)
-                                )
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(24.dp),
+                                    .padding(20.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Column {
+                                Text("USDC on Base", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.9f))
                                         Text(
-                                            "Card Balance",
-                                            fontSize = 13.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            color = Color(0xFF86868b)
-                                        )
+                                    "%.2f USDC".format(usdcBal),
+                                    fontSize = 18.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.White
+                                )
+                            }
+                        }
+                        if (cardList != null) {
+                            Spacer(modifier = Modifier.height(12.dp))
                                         Text(
-                                            "$${"%.2f".format(voucherBalance)} ${assets?.cardCurrency ?: "CAD"}",
-                                            fontSize = 38.sp,
-                                            fontWeight = FontWeight.SemiBold,
-                                            color = Color.White
-                                        )
-                                    }
+                                "${cardList.size} Passes",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(horizontal = 4.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            cardList.forEachIndexed { index, card ->
+                                val overlap = 24.dp
+                                val balanceNum = card.points.toDoubleOrNull() ?: 0.0
+                                val memberNo = card.nfts
+                                    .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
+                                    .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
+                                    ?.tokenId
+                                    ?.let { "M-%s".format(it.padStart(6, '0')) }
+                                    ?: ""
+                                val isCcsa = card.cardType == "ccsa"
+                                val isInfra = card.cardType == "infrastructure"
+                                val bgColor = parseHexColor(card.cardBackground) ?: when {
+                                    isCcsa -> Color(0xFF6366F1)
+                                    isInfra -> Color(0xFF0ea5e9)
+                                    else -> Color(0xFF6366F1)
+                                }
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = if (index == 0) 0.dp else overlap),
+                                    shape = RoundedCornerShape(24.dp),
+                                    colors = CardDefaults.cardColors(containerColor = bgColor)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(20.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.weight(1f),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            if (card.cardImage != null && card.cardImage!!.isNotBlank()) {
+                                                AsyncImage(
+                                                    model = card.cardImage,
+                                                    contentDescription = card.cardName,
+                                                    modifier = Modifier
+                                                        .size(48.dp)
+                                                        .clip(RoundedCornerShape(12.dp))
+                                                )
+                                                Spacer(modifier = Modifier.width(12.dp))
+                                            } else {
                                     Box(
                                         modifier = Modifier
-                                            .size(64.dp)
-                                            .background(Color(0xFF1c1c1e), RoundedCornerShape(20.dp))
-                                            .clickable { /* Print mock */ },
+                                                        .size(48.dp)
+                                                        .clip(RoundedCornerShape(12.dp))
+                                                        .background(Color.White.copy(alpha = 0.2f)),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Icon(Icons.Filled.Print, null, Modifier.size(24.dp), tint = Color.White)
-                                            Text("Print", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                                                    Icon(Icons.Filled.Favorite, null, Modifier.size(24.dp), tint = Color.White)
+                                                }
+                                                Spacer(modifier = Modifier.width(12.dp))
+                                            }
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    card.cardName,
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.White.copy(alpha = 0.95f)
+                                                )
+                                                if (card.cardType != "infrastructure") {
+                                                    Text(
+                                                        card.cardType.replaceFirstChar { it.uppercase() },
+                                                        fontSize = 10.sp,
+                                                        color = Color.White.copy(alpha = 0.75f)
+                                                    )
+                                                }
+                                                if (card.tierName != null) {
+                                                    Text(
+                                                        card.tierName,
+                                                        fontSize = 11.sp,
+                                                        fontWeight = FontWeight.Medium,
+                                                        color = Color.White.copy(alpha = 0.9f),
+                                                        modifier = Modifier.padding(top = 2.dp)
+                                                    )
+                                                }
+                                                if (card.tierDescription != null) {
+                                                    Text(
+                                                        card.tierDescription,
+                                                        fontSize = 10.sp,
+                                                        color = Color.White.copy(alpha = 0.85f),
+                                                        modifier = Modifier.padding(top = 2.dp)
+                                                    )
+                                                }
+                                                if (memberNo.isNotEmpty()) {
+                                                    Text(
+                                                        "NFT $memberNo",
+                                                        fontSize = 10.sp,
+                                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                                        color = Color.White.copy(alpha = 0.8f),
+                                                        modifier = Modifier.padding(top = 4.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Column(horizontalAlignment = Alignment.End) {
+                                            Text(
+                                                "%.2f %s".format(balanceNum, card.cardCurrency),
+                                                fontSize = 22.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.White
+                                            )
                                         }
                                     }
                                 }
                             }
                         }
-
-                        // Receipt details
+                        // Account summary
                         Card(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -2349,17 +2614,7 @@ internal fun ReadScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("Date", fontSize = 15.sp, color = Color(0xFF86868b))
-                                    Text("$dateString, $timeString", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 20.dp, vertical = 16.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("Account ID", fontSize = 15.sp, color = Color(0xFF86868b))
+                                    Text("Account", fontSize = 15.sp, color = Color(0xFF86868b))
                                     Text(shortAddr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
                                 }
                                 Row(
