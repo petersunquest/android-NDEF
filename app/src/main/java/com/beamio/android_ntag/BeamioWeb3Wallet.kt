@@ -11,7 +11,7 @@ import java.math.BigInteger
  * 使用 MainActivity 中的 privateKey 初始化。
  */
 object BeamioWeb3Wallet {
-    private const val BASE_CARD_FACTORY = "0xDdD5c17E549a4e66ca636a3c528ae8FAebb8692b"
+    private const val BASE_CARD_FACTORY = "0x331a8ebc41afbAf01D78Fd2684D609407527DA18"
     private const val BASE_CHAIN_ID = 8453L
 
     private var keyPair: ECKeyPair? = null

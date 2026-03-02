@@ -223,7 +223,7 @@ class MainActivity : ComponentActivity() {
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
         /** 基础设施卡（与 SilentPassUI BEAMIO_USER_CARD_ASSET_ADDRESS 一致，新创建卡合约地址） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xC0F1c74fb95100a97b532be53B266a54f41DB615"
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xa86a8406B06bD6c332b4b380A0EAced822218Eff"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
     }
@@ -327,17 +327,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 解析 QR 中的 OpenContainerRelayPayload（由 signAAtoEOA_USDC_with_BeamioContainerMainRelayedOpen 生成） */
+    /** 解析 QR 中的 OpenContainerRelayPayload（由 signAAtoEOA_USDC_with_BeamioContainerMainRelayedOpen 生成）
+     * 新格式：{ account, currencyType, nonce, deadline, signature, validBefore? }
+     * 旧格式：{ account, to, items, signature }（兼容保留）
+     */
     private fun parseOpenContainerRelayPayload(content: String): org.json.JSONObject? {
         return try {
             val root = org.json.JSONObject(content)
             val account = root.optString("account")
+            val sig = root.optString("signature")
+            if (account.isEmpty() || sig.isEmpty()) return null
+            // 新格式：account + signature + (nonce|deadline|validBefore) 任一即可
+            val hasNewFormat = root.has("currencyType") || root.has("nonce") || root.has("deadline") || root.has("validBefore")
+            if (hasNewFormat) return root
+            // 旧格式：需 to + items
             val to = root.optString("to")
             val items = root.optJSONArray("items")
-            val sig = root.optString("signature")
-            if (account.isNotEmpty() && to.isNotEmpty() && items != null && items.length() > 0 && sig.isNotEmpty()) {
-                root
-            } else null
+            if (to.isNotEmpty() && items != null && items.length() > 0) root else null
         } catch (_: Exception) {
             null
         }
@@ -1325,7 +1331,7 @@ class MainActivity : ComponentActivity() {
                 val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
                 runOnUiThread {
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
-                    paymentScreenCardCurrency = assets.cardCurrency ?: "CAD"
+                    paymentScreenCardCurrency = "CAD"
                 }
                 val required6 = amountUsdc6.toLongOrNull() ?: 0L
                 if (totalBalance6 < required6) {
@@ -1396,11 +1402,11 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "detectingUser", StepStatus.loading) }
                 val account = payload.optString("account", "")
                 val payeeFromQr = payload.optString("to", "")
-                if (account.isEmpty() || payeeFromQr.isEmpty()) {
+                if (account.isEmpty()) {
                     runOnUiThread {
                         nfcFetchingInfo = false
                         paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = "无效的支付码"
+                        paymentScreenError = "Invalid payment code"
                     }
                     return@Thread
                 }
@@ -1524,17 +1530,31 @@ class MainActivity : ComponentActivity() {
                 composedItems.forEach { m -> itemsJson.put(org.json.JSONObject(m)) }
                 val finalPayload = org.json.JSONObject(payload.toString())
                 finalPayload.put("items", itemsJson)
+                if (!finalPayload.has("maxAmount")) finalPayload.put("maxAmount", "0")
                 val merchantAssets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress())
                 val toAddr = merchantAssets?.aaAddress?.takeIf { it.isNotEmpty() } ?: payeeFromQr
+                if (toAddr.isEmpty()) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Merchant AA not found. Please ensure terminal is configured."
+                    }
+                    return@Thread
+                }
+                // 新格式：若仅有 validBefore 无 deadline，用 validBefore 补全
+                if (!finalPayload.has("deadline") && finalPayload.has("validBefore")) {
+                    finalPayload.put("deadline", finalPayload.optString("validBefore"))
+                }
                 finalPayload.put("to", toAddr)
                 steps = updateStep(steps, "optimizingRoute", StepStatus.success,
                     if (ccsaPointsWei > 0 && usdcWei > 0) "Hybrid: CCSA + USDC" else if (ccsaPointsWei > 0) "CCSA only" else "USDC only")
+                val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
                 runOnUiThread {
                     paymentScreenPayee = toAddr
-                    paymentScreenSubtotal = "%.2f".format(effectiveUsdc6 / 1_000_000.0)
-                    paymentScreenPreBalance = paymentScreenSubtotal
+                    paymentScreenSubtotal = "%.2f".format(merchantAmountCad)
+                    paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
                     paymentScreenTip = "0"
-                    paymentScreenCardCurrency = "USDC"
+                    paymentScreenCardCurrency = "CAD"
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
