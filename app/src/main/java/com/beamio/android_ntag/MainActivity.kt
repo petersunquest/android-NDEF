@@ -46,6 +46,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -155,6 +156,9 @@ internal data class UIDAssets(
     val cardCurrency: String? = null,
     val nfts: List<NftItem>? = null,
     val cards: List<CardItem>? = null,
+    val unitPriceUSDC6: String? = null,
+    /** AA Factory 配置的 beamioUserCard，maxAmount>0 时 ERC1155 必须用此地址 */
+    val beamioUserCard: String? = null,
     val error: String? = null
 )
 internal data class NftItem(
@@ -490,12 +494,10 @@ class MainActivity : ComponentActivity() {
                         paymentCardCurrency = if (pendingScanAction == "payment") paymentScreenCardCurrency else null,
                         onPaymentDone = {
                             showScanMethodScreen = false
+                            resetPaymentScreenState()
                             tipScreenSubtotal = scanMethodBackTipSubtotal
                             selectedTipRate = scanMethodBackTipRate
                             showTipScreen = true
-                            paymentScreenStatus = PaymentStatus.Waiting
-                            paymentScreenRoutingSteps = emptyList()
-                            paymentScreenError = ""
                         },
                         onProceed = { proceedFromScanMethod() },
                         onProceedNfcStay = { armForNfcScan() },
@@ -519,18 +521,12 @@ class MainActivity : ComponentActivity() {
                             topupArmed = false
                             paymentArmed = false
                             showScanMethodScreen = false
+                            showTipScreen = false
+                            showAmountInputScreen = false
                             when (pendingScanAction) {
-                                "payment" -> {
-                                    tipScreenSubtotal = scanMethodBackTipSubtotal
-                                    selectedTipRate = scanMethodBackTipRate
-                                    showTipScreen = true
-                                }
-                                "topup" -> {
-                                    amountInput = topupScreenAmount
-                                    amountInputMode = "topup"
-                                    showAmountInputScreen = true
-                                }
-                                else -> { /* read: just close, back to NdefScreen */ }
+                                "payment" -> resetPaymentScreenState()
+                                "topup" -> resetTopupScreenState()
+                                else -> resetReadScreenState()
                             }
                         },
                         modifier = Modifier.fillMaxSize()
@@ -588,14 +584,12 @@ class MainActivity : ComponentActivity() {
                             val subtotal = tipScreenSubtotal.toDoubleOrNull() ?: 0.0
                             val tip = subtotal * selectedTipRate
                             val total = subtotal + tip
-                            paymentScreenSubtotal = "%.2f".format(subtotal)
-                            paymentScreenTip = "%.2f".format(tip)
                             scanMethodBackTipSubtotal = tipScreenSubtotal
                             scanMethodBackTipRate = selectedTipRate
                             showTipScreen = false
                             tipScreenSubtotal = "0"
                             selectedTipRate = 0.0
-                            startPayment("%.2f".format(total))
+                            startPayment("%.2f".format(total), "%.2f".format(subtotal), "%.2f".format(tip))
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -666,6 +660,7 @@ class MainActivity : ComponentActivity() {
             uidText = "请先开启 NFC"
             return
         }
+        resetReadScreenState()
         pendingScanAction = "read"
         scanMethodState = "nfc"
         showScanMethodScreen = true
@@ -679,6 +674,7 @@ class MainActivity : ComponentActivity() {
     private fun startTopup(amount: String) {
         if (nfcAdapter == null) return
         if (nfcAdapter?.isEnabled != true) return
+        resetTopupScreenState()
         topupScreenAmount = amount
         pendingScanAction = "topup"
         scanMethodState = "nfc"
@@ -690,10 +686,54 @@ class MainActivity : ComponentActivity() {
         topupArmed = false
     }
 
-    private fun startPayment(amount: String) {
+    /** 重置支付相关状态，避免 cancel 后再次 Charge 时残留旧数据 */
+    private fun resetPaymentScreenState() {
+        paymentScreenAmount = ""
+        paymentScreenPayee = ""
+        paymentScreenUid = ""
+        paymentScreenStatus = PaymentStatus.Waiting
+        paymentScreenTxHash = ""
+        paymentScreenError = ""
+        paymentScreenRoutingSteps = emptyList()
+        paymentScreenSubtotal = "0"
+        paymentScreenTip = "0"
+        paymentScreenPreBalance = null
+        paymentScreenPostBalance = null
+        paymentScreenCardCurrency = null
+    }
+
+    /** 重置充值相关状态 */
+    private fun resetTopupScreenState() {
+        topupScreenUid = ""
+        topupScreenWallet = null
+        topupScreenStatus = TopupStatus.Waiting
+        topupScreenTxHash = ""
+        topupScreenError = ""
+        topupScreenPreBalance = null
+        topupScreenPostBalance = null
+        topupScreenCardCurrency = null
+        topupScreenAddress = null
+        topupScreenCardBackground = null
+        topupScreenCardImage = null
+        topupScreenTierDescription = null
+    }
+
+    /** 重置读取相关状态 */
+    private fun resetReadScreenState() {
+        readScreenUid = ""
+        readScreenWallet = null
+        readScreenStatus = ReadStatus.Waiting
+        readScreenAssets = null
+        readScreenError = ""
+    }
+
+    private fun startPayment(amount: String, subtotal: String? = null, tip: String? = null) {
         if (nfcAdapter == null) return
         if (nfcAdapter?.isEnabled != true) return
+        resetPaymentScreenState()
         paymentScreenAmount = amount
+        paymentScreenSubtotal = subtotal ?: amount
+        paymentScreenTip = tip ?: "0"
         paymentScreenPayee = BeamioWeb3Wallet.getAddress()
         pendingScanAction = "payment"
         scanMethodState = "nfc"
@@ -813,9 +853,7 @@ class MainActivity : ComponentActivity() {
         paymentArmed = false
         showTipScreen = false
         showScanMethodScreen = false
-        paymentScreenStatus = PaymentStatus.Waiting
-        paymentScreenRoutingSteps = emptyList()
-        paymentScreenError = ""
+        resetPaymentScreenState()
         // Done → 返回 home (NdefScreen)
     }
 
@@ -1270,10 +1308,6 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                runOnUiThread {
-                    paymentScreenPreBalance = assets.points
-                    paymentScreenCardCurrency = assets.cardCurrency
-                }
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success, "Card + USDC balance")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
                 steps = updateStep(steps, "optimizingRoute", StepStatus.success, "Direct: NFC → Merchant")
@@ -1287,6 +1321,12 @@ class MainActivity : ComponentActivity() {
                     points6ToUsdc6(pts6, cur, oracle)
                 }
                 val totalBalance6 = usdcBalance6.toLong() + cardsValueUsdc6
+                // 初始余额（CAD）：总 USDC6 转 CAD，供 postBalance = pre - subtotal - tip
+                val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
+                runOnUiThread {
+                    paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
+                    paymentScreenCardCurrency = assets.cardCurrency ?: "CAD"
+                }
                 val required6 = amountUsdc6.toLongOrNull() ?: 0L
                 if (totalBalance6 < required6) {
                     steps = updateStep(steps, "analyzingAssets", StepStatus.error, "余额不足")
@@ -1343,7 +1383,7 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    /** QR 支付：扫描 signAAtoEOA_USDC_with_BeamioContainerMainRelayedOpen 生成的 payload，直接 POST /api/AAtoEOA（与 SilentPassUI 流程一致） */
+    /** QR 支付：与 SilentPassUI 一致。商户金额 → USDC6，链上查询客户资产，Smart Routing 组装 items，POST /api/AAtoEOA */
     private fun executeQrPayment(payload: org.json.JSONObject) {
         Thread {
             try {
@@ -1354,30 +1394,152 @@ class MainActivity : ComponentActivity() {
                 }
                 var steps = createRoutingSteps()
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "detectingUser", StepStatus.loading) }
+                val account = payload.optString("account", "")
+                val payeeFromQr = payload.optString("to", "")
+                if (account.isEmpty() || payeeFromQr.isEmpty()) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "无效的支付码"
+                    }
+                    return@Thread
+                }
+                val merchantAmountCad = paymentScreenAmount.toDoubleOrNull() ?: 0.0
+                if (merchantAmountCad <= 0) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "请先输入金额"
+                    }
+                    return@Thread
+                }
+                val oracle = fetchOracle()
+                val enteredUsdc6 = currencyToUsdc6(merchantAmountCad, "CAD", oracle).toLongOrNull() ?: 0L
+                if (enteredUsdc6 <= 0) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "金额换算失败"
+                    }
+                    return@Thread
+                }
+                // openRelayed：签名不绑定 to/items，maxAmount=0 表示无限制，金额与收款方由商户填写。不在此处校验 maxAmount，链上会校验。
                 steps = updateStep(steps, "detectingUser", StepStatus.success, "Dynamic QR detected")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
-                steps = updateStep(steps, "membership", StepStatus.success, "AA Express Pay")
+                val assets = fetchWalletAssetsSync(account)
+                if (assets == null || !assets.ok) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = assets?.error ?: "无法获取客户资产"
+                    }
+                    return@Thread
+                }
+                val hasCardholder = (assets.cards?.any { it.cardType == "ccsa" || it.cardAddress.equals(BASE_CCSA_CARD_ADDRESS, ignoreCase = true) } == true) ||
+                    (assets.points6?.toLongOrNull() ?: 0L) > 0
+                val effectiveUsdc6 = if (hasCardholder) (enteredUsdc6 * 9) / 10 else enteredUsdc6
+                steps = updateStep(steps, "membership", StepStatus.success, if (hasCardholder) "Cardholder (10% OFF)" else "No membership discount")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
-                val items = payload.optJSONArray("items")
-                val firstAmount = items?.optJSONObject(0)?.optString("amount") ?: "0"
-                val amountUsdc6 = firstAmount.toLongOrNull() ?: 0L
-                val payeeTo = payload.optString("to", "")
+                // payload 的 maxAmount 由客户签字锁定，不可修改。maxAmount>0 时合约要求 ERC1155 必须用 Factory 的 beamioUserCard
+                val payloadMaxAmount = payload.optString("maxAmount", "0").toLongOrNull() ?: 0L
+                val hasMaxAmount = payloadMaxAmount > 0L
+                val beamioUserCardAddr = assets.beamioUserCard
+                if (hasMaxAmount && beamioUserCardAddr.isNullOrEmpty()) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "服务暂不可用（缺少 beamioUserCard）"
+                    }
+                    return@Thread
+                }
+                val unitPriceStr = assets.unitPriceUSDC6
+                val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
+                val cards = chargeableCards(assets)
+                val ccsaCards = if (hasMaxAmount) emptyList() else cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(BASE_CCSA_CARD_ADDRESS, ignoreCase = true) }
+                val infraCards = if (hasMaxAmount && beamioUserCardAddr != null) {
+                    cards.filter { it.cardAddress.equals(beamioUserCardAddr, ignoreCase = true) }
+                } else {
+                    cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
+                }
+                val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+                val ccsaValueUsdc6 = if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) (ccsaPoints6 * unitPriceUSDC6) / 1_000_000 else 0L
+                val infraValueUsdc6 = infraCards.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
+                val totalBalance6 = ccsaValueUsdc6 + infraValueUsdc6 + usdcBalance6.toLong()
+                if (totalBalance6 < effectiveUsdc6) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "客户余额不足（需 ${String.format("%.2f", effectiveUsdc6 / 1_000_000.0)} USDC，资产合计 ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC）"
+                    }
+                    return@Thread
+                }
+                steps = updateStep(steps, "analyzingAssets", StepStatus.success,
+                    if (ccsaValueUsdc6 >= effectiveUsdc6) "\$CCSA: (Sufficient)" else if (ccsaValueUsdc6 > 0) "\$CCSA: (Partial)" else "USDC sufficient")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
+                var remaining = effectiveUsdc6
+                var ccsaPointsWei = 0L
+                var infraPointsWei = 0L
+                if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) {
+                    val maxPointsFromAmount = (remaining * 1_000_000) / unitPriceUSDC6
+                    ccsaPointsWei = minOf(maxPointsFromAmount, ccsaPoints6)
+                    val ccsaValue = (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
+                    remaining -= ccsaValue
+                }
+                if (remaining > 0 && infraPoints6 > 0 && infraCards.isNotEmpty()) {
+                    val infraCard = infraCards.first()
+                    val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
+                    if (rate > 0) {
+                        val infraValueUsdc6Needed = minOf(remaining, points6ToUsdc6(infraPoints6, infraCard.cardCurrency, oracle))
+                        infraPointsWei = kotlin.math.ceil(infraValueUsdc6Needed * rate).toLong().coerceIn(0L, infraPoints6)
+                        remaining = (remaining - points6ToUsdc6(infraPointsWei, infraCard.cardCurrency, oracle)).coerceAtLeast(0L)
+                    }
+                }
+                var usdcWei = remaining.coerceAtLeast(0L)
+                if (usdcWei > 0 && usdcBalance6.toLong() == 0L && infraPoints6 > 0 && infraCards.isNotEmpty()) {
+                    val infraCard = infraCards.first()
+                    val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
+                    if (rate > 0 && infraPointsWei < infraPoints6) {
+                        val extraPoints = kotlin.math.ceil(usdcWei * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
+                        infraPointsWei += extraPoints
+                        usdcWei = 0L
+                    }
+                }
+                val composedItems = mutableListOf<Map<String, Any>>()
+                val erc1155AssetForInfra = if (hasMaxAmount && beamioUserCardAddr != null) beamioUserCardAddr else BEAMIO_USER_CARD_ASSET_ADDRESS
+                if (usdcWei > 0) {
+                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                if (ccsaPointsWei > 0) {
+                    composedItems.add(mapOf("kind" to 1, "asset" to BASE_CCSA_CARD_ADDRESS, "amount" to ccsaPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                if (infraPointsWei > 0) {
+                    composedItems.add(mapOf("kind" to 1, "asset" to erc1155AssetForInfra, "amount" to infraPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                if (composedItems.isEmpty()) {
+                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to effectiveUsdc6.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                val itemsJson = org.json.JSONArray()
+                composedItems.forEach { m -> itemsJson.put(org.json.JSONObject(m)) }
+                val finalPayload = org.json.JSONObject(payload.toString())
+                finalPayload.put("items", itemsJson)
+                val merchantAssets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress())
+                val toAddr = merchantAssets?.aaAddress?.takeIf { it.isNotEmpty() } ?: payeeFromQr
+                finalPayload.put("to", toAddr)
+                steps = updateStep(steps, "optimizingRoute", StepStatus.success,
+                    if (ccsaPointsWei > 0 && usdcWei > 0) "Hybrid: CCSA + USDC" else if (ccsaPointsWei > 0) "CCSA only" else "USDC only")
                 runOnUiThread {
-                    paymentScreenAmount = "%.2f".format(amountUsdc6 / 1_000_000.0)
-                    paymentScreenPayee = payeeTo
-                    paymentScreenSubtotal = paymentScreenAmount
+                    paymentScreenPayee = toAddr
+                    paymentScreenSubtotal = "%.2f".format(effectiveUsdc6 / 1_000_000.0)
                     paymentScreenPreBalance = paymentScreenSubtotal
                     paymentScreenTip = "0"
                     paymentScreenCardCurrency = "USDC"
-                }
-                steps = updateStep(steps, "analyzingAssets", StepStatus.success, "USDC balance")
-                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
-                steps = updateStep(steps, "optimizingRoute", StepStatus.success, "Direct: QR → Merchant")
-                runOnUiThread {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = postAAtoEOAOpenContainer(payload)
+                val currencyAmountCad = "%.2f".format(merchantAmountCad)
+                val result = postAAtoEOAOpenContainer(finalPayload, listOf("CAD"), listOf(currencyAmountCad))
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "支付失败"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 runOnUiThread {
@@ -1885,6 +2047,8 @@ class MainActivity : ComponentActivity() {
                     ))
                 } else null
             }
+            val unitPriceUSDC6 = root.optString("unitPriceUSDC6").takeIf { it.isNotEmpty() }
+            val beamioUserCard = root.optString("beamioUserCard").takeIf { it.isNotEmpty() }
             if (cards != null) {
                 val first = cards.firstOrNull()
                 UIDAssets(
@@ -1898,6 +2062,8 @@ class MainActivity : ComponentActivity() {
                     cardCurrency = first?.cardCurrency,
                     nfts = first?.nfts?.takeIf { it.isNotEmpty() },
                     cards = cards,
+                    unitPriceUSDC6 = unitPriceUSDC6,
+                    beamioUserCard = beamioUserCard,
                     error = root.optString("error").takeIf { it.isNotEmpty() }
                 )
             } else {
@@ -1914,6 +2080,8 @@ class MainActivity : ComponentActivity() {
                     cardCurrency = if (isDeprecatedLegacy) null else root.optString("cardCurrency").takeIf { it.isNotEmpty() },
                     nfts = if (isDeprecatedLegacy) null else nfts.takeIf { it.isNotEmpty() },
                     cards = null,
+                    unitPriceUSDC6 = unitPriceUSDC6,
+                    beamioUserCard = beamioUserCard,
                     error = root.optString("error").takeIf { it.isNotEmpty() }
                 )
             }
@@ -4233,7 +4401,8 @@ internal fun ScanMethodSelectionScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            if (pendingAction == "payment" && (showPaymentSuccess || showPaymentError || showPaymentRouting)) {
+            // 扫描区始终渲染，由内部状态分支决定显示内容
+            if (true) {
                 // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
                 if (showPaymentSuccess) {
                     // Charge 贴卡成功后：在中间窗口显示 PaymentSuccessContent，不跳新页
@@ -4349,68 +4518,64 @@ internal fun ScanMethodSelectionScreen(
                             }
                     }
                 } else if (scanWaitingForNfc) {
-                    // 等待 UID：蓝线上下往复移动
-                    val lineOffsetY = remember { Animatable(0f) }
-                    LaunchedEffect(scanWaitingForNfc) {
-                        if (scanWaitingForNfc) {
-                            while (isActive) {
-                                lineOffsetY.animateTo(1f, animationSpec = tween<Float>(2000))
-                                lineOffsetY.animateTo(0f, animationSpec = tween<Float>(2000))
-                            }
-                        } else {
-                            lineOffsetY.snapTo(0f)
-                        }
-                    }
+                    // 等待 UID：固定显示等待态（仅图标 + 扫描线），不显示 tap/type 文案
+                    val scanLineY by rememberInfiniteTransition(label = "nfcScanLine").animateFloat(
+                        initialValue = 0f,
+                        targetValue = 1f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = 1600),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "nfcScanLineY"
+                    )
                     Box(
                         modifier = Modifier
-                            .size(280.dp)
-                            .padding(bottom = 32.dp)
+                            .fillMaxWidth()
+                            .wrapContentHeight()
                     ) {
-                        Card(
-                            modifier = Modifier.fillMaxSize(),
-                            shape = RoundedCornerShape(32.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-                            border = BorderStroke(2.dp, Color.White.copy(alpha = 0.1f))
+                        Box(
+                            modifier = Modifier
+                                .size(280.dp)
+                                .align(Alignment.Center)
                         ) {
-                            Box(
+                            Card(
                                 modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+                                border = BorderStroke(2.dp, Color.White.copy(alpha = 0.1f))
                             ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(48.dp),
-                                    color = Color(0xFF1562f0),
-                                    strokeWidth = 2.dp
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(Icons.Filled.Nfc, null, Modifier.size(48.dp), tint = Color.White)
+                                    Text(
+                                        "Hold the customer's NTAG 424 DNA card near the NFC sensor.",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF86868b),
+                                        modifier = Modifier.padding(top = 12.dp),
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                            Canvas(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(2.dp)
+                            ) {
+                                val y = scanLineY * (size.height - 2f)
+                                drawLine(
+                                    color = Color(0xFF1562F0),
+                                    start = Offset(0f, y),
+                                    end = Offset(size.width, y),
+                                    strokeWidth = 0.2.dp.toPx()
                                 )
                             }
                         }
-                        Canvas(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(2.dp)
-                        ) {
-                            val y = lineOffsetY.value * (size.height - 2)
-                            drawLine(
-                                color = Color(0xFF1562f0),
-                                start = Offset(0f, y),
-                                end = Offset(size.width, y),
-                                strokeWidth = 0.3.dp.toPx()
-                            )
-                        }
                     }
-                    Text(
-                        "Verifying...",
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                    Text(
-                        "Hold the customer's NTAG 424 DNA card near the NFC sensor.",
-                        fontSize = 15.sp,
-                        color = Color(0xFF86868b),
-                        modifier = Modifier.padding(top = 8.dp),
-                        textAlign = TextAlign.Center
-                    )
                 } else if (nfcFetchingInfo) {
                     // 已获 UID，拉取信息中：无蓝线，仅 loading
                     Box(
@@ -4451,114 +4616,130 @@ internal fun ScanMethodSelectionScreen(
                         textAlign = TextAlign.Center
                     )
                 } else if (nfcFetchError.isNotEmpty()) {
-                    // 拉取失败：在 280.dp 框内显示绿色错误
-                    Box(
+                    // 拉取失败：在 280.dp 框内显示错误，点击可重试
+                    Column(
                         modifier = Modifier
-                            .size(280.dp)
-                            .padding(bottom = 32.dp)
+                            .clickable { onProceedNfcStay?.invoke() }
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Card(
-                            modifier = Modifier.fillMaxSize(),
-                            shape = RoundedCornerShape(32.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
-                            border = BorderStroke(2.dp, Color.White.copy(alpha = 0.1f))
+                        Box(
+                            modifier = Modifier
+                                .size(280.dp)
+                                .padding(bottom = 8.dp)
+                        ) {
+                            Card(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+                                border = BorderStroke(2.dp, Color.White.copy(alpha = 0.1f))
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        nfcFetchError,
+                                        fontSize = 14.sp,
+                                        color = Color(0xFF22c55e),
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            "Tap to retry",
+                            fontSize = 15.sp,
+                            color = Color(0xFF86868b),
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                } else {
+                    if (scanMethod == "qr") {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Box(
                                 modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(16.dp),
-                                contentAlignment = Alignment.Center
+                                    .size(280.dp)
+                                    .clip(RoundedCornerShape(32.dp))
+                                    .then(
+                                        if (qrScanningActive) Modifier
+                                        else Modifier.clickable {
+                                            onProceedWithQr?.invoke()
+                                        }
+                                    )
+                                    .background(Color.White.copy(alpha = 0.05f))
                             ) {
-                                Text(
-                                    nfcFetchError,
-                                    fontSize = 14.sp,
-                                    color = Color(0xFF22c55e),
-                                    textAlign = TextAlign.Center
-                                )
+                                if (qrScanningActive) {
+                                    EmbeddedQrScanner(
+                                        onResult = onQrScanResult,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color.White.copy(alpha = 0.05f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.QrCode2,
+                                            null,
+                                            Modifier.size(48.dp),
+                                            tint = Color.White.copy(alpha = 0.2f)
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                if (qrScanningActive) "Scanning..." else "Type to scan QR",
+                                fontSize = 15.sp,
+                                color = Color(0xFF86868b),
+                                modifier = Modifier.padding(top = 12.dp),
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                    } else {
+                        // Tap Card（payment/read/topup 统一）：正方形区域整块为触发区
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .wrapContentHeight()
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(280.dp)
+                                    .align(Alignment.Center)
+                                    .clip(RoundedCornerShape(32.dp))
+                                    .clickable(enabled = !scanWaitingForNfc && !nfcFetchingInfo) {
+                                        onProceedNfcStay?.invoke()
+                                    }
+                                    .background(Color.White.copy(alpha = 0.05f))
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Icon(Icons.Filled.Nfc, null, Modifier.size(48.dp), tint = Color.White)
+                                    Text(
+                                        "tap to scan card",
+                                        fontSize = 15.sp,
+                                        color = Color(0xFF86868b),
+                                        modifier = Modifier.padding(top = 12.dp),
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
                             }
                         }
                     }
-                    Text(
-                        "Error",
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                    Text(
-                        "Tap Continue to retry.",
-                        fontSize = 15.sp,
-                        color = Color(0xFF86868b),
-                        modifier = Modifier.padding(top = 8.dp),
-                        textAlign = TextAlign.Center
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .size(96.dp)
-                            .background(Color.White.copy(alpha = 0.1f), CircleShape)
-                            .padding(24.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(Icons.Filled.Nfc, null, Modifier.size(40.dp), tint = Color.White)
-                    }
-                    Text(
-                        "Ready to Scan",
-                        fontSize = 24.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = Color.White,
-                        modifier = Modifier.padding(top = 32.dp)
-                    )
-                    Text(
-                        "Hold the customer's NTAG 424 DNA card near the NFC sensor.",
-                        fontSize = 15.sp,
-                        color = Color(0xFF86868b),
-                        modifier = Modifier.padding(top = 8.dp),
-                        textAlign = TextAlign.Center
-                    )
                 }
-            } else {
-                Box(
-                    modifier = Modifier
-                        .size(280.dp)
-                        .clip(RoundedCornerShape(32.dp))
-                        .background(Color.White.copy(alpha = 0.05f))
-                ) {
-                    if (qrScanningActive) {
-                        EmbeddedQrScanner(
-                            onResult = onQrScanResult,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(Color.White.copy(alpha = 0.05f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                Icons.Filled.QrCode2,
-                                null,
-                                Modifier.size(48.dp),
-                                tint = Color.White.copy(alpha = 0.2f)
-                            )
-                        }
-                    }
-                }
-                Text(
-                    if (qrScanningActive) "Scanning..." else "Scan Dynamic QR",
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.White,
-                    modifier = Modifier.padding(top = 32.dp)
-                )
-                Text(
-                    "Position the customer's Beamio App payment code in the frame.",
-                    fontSize = 15.sp,
-                    color = Color(0xFF86868b),
-                    modifier = Modifier.padding(top = 8.dp),
-                    textAlign = TextAlign.Center
-                )
             }
         }
 
@@ -4587,36 +4768,6 @@ internal fun ScanMethodSelectionScreen(
                         modifier = Modifier.padding(bottom = 32.dp)
                     )
                 }
-            }
-            if (!showPaymentSuccess) {
-            Button(
-                onClick = {
-                    if (scanMethod == "qr" && onProceedWithQr != null) {
-                        onProceedWithQr()
-                    } else if (scanMethod == "nfc" && onProceedNfcStay != null) {
-                        onProceedNfcStay()
-                    } else {
-                        onProceed()
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 16.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.White.copy(alpha = 0.1f), contentColor = Color.White),
-                enabled = !scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive
-            ) {
-                Text(
-                    when {
-                        scanWaitingForNfc -> "Waiting for NFC..."
-                        nfcFetchingInfo -> "Loading..."
-                        qrScanningActive -> "Scanning..."
-                        scanMethod == "qr" -> "Scan QR"
-                        else -> "Continue"
-                    },
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
             }
             TextButton(
                 onClick = {
