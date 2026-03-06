@@ -28,7 +28,7 @@ import java.io.File
 object BeamioWalletService {
     private const val TAG = "BeamioWalletService"
     private const val BEAMIO_API = "https://beamio.app"
-    private const val CONET_RPC = "https://mainnet-rpc1.conet.network"
+    private const val CONET_RPC = "https://mainnet-rpc.conet.network"
     private const val ACCOUNT_REGISTRY = "0x3E15607BCf98B01e6C7dF834a2CEc7B8B6aFb1BC"
 
     // Argon2id 参数：与 web defaultBrowserParams 一致（32MB, 3 iter, 1 parallel）
