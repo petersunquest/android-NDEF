@@ -1155,6 +1155,9 @@ class MainActivity : ComponentActivity() {
             put("amount", amount)
             put("currency", "CAD")
             put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
+            // 显式声明 Android 走 admin topup（mintPointsByAdmin）路径，不走 USDC 购买工作流
+            put("workflow", "adminTopup")
+            put("topupMode", "admin")
         }.toString()
         conn.outputStream.use { os ->
             os.write(body.toByteArray(Charsets.UTF_8))
@@ -1340,6 +1343,8 @@ class MainActivity : ComponentActivity() {
             put("nonce", nonce)
             put("adminSignature", adminSignature)
             put("wallet", wallet)
+            put("workflow", "adminTopup")
+            put("topupMode", "admin")
         }.toString()
         conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
@@ -1374,6 +1379,8 @@ class MainActivity : ComponentActivity() {
             put("nonce", nonce)
             put("adminSignature", adminSignature)
             put("uid", uid)
+            put("workflow", "adminTopup")
+            put("topupMode", "admin")
         }.toString()
         conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
