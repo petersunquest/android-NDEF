@@ -36,6 +36,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
@@ -122,6 +123,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
 import coil.compose.AsyncImage
 import com.beamio.android_ntag.ui.theme.AndroidNTAGTheme
@@ -4591,10 +4593,17 @@ fun NdefScreen(
                 Box(
                     modifier = Modifier
                         .size(40.dp)
-                        .background(color = Color.Black, shape = CircleShape),
+                        .clip(CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("B", fontSize = 18.sp, fontWeight = FontWeight.Black, fontStyle = FontStyle.Italic, color = Color.White)
+                    Image(
+                        painter = painterResource(R.mipmap.ic_launcher),
+                        contentDescription = "App icon",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(CircleShape),
+                        contentScale = ContentScale.Crop
+                    )
                 }
                 Column {
                     Text("Terminal", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
