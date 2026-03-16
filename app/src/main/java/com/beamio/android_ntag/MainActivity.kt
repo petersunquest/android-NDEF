@@ -43,6 +43,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -116,6 +117,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
@@ -305,6 +307,7 @@ class MainActivity : ComponentActivity() {
     private var readArmed by mutableStateOf(false)
     private var initArmed by mutableStateOf(false)
     private var initTemplateArmed by mutableStateOf(false)
+    private var showWelcomePage by mutableStateOf(false)
     private var showOnboardingScreen by mutableStateOf(false)
     private var showAmountInputScreen by mutableStateOf(false)
     private var amountInputMode by mutableStateOf("charge") // "charge" | "topup"
@@ -330,6 +333,9 @@ class MainActivity : ComponentActivity() {
     private var pendingInitUseDefaultKey0: Boolean = false
     private var nfcAdapter: NfcAdapter? = null
     private var qrScanningActive by mutableStateOf(false) // 按下 Scan QR 后，在 280.dp 方框内显示相机
+
+    /** AA 账号检测：null=未检测/检测中，true=有 AA，false=无 AA。无 AA 时显示欢迎面板 */
+    private var hasAAAccount by mutableStateOf<Boolean?>(null)
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) qrScanningActive = true
@@ -468,10 +474,10 @@ class MainActivity : ComponentActivity() {
             try {
                 BeamioWeb3Wallet.init(savedKey)
             } catch (_: Exception) {
-                showOnboardingScreen = true
+                showWelcomePage = true
             }
         } else {
-            showOnboardingScreen = true
+            showWelcomePage = true
         }
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
         enableEdgeToEdge()
@@ -483,12 +489,39 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             AndroidNTAGTheme {
+                LaunchedEffect(showOnboardingScreen) {
+                    if (!showOnboardingScreen && BeamioWeb3Wallet.isInitialized() && hasAAAccount == null) {
+                        Thread {
+                            try {
+                                val assets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress())
+                                runOnUiThread {
+                                    hasAAAccount = !assets?.aaAddress.isNullOrEmpty()
+                                }
+                            } catch (_: Exception) {
+                                runOnUiThread { hasAAAccount = true }
+                            }
+                        }.start()
+                    }
+                }
                 when {
+                    showWelcomePage -> WelcomePage(
+                        versionName = BuildConfig.VERSION_NAME ?: "1.0",
+                        onCreateWalletClick = {
+                            showWelcomePage = false
+                            showOnboardingScreen = true
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
                     showOnboardingScreen -> OnboardingScreen(
                         onCreateComplete = { privateKeyHex ->
                             WalletStorageManager.savePrivateKey(this@MainActivity, privateKeyHex)
                             BeamioWeb3Wallet.init(privateKeyHex)
+                            hasAAAccount = null
                             showOnboardingScreen = false
+                        },
+                        onBackToWelcome = {
+                            showOnboardingScreen = false
+                            showWelcomePage = true
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -697,6 +730,35 @@ class MainActivity : ComponentActivity() {
                         cardType = paymentScreenCardType,
                         settlementViaQr = paymentViaQr,
                         onBack = { closePaymentScreen() },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                    hasAAAccount == false -> NdefScreen(
+                        uidText = uidText,
+                        readUrlText = readUrlText,
+                        readParamText = readParamText,
+                        walletAddress = if (BeamioWeb3Wallet.isInitialized()) BeamioWeb3Wallet.getAddress() else null,
+                        onCopyWalletClick = {
+                            if (BeamioWeb3Wallet.isInitialized()) {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("wallet", BeamioWeb3Wallet.getAddress()))
+                            }
+                        },
+                        onReadClick = { startReadUid() },
+                        onTopupClick = {
+                            amountInput = "0"
+                            amountInputMode = "topup"
+                            showAmountInputScreen = true
+                        },
+                        onPaymentClick = {
+                            amountInput = "0"
+                            amountInputMode = "charge"
+                            showAmountInputScreen = true
+                        },
+                        onCopyUrlClick = {
+                            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("url", readUrlText))
+                        },
+                        contentAboveCharge = { WelcomePanelNoAA(modifier = Modifier.fillMaxWidth(), compact = true) },
                         modifier = Modifier.fillMaxSize()
                     )
                     else -> NdefScreen(
@@ -3166,7 +3228,7 @@ internal fun TopupScreen(
         when (status) {
             is TopupStatus.Waiting -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3180,7 +3242,7 @@ internal fun TopupScreen(
             }
             is TopupStatus.Loading -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3221,12 +3283,12 @@ internal fun TopupScreen(
                         title = { Text("Top-up Not Allowed", fontSize = 18.sp) },
                         text = { Text(error, fontSize = 14.sp) },
                         confirmButton = {
-                            TextButton(onClick = onBack) { Text("OK") }
+                            TextButton(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("OK") }
                         }
                     )
                 }
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3485,20 +3547,20 @@ private fun TopupSuccessContent(
         ) {
             OutlinedButton(
                 onClick = { printTopupReceipt(context, amount, postBalance, cardCurrency, address, txHash, dateString, timeString) },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(24.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
             ) {
-                Icon(Icons.Filled.Print, null, Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Print Receipt", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Icon(Icons.Filled.Print, null, Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Print Receipt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
             Button(
                 onClick = onDone,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(24.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
             ) {
-                Text("Done", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -3709,7 +3771,7 @@ internal fun ReadScreen(
                         .fillMaxSize()
                         .padding(16.dp)
                 ) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3726,7 +3788,7 @@ internal fun ReadScreen(
                         .fillMaxSize()
                         .padding(16.dp)
                 ) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -4002,19 +4064,20 @@ internal fun ReadScreen(
                             onClick = onTopupClick,
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .height(24.dp)
                                 .padding(bottom = 12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White)
                         ) {
-                            Icon(Icons.Filled.Add, null, Modifier.size(20.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Top-Up Card Now", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            Icon(Icons.Filled.Add, null, Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Top-Up Card Now", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         }
                         Button(
                             onClick = onBack,
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth().height(24.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
                         ) {
-                            Text("Done", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
@@ -4025,7 +4088,7 @@ internal fun ReadScreen(
                         .fillMaxSize()
                         .padding(16.dp)
                 ) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -4336,20 +4399,20 @@ private fun PaymentSuccessContent(
         ) {
             OutlinedButton(
                 onClick = { printChargeReceipt(context, amount, subtotal, tip, postBalance, cardCurrency, payee, txHash, dateString, timeString) },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(24.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
             ) {
-                Icon(Icons.Filled.Print, null, Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Print Receipt", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Icon(Icons.Filled.Print, null, Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Print Receipt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
             Button(
                 onClick = onDone,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(24.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
             ) {
-                Text("Done", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -4386,7 +4449,7 @@ internal fun PaymentScreen(
         when (status) {
             is PaymentStatus.Waiting -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -4399,7 +4462,7 @@ internal fun PaymentScreen(
             }
             is PaymentStatus.Refreshing -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -4420,7 +4483,7 @@ internal fun PaymentScreen(
             }
             is PaymentStatus.Routing, is PaymentStatus.Submitting -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -4495,7 +4558,7 @@ internal fun PaymentScreen(
                 Column(
                     modifier = Modifier.fillMaxSize().padding(16.dp)
                 ) {
-                    Button(onClick = onBack) { Text("Back") }
+                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -4551,6 +4614,57 @@ internal fun PaymentScreen(
 }
 
 @Composable
+fun WelcomePanelNoAA(
+    modifier: Modifier = Modifier,
+    compact: Boolean = false
+) {
+    val padding = if (compact) 0.dp else 24.dp
+    val cardPadding = if (compact) 10.dp else 32.dp
+    val titleSize = if (compact) 14.sp else 24.sp
+    val bodySize = if (compact) 10.sp else 15.sp
+    val bodyLineHeight = if (compact) 13.sp else 22.sp
+    val bodyBottomPadding = if (compact) 0.dp else 24.dp
+    Column(
+        modifier = modifier
+            .then(if (!compact) Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.statusBars) else Modifier)
+            .then(
+                if (compact) Modifier.padding(vertical = 4.dp)  // align with other cards
+                else Modifier.padding(padding)
+            )
+    ) {
+        if (!compact) Spacer(modifier = Modifier.height(48.dp))
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(if (compact) 12.dp else 32.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1562f0))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(cardPadding)
+            ) {
+                Text(
+                    "Welcome to Beamio Web3 POS!",
+                    fontSize = titleSize,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier.padding(bottom = if (compact) 6.dp else 12.dp)
+                )
+                Text(
+                    "Your EOA Vault is ready. You can currently send/receive direct USDC payments. Your Smart Terminal (AA) is locked. To unlock zero-gas routing, VIP memberships, and voucher economies, purchase a Fuel Pack or join an Alliance.",
+                    fontSize = bodySize,
+                    color = Color.White.copy(alpha = 0.9f),
+                    lineHeight = bodyLineHeight,
+                    modifier = Modifier.padding(bottom = if (compact) 0.dp else bodyBottomPadding),
+                    maxLines = if (compact) 2 else Int.MAX_VALUE,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
 fun NdefScreen(
     uidText: String,
     readUrlText: String,
@@ -4561,6 +4675,7 @@ fun NdefScreen(
     onTopupClick: () -> Unit,
     onPaymentClick: () -> Unit,
     onCopyUrlClick: () -> Unit,
+    contentAboveCharge: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     var walletCopied by mutableStateOf(false)
@@ -4573,16 +4688,15 @@ fun NdefScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.statusBars)
-            .verticalScroll(rememberScrollState()),
-        verticalArrangement = Arrangement.Top
+            .windowInsetsPadding(WindowInsets.statusBars),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
     ) {
-        // Header: B icon + Terminal + Active Node (per design)
+        // Header: B icon + Terminal + Active Node (compact)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp, vertical = 20.dp)
-                .padding(top = 36.dp),
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+                .padding(top = 16.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -4597,7 +4711,7 @@ fun NdefScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Image(
-                        painter = painterResource(R.mipmap.ic_launcher),
+                        painter = painterResource(R.drawable.ic_launcher_adaptive),
                         contentDescription = "App icon",
                         modifier = Modifier
                             .fillMaxSize()
@@ -4617,25 +4731,25 @@ fun NdefScreen(
             }
         }
 
-        // Content area
+        // Content area (weight fills remaining height, compact)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 24.dp)
-                .padding(bottom = 32.dp)
+                .weight(1f)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
         ) {
-            // Summary card (Charges | Top-Ups) - per design
+            // Summary card (Charges | Top-Ups) - compact
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 24.dp),
+                    .padding(bottom = 8.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.Black),
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(24.dp)
+                        .padding(12.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -4643,51 +4757,51 @@ fun NdefScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(bottom = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
                                 Box(
-                                    modifier = Modifier.size(24.dp).background(Color(0xFF1562f0).copy(alpha = 0.2f), CircleShape),
+                                    modifier = Modifier.size(18.dp).background(Color(0xFF1562f0).copy(alpha = 0.2f), CircleShape),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(Icons.Filled.ArrowDownward, null, Modifier.size(12.dp), tint = Color(0xFF1562f0))
+                                    Icon(Icons.Filled.ArrowDownward, null, Modifier.size(10.dp), tint = Color(0xFF1562f0))
                                 }
-                                Text("Charges", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                                Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                             }
                             Row(verticalAlignment = Alignment.Bottom) {
-                                Text("$845", fontSize = 28.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                                Text(".00", fontSize = 18.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 2.dp))
+                                Text("$845", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                Text(".00", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 1.dp))
                             }
                         }
                         Box(
                             modifier = Modifier
                                 .width(1.dp)
-                                .height(64.dp)
+                                .height(44.dp)
                                 .background(Color.White.copy(alpha = 0.1f))
                         )
                         Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(bottom = 8.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
                                 Box(
-                                    modifier = Modifier.size(24.dp).background(Color(0xFF34C759).copy(alpha = 0.2f), CircleShape),
+                                    modifier = Modifier.size(18.dp).background(Color(0xFF34C759).copy(alpha = 0.2f), CircleShape),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Icon(Icons.Filled.ArrowUpward, null, Modifier.size(12.dp), tint = Color(0xFF34C759))
+                                    Icon(Icons.Filled.ArrowUpward, null, Modifier.size(10.dp), tint = Color(0xFF34C759))
                                 }
-                                Text("Top-Ups", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                                Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                             }
                             Row(
                                 verticalAlignment = Alignment.Bottom,
                                 horizontalArrangement = Arrangement.End,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("$400", fontSize = 28.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                                Text(".00", fontSize = 18.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 2.dp))
+                                Text("$400", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                Text(".00", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 1.dp))
                             }
                         }
                     }
-                    // Bottom row: ID + SECURED (per design)
+                    // Bottom row: ID + SECURED (compact)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 16.dp),
+                            .padding(top = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
@@ -4725,93 +4839,114 @@ fun NdefScreen(
                 }
             }
 
+            if (contentAboveCharge != null) {
+                Box(modifier = Modifier.padding(bottom = 8.dp)) {
+                    contentAboveCharge()
+                }
+            }
+
             // Charge
             Card(
                 onClick = onPaymentClick,
-                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(
-                            modifier = Modifier.size(56.dp).background(Color(0xFF1562f0).copy(alpha = 0.1f), RoundedCornerShape(12.dp)),
+                            modifier = Modifier.size(40.dp).background(Color(0xFF1562f0).copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.QrCode2, null, Modifier.size(24.dp), tint = Color(0xFF1562f0))
+                            Icon(Icons.Filled.QrCode2, null, Modifier.size(20.dp), tint = Color(0xFF1562f0))
                         }
                         Column {
-                            Text("Charge", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Accept NFC or QR code", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                            Text("Charge", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                            Text("Accept NFC or QR code", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                         }
                     }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(20.dp), tint = Color(0xFFc7c7cc))
+                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
+                }
                 }
             }
             Card(
                 onClick = onTopupClick,
-                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(
-                            modifier = Modifier.size(56.dp).background(Color(0xFF34C759).copy(alpha = 0.1f), CircleShape),
+                            modifier = Modifier.size(40.dp).background(Color(0xFF34C759).copy(alpha = 0.1f), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.Add, null, Modifier.size(24.dp), tint = Color(0xFF34C759))
+                            Icon(Icons.Filled.Add, null, Modifier.size(20.dp), tint = Color(0xFF34C759))
                         }
                         Column {
-                            Text("Top-Up / Mint", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Load balance or new card", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                            Text("Top-Up / Mint", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                            Text("Load balance or new card", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                         }
                     }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(20.dp), tint = Color(0xFFc7c7cc))
+                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
+                }
                 }
             }
             Card(
                 onClick = onReadClick,
-                modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
+                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 8.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(16.dp)
             ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(24.dp),
+                    modifier = Modifier.fillMaxWidth().padding(12.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Box(
-                            modifier = Modifier.size(56.dp).background(Color(0xFFf4f4f5), CircleShape),
+                            modifier = Modifier.size(40.dp).background(Color(0xFFf4f4f5), CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(Icons.Filled.Search, null, Modifier.size(24.dp), tint = Color.Black)
+                            Icon(Icons.Filled.Search, null, Modifier.size(20.dp), tint = Color.Black)
                         }
                         Column {
-                            Text("Check Balance", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Read member profile", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                            Text("Check Balance", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                            Text("Read member profile", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                         }
                     }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(20.dp), tint = Color(0xFFc7c7cc))
+                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
+                }
                 }
             }
 
             if (readUrlText.isNotBlank()) {
-                Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = readUrlText, modifier = Modifier.weight(1f), fontSize = 11.sp)
-                    IconButton(onClick = onCopyUrlClick) { Text("📋") }
+                Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(text = readUrlText, modifier = Modifier.weight(1f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    IconButton(onClick = onCopyUrlClick, modifier = Modifier.size(32.dp)) { Text("📋", fontSize = 12.sp) }
                 }
             }
-            if (readParamText.isNotBlank()) Text(readParamText, fontSize = 11.sp, color = Color(0xFF64748b), modifier = Modifier.padding(top = 8.dp))
+            if (readParamText.isNotBlank()) Text(readParamText, fontSize = 10.sp, color = Color(0xFF64748b), modifier = Modifier.padding(top = 4.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -4888,85 +5023,30 @@ internal fun ScanMethodSelectionScreen(
     val showPaymentSuccess = pendingAction == "payment" && paymentStatus is PaymentStatus.Success
     val showPaymentError = pendingAction == "payment" && paymentStatus is PaymentStatus.Error
 
-    Column(
+    Box(
         modifier = modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .background(Color(0xFFf5f5f7)),
-        verticalArrangement = Arrangement.Top
+            .background(Color(0xFFf5f5f7))
     ) {
-        // Top Toggle: NFC vs QR（扫描进行中时隐藏，但保留占位以保持中央区域原位）
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(120.dp)
+        // 280.dp area: centered by full screen height (independent of top/bottom controls)
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize()
         ) {
-            if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 56.dp, start = 24.dp, end = 24.dp),
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Card(
-                        shape = RoundedCornerShape(999.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.08f))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(6.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Button(
-                                onClick = { onScanMethodChange("nfc") },
-                                modifier = Modifier.height(40.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (scanMethod == "nfc") Color(0xFF1562f0) else Color.Transparent,
-                                    contentColor = if (scanMethod == "nfc") Color.White else Color.Black.copy(alpha = 0.6f)
-                                ),
-                                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp)
-                            ) {
-                                Icon(Icons.Filled.Nfc, null, Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Tap Card", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                            Button(
-                                onClick = { onScanMethodChange("qr") },
-                                modifier = Modifier.height(40.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (scanMethod == "qr") Color(0xFF1562f0) else Color.Transparent,
-                                    contentColor = if (scanMethod == "qr") Color.White else Color.Black.copy(alpha = 0.6f)
-                                ),
-                                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 8.dp)
-                            ) {
-                                Icon(Icons.Filled.QrCode2, null, Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Scan QR", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Scanning area
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            // 扫描区始终渲染，由内部状态分支决定显示内容
-            if (true) {
-                // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
-                if (showPaymentSuccess) {
+            val scanSize = minOf(280.dp, maxHeight - 64.dp).coerceIn(160.dp, 280.dp)
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                // 扫描区始终渲染，由内部状态分支决定显示内容
+                if (true) {
+                    // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
+                    if (showPaymentSuccess) {
                     // Charge 贴卡成功后：在中间窗口显示 PaymentSuccessContent，不跳新页
                     Column(
                         modifier = Modifier
+                            .fillMaxSize()
                             .fillMaxWidth()
-                            .weight(1f)
                             .verticalScroll(rememberScrollState())
                     ) {
                         PaymentSuccessContent(
@@ -4992,8 +5072,8 @@ internal fun ScanMethodSelectionScreen(
                     // Charge 贴卡失败：显示 Smart Routing 步骤 + 错误
                     Column(
                         modifier = Modifier
+                            .fillMaxSize()
                             .fillMaxWidth()
-                            .weight(1f)
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 24.dp)
                     ) {
@@ -5039,8 +5119,8 @@ internal fun ScanMethodSelectionScreen(
                     // Charge 贴卡后：显示 Smart Routing 完整流程
                     Column(
                         modifier = Modifier
+                            .fillMaxSize()
                             .fillMaxWidth()
-                            .weight(1f)
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 24.dp)
                     ) {
@@ -5099,7 +5179,7 @@ internal fun ScanMethodSelectionScreen(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(280.dp)
+                                .size(scanSize)
                                 .align(Alignment.Center)
                         ) {
                             Card(
@@ -5156,7 +5236,7 @@ internal fun ScanMethodSelectionScreen(
                     ) {
                         Box(
                             modifier = Modifier
-                                .size(280.dp)
+                                .size(scanSize)
                                 .align(Alignment.Center)
                         ) {
                             Card(
@@ -5200,55 +5280,56 @@ internal fun ScanMethodSelectionScreen(
                         }
                     }
                 } else if (nfcFetchError.isNotEmpty()) {
-                    // 拉取失败：在 280.dp 框内显示错误，点击可重试
-                    Column(
+                    // 拉取失败：在 scanSize 框内显示错误，点击可重试（与 Tap Card 同结构，独立居中）
+                    Box(
                         modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
                             .clickable { onProceedNfcStay?.invoke() }
-                            .padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Box(
+                        Card(
                             modifier = Modifier
-                                .size(280.dp)
-                                .padding(bottom = 8.dp)
+                                .size(scanSize)
+                                .align(Alignment.Center),
+                            shape = RoundedCornerShape(32.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
                         ) {
-                            Card(
-                                modifier = Modifier.fillMaxSize(),
-                                shape = RoundedCornerShape(32.dp),
-                                colors = CardDefaults.cardColors(containerColor = Color.White),
-                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp)
                             ) {
-                                Box(
+                                Text(
+                                    nfcFetchError,
+                                    fontSize = 14.sp,
+                                    color = Color(0xFFef4444),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                                Text(
+                                    "Tap to retry",
+                                    fontSize = 15.sp,
+                                    color = Color(0xFF86868b),
                                     modifier = Modifier
-                                        .fillMaxSize()
-                                        .padding(16.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        nfcFetchError,
-                                        fontSize = 14.sp,
-                                        color = Color(0xFFef4444),
-                                        textAlign = TextAlign.Center
-                                    )
-                                }
+                                        .align(Alignment.BottomCenter)
+                                        .padding(bottom = 8.dp)
+                                )
                             }
                         }
-                        Text(
-                            "Tap to retry",
-                            fontSize = 15.sp,
-                            color = Color(0xFF86868b),
-                            textAlign = TextAlign.Center
-                        )
                     }
                 } else {
                     if (scanMethod == "qr") {
-                        Column(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                        // Same structure as Tap Card: Box with Card only, centered independently
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .wrapContentHeight()
                         ) {
                             Card(
                                 modifier = Modifier
-                                    .size(280.dp)
+                                    .size(scanSize)
+                                    .align(Alignment.Center)
                                     .then(
                                         if (qrScanningActive) Modifier
                                         else Modifier.clickable {
@@ -5259,36 +5340,29 @@ internal fun ScanMethodSelectionScreen(
                                 colors = CardDefaults.cardColors(containerColor = Color.White),
                                 border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
                             ) {
-                            Box(modifier = Modifier.fillMaxSize()) {
-                                if (qrScanningActive) {
-                                    EmbeddedQrScanner(
-                                        onResult = onQrScanResult,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                } else {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .background(Color.White),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Filled.QrCode2,
-                                            null,
-                                            Modifier.size(96.dp),
-                                            tint = Color.Black.copy(alpha = 0.1f)
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    if (qrScanningActive) {
+                                        EmbeddedQrScanner(
+                                            onResult = onQrScanResult,
+                                            modifier = Modifier.fillMaxSize()
                                         )
+                                    } else {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxSize()
+                                                .background(Color.White),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                Icons.Filled.QrCode2,
+                                                null,
+                                                Modifier.size(96.dp),
+                                                tint = Color.Black.copy(alpha = 0.1f)
+                                            )
+                                        }
                                     }
                                 }
                             }
-                            }
-                            Text(
-                                if (qrScanningActive) "Scanning..." else "",
-                                fontSize = 15.sp,
-                                color = Color(0xFF86868b),
-                                modifier = Modifier.padding(top = 12.dp),
-                                textAlign = TextAlign.Center
-                            )
                         }
                     } else {
                         // Tap Card（payment/read/topup 统一）：正方形区域整块为触发区
@@ -5299,7 +5373,7 @@ internal fun ScanMethodSelectionScreen(
                         ) {
                             Card(
                                 modifier = Modifier
-                                    .size(280.dp)
+                                    .size(scanSize)
                                     .align(Alignment.Center)
                                     .clickable(enabled = !scanWaitingForNfc && !nfcFetchingInfo) {
                                         onProceedNfcStay?.invoke()
@@ -5326,12 +5400,85 @@ internal fun ScanMethodSelectionScreen(
                     }
                 }
             }
+            }
         }
 
-        // Bottom: Total amount + Proceed + Cancel
+        // Top bar overlay: Back button (left) + NFC/QR toggle (center, when visible)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(
+                    if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess)
+                        120.dp
+                    else
+                        BACK_BUTTON_TOP_BAR_HEIGHT
+                )
+                .background(Color(0xFFf5f5f7))
+                .align(Alignment.TopCenter)
+        ) {
+            BackButtonIcon(
+                onClick = {
+                    if (showPaymentSuccess) onPaymentDone()
+                    else onCancel()
+                },
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
+            )
+            if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = TOP_BAR_CAPSULE_TITLE_PADDING, start = 24.dp, end = 24.dp),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Card(
+                        shape = RoundedCornerShape(999.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.08f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(6.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Button(
+                                onClick = { onScanMethodChange("nfc") },
+                                modifier = Modifier.height(40.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (scanMethod == "nfc") Color(0xFF1562f0) else Color.Transparent,
+                                    contentColor = if (scanMethod == "nfc") Color.White else Color.Black.copy(alpha = 0.6f)
+                                ),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                            ) {
+                                Icon(Icons.Filled.Nfc, null, Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Tap Card", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Button(
+                                onClick = { onScanMethodChange("qr") },
+                                modifier = Modifier.height(40.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (scanMethod == "qr") Color(0xFF1562f0) else Color.Transparent,
+                                    contentColor = if (scanMethod == "qr") Color.White else Color.Black.copy(alpha = 0.6f)
+                                ),
+                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                            ) {
+                                Icon(Icons.Filled.QrCode2, null, Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Scan QR", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bottom overlay: Total amount (when applicable)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .background(Color(0xFFf5f5f7))
+                .align(Alignment.BottomCenter)
                 .padding(24.dp)
         ) {
             if (pendingAction != "read" && totalAmount.isNotBlank() && !showPaymentSuccess) {
@@ -5343,30 +5490,16 @@ internal fun ScanMethodSelectionScreen(
                         if (pendingAction == "payment") "Total Amount" else "Top-Up Amount",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
-                        color = Color(0xFF86868b)
+                        color = if (pendingAction == "topup") Color(0xFF1562f0) else Color(0xFF86868b)
                     )
                     Text(
                         "$${"%.2f".format(totalAmount.toDoubleOrNull() ?: 0.0)}",
                         fontSize = 40.sp,
                         fontWeight = FontWeight.SemiBold,
-                        color = Color.Black,
+                        color = if (pendingAction == "topup") Color(0xFF1562f0) else Color.Black,
                         modifier = Modifier.padding(bottom = 32.dp)
                     )
                 }
-            }
-            TextButton(
-                onClick = {
-                    if (showPaymentSuccess) onPaymentDone()
-                    else onCancel()
-                },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    if (showPaymentSuccess) "Done" else "Cancel",
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = Color(0xFF1562f0)
-                )
             }
         }
     }
@@ -5391,27 +5524,30 @@ fun TipSelectionScreen(
             .background(Color(0xFFf5f5f7)),
         verticalArrangement = Arrangement.Top
     ) {
-        // Header: Back | Add Tip | spacer
-        Row(
+        // Header: Back (aligned with scan page) | Add Tip (aligned with Charge Amount title)
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp)
-                .padding(top = 36.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .height(120.dp)
         ) {
-            Row(
-                modifier = Modifier.clickable { onBack() },
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, null, Modifier.size(24.dp), tint = Color(0xFF1562f0))
-                Text("Back", fontSize = 17.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
-            }
-            Text("Add Tip", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-            Box(modifier = Modifier.width(64.dp))
+            BackButtonIcon(
+                onClick = onBack,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
+            )
+            Text(
+                "Add Tip",
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.Black,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = TOP_BAR_CAPSULE_TITLE_PADDING)
+            )
         }
 
+        // Scrollable middle: Subtotal + Tip options (height-adaptive)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -5423,7 +5559,7 @@ fun TipSelectionScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 8.dp, bottom = 32.dp),
+                    .padding(top = 8.dp, bottom = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Row(
@@ -5440,7 +5576,7 @@ fun TipSelectionScreen(
                 Text("$${"%.2f".format(numAmount)}", fontSize = 48.sp, fontWeight = FontWeight.Light, color = Color.Black)
             }
 
-            // Tip options: 2x2 grid - 15%, 18%, 20%, No Tip
+            // Tip options: 2x2 grid - 15%, 18%, 20%, No Tip (compact padding for small screens)
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 listOf(
                     listOf(0.15 to "15%", 0.18 to "18%"),
@@ -5465,7 +5601,7 @@ fun TipSelectionScreen(
                                 Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(vertical = 32.dp),
+                                        .padding(vertical = 24.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally,
                                     verticalArrangement = Arrangement.Center
                                 ) {
@@ -5488,39 +5624,41 @@ fun TipSelectionScreen(
                     }
                 }
             }
+        }
 
-            // Total + Confirm & Pay
-            Card(
+        // Total Pay panel: fixed at bottom, always visible, ensures Confirm & Pay button is never clipped
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 24.dp, top = 16.dp, end = 24.dp, bottom = 24.dp),
+            shape = RoundedCornerShape(32.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.Black)
+        ) {
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 24.dp, bottom = 48.dp),
-                shape = RoundedCornerShape(32.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.Black)
+                    .padding(20.dp)
             ) {
-                Column(
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Text("Total to Pay", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                    Text("$${"%.2f".format(totalAmount)}", fontSize = 36.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+                }
+                Button(
+                    onClick = onConfirmPay,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(24.dp)
+                        .heightIn(min = 56.dp)
+                        .padding(top = 20.dp),
+                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Bottom
-                    ) {
-                        Text("Total to Pay", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                        Text("$${"%.2f".format(totalAmount)}", fontSize = 40.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                    }
-                    Button(
-                        onClick = onConfirmPay,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 24.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
-                    ) {
-                        Text("Confirm & Pay", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Icon(Icons.Filled.ChevronRight, null, Modifier.size(20.dp), tint = Color.Black)
-                    }
+                    Text("Confirm & Pay", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(16.dp), tint = Color.Black)
                 }
             }
         }
@@ -5547,25 +5685,27 @@ fun ChargeAmountScreen(
             .background(Color(0xFFf5f5f7)),
         verticalArrangement = Arrangement.Top
     ) {
-        // Header: Back | Charge Amount | spacer
-        Row(
+        // Header: Back (aligned with scan page) | title (aligned with scan page capsule)
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp)
-                .padding(top = 36.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .height(120.dp)
         ) {
-            Row(
-                modifier = Modifier.clickable { onBack() },
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, null, Modifier.size(24.dp), tint = Color(0xFF1562f0))
-                Text("Back", fontSize = 17.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
-            }
-            Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-            Box(modifier = Modifier.width(64.dp))
+            BackButtonIcon(
+                onClick = onBack,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
+            )
+            Text(
+                title,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.Black,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = TOP_BAR_CAPSULE_TITLE_PADDING)
+            )
         }
 
         // Big amount display
@@ -5635,7 +5775,7 @@ fun ChargeAmountScreen(
             Button(
                 onClick = onContinue,
                 enabled = canContinue,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().height(48.dp),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (canContinue) continueBtnColor else Color(0xFFe5e5ea),
                     disabledContainerColor = Color(0xFFe5e5ea),
@@ -5643,7 +5783,7 @@ fun ChargeAmountScreen(
                     disabledContentColor = Color(0xFF86868b)
                 )
             ) {
-                Text("Continue", fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("Continue", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
         }
     }
@@ -5687,12 +5827,12 @@ fun InitFlowScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (allowContinue) {
-                    Button(onClick = onContinue) {
-                        Text("Continue")
+                    Button(onClick = onContinue, modifier = Modifier.height(48.dp)) {
+                        Text("Continue", fontSize = 14.sp)
                     }
                 }
-                Button(onClick = onCancel) {
-                    Text("cancel")
+                Button(onClick = onCancel, modifier = Modifier.height(48.dp)) {
+                    Text("cancel", fontSize = 14.sp)
                 }
             }
         } else {
@@ -5703,8 +5843,8 @@ fun InitFlowScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(onClick = onCancel) {
-                    Text("cancel")
+                Button(onClick = onCancel, modifier = Modifier.height(24.dp)) {
+                    Text("cancel", fontSize = 14.sp)
                 }
             }
         }

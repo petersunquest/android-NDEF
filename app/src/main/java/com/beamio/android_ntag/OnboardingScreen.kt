@@ -1,7 +1,10 @@
 package com.beamio.android_ntag
 
 import android.app.Activity
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +18,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
@@ -31,13 +35,99 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+/**
+ * 无钱包时的欢迎页：Merchant OS 品牌 + Create Wallet 入口，点击后进入 OnboardingScreen。
+ */
+@Composable
+fun WelcomePage(
+    versionName: String,
+    onCreateWalletClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val haptic = LocalHapticFeedback.current
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .background(Color.White)
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "v$versionName",
+                    fontSize = 12.sp,
+                    color = Color(0xFFd1d5db),
+                    modifier = Modifier.align(Alignment.TopEnd)
+                )
+            }
+            Spacer(modifier = Modifier.height(72.dp))
+            Image(
+                painter = painterResource(R.drawable.ic_launcher_adaptive),
+                contentDescription = "App icon",
+                modifier = Modifier
+                    .size(80.dp)
+                    .shadow(12.dp, RoundedCornerShape(16.dp)),
+                contentScale = ContentScale.Fit
+            )
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                text = "Soft POS",
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Black
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "The Commerce State Layer for USDC.",
+                fontSize = 16.sp,
+                color = Color(0xFF9ca3af)
+            )
+            Spacer(modifier = Modifier.height(48.dp))
+            Button(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onCreateWalletClick()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White),
+                shape = RoundedCornerShape(14.dp)
+            ) {
+                Text("Create Wallet", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        Text(
+            text = "Gas Sponsored. Non-custodial.",
+            fontSize = 13.sp,
+            color = Color(0xFFd1d5db),
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+    }
+}
 
 /**
  * Beamio 钱包创建引导页：BeamioTag + PIN，与 LoadingPage/CreateUsernamePinScreen 流程一致。
@@ -45,6 +135,7 @@ import androidx.compose.ui.unit.sp
 @Composable
 fun OnboardingScreen(
     onCreateComplete: (privateKeyHex: String) -> Unit,
+    onBackToWelcome: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -63,17 +154,23 @@ fun OnboardingScreen(
         modifier = modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
-            .padding(24.dp)
             .verticalScroll(rememberScrollState())
     ) {
+        BackButtonTopBar(
+            onClick = {
+                if (step == 1) onBackToWelcome() else step = 1
+            }
+        )
+        Column(modifier = Modifier.padding(24.dp)) {
+        Spacer(modifier = Modifier.height(16.dp))
         Text(
-            text = "Create Beamio Wallet",
+            text = if (step == 1) "Claim BeamioTag" else "Secure Wallet",
             fontSize = 24.sp,
             fontWeight = FontWeight.Bold,
             modifier = Modifier.padding(bottom = 8.dp)
         )
         Text(
-            text = "Your unique identity in the commerce layer.",
+            text = if (step == 1) "Your unique identity in the commerce layer." else "Encrypts your keys locally.",
             fontSize = 16.sp,
             color = Color(0xFF64748b),
             modifier = Modifier.padding(bottom = 24.dp)
@@ -99,7 +196,6 @@ fun OnboardingScreen(
                     tagError = if (available) "" else "@$trimmedTag is already taken"
                     if (available) lastValidatedTag = trimmedTag
                 }
-                Text(text = "BeamioTag (3–20 chars)", fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(bottom = 8.dp))
                 OutlinedTextField(
                     value = beamioTag,
                     onValueChange = {
@@ -111,7 +207,18 @@ fun OnboardingScreen(
                     },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
-                    placeholder = { Text("tagname") },
+                    placeholder = { Text("tagname", color = Color(0xFF9ca3af)) },
+                    prefix = { Text("@", color = Color(0xFF6b7280), fontSize = 16.sp) },
+                    trailingIcon = {
+                        if (tagStatus == "valid") {
+                            Icon(
+                                Icons.Filled.CheckCircle,
+                                contentDescription = "Valid",
+                                modifier = Modifier.size(20.dp),
+                                tint = Color(0xFF34C759)
+                            )
+                        }
+                    },
                     enabled = !loading && tagStatus != "checking"
                 )
                 if (tagStatus == "checking") {
@@ -126,24 +233,37 @@ fun OnboardingScreen(
                 } else if (tagStatus == "invalid" && tagError.isNotEmpty()) {
                     Text(text = tagError, fontSize = 14.sp, color = Color(0xFFef4444), modifier = Modifier.padding(top = 8.dp))
                 } else {
-                    Text(
-                        text = "Permanent. Cannot be changed later.",
-                        fontSize = 13.sp,
-                        color = Color(0xFFf97316),
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
+                    Row(
+                        modifier = Modifier.padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Warning,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = Color(0xFFf97316)
+                        )
+                        Text(
+                            text = "Permanent. Cannot be changed later.",
+                            fontSize = 13.sp,
+                            color = Color(0xFFf97316)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(24.dp))
                 Button(
                     onClick = { step = 2 },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = tagValid && tagStatus == "valid" && !loading
+                    enabled = tagValid && tagStatus == "valid" && !loading,
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White),
+                    shape = RoundedCornerShape(24.dp)
                 ) {
-                    Text("Next")
+                    Text("Next →", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
             2 -> {
-                Text(text = "Set Password (6+ chars)", fontSize = 14.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(bottom = 8.dp))
+                var passwordVisible by remember { mutableStateOf(false) }
                 OutlinedTextField(
                     value = pin,
                     onValueChange = {
@@ -152,17 +272,38 @@ fun OnboardingScreen(
                     },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
-                    placeholder = { Text("Encrypts your keys locally") },
-                    visualTransformation = PasswordVisualTransformation(),
+                    placeholder = { Text("Password", color = Color(0xFF9ca3af)) },
+                    visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    trailingIcon = {
+                        IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Icon(
+                                if (passwordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (passwordVisible) "Hide password" else "Show password",
+                                modifier = Modifier.size(20.dp),
+                                tint = Color(0xFF6b7280)
+                            )
+                        }
+                    },
                     enabled = !loading
                 )
-                Text(
-                    text = "Beamio is non-custodial. We cannot reset this.",
-                    fontSize = 13.sp,
-                    color = Color(0xFF64748b),
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+                Row(
+                    modifier = Modifier.padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Shield,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFF9ca3af)
+                    )
+                    Text(
+                        text = "Beamio is non-custodial. We cannot reset this.",
+                        fontSize = 13.sp,
+                        color = Color(0xFF9ca3af)
+                    )
+                }
                 if (error.isNotEmpty()) {
                     Text(text = error, fontSize = 14.sp, color = Color(0xFFef4444), modifier = Modifier.padding(top = 8.dp))
                 }
@@ -177,44 +318,36 @@ fun OnboardingScreen(
                         Text(text = "Creating wallet & registering...", fontSize = 14.sp)
                     }
                 } else {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Button(
-                            onClick = { step = 1 },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("Back")
-                        }
-                        Button(
-                            onClick = {
-                                if (pin.trim().length < 6) {
-                                    error = "Password must be 6+ characters"
-                                    return@Button
-                                }
-                                loading = true
-                                error = ""
-                                Thread {
-                                    val result = BeamioWalletService.createRecover(beamioTag.trim(), pin.trim())
-                                    activity?.runOnUiThread {
-                                        loading = false
-                                        if (result != null) {
-                                            onCreateComplete(result.privateKeyHex)
-                                        } else {
-                                            error = "Create failed. BeamioTag may be taken or network error."
-                                        }
+                    Button(
+                        onClick = {
+                            if (pin.trim().length < 6) {
+                                error = "Password must be 6+ characters"
+                                return@Button
+                            }
+                            loading = true
+                            error = ""
+                            Thread {
+                                val result = BeamioWalletService.createRecover(beamioTag.trim(), pin.trim())
+                                activity?.runOnUiThread {
+                                    loading = false
+                                    if (result != null) {
+                                        onCreateComplete(result.privateKeyHex)
+                                    } else {
+                                        error = "Create failed. BeamioTag may be taken or network error."
                                     }
-                                }.start()
-                            },
-                            modifier = Modifier.weight(1f),
-                            enabled = pin.trim().length >= 6
-                        ) {
-                            Text("Create Wallet")
-                        }
+                                }
+                            }.start()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = pin.trim().length >= 6,
+                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White),
+                        shape = RoundedCornerShape(24.dp)
+                    ) {
+                        Text("Create Wallet", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
+        }
         }
     }
 }
