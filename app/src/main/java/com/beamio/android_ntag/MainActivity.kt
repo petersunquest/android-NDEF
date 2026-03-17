@@ -282,6 +282,7 @@ class MainActivity : ComponentActivity() {
     private var readScreenWallet by mutableStateOf<String?>(null)
     private var readScreenStatus by mutableStateOf<ReadStatus>(ReadStatus.Waiting)
     private var readScreenAssets by mutableStateOf<UIDAssets?>(null)
+    private var readScreenRawJson by mutableStateOf<String?>(null)
     private var readScreenError by mutableStateOf("")
 
     private var showPaymentScreen by mutableStateOf(false)
@@ -435,6 +436,7 @@ class MainActivity : ComponentActivity() {
                         readScreenWallet = wallet ?: ""
                         readScreenStatus = ReadStatus.Loading
                         readScreenAssets = null
+                        readScreenRawJson = null
                         readScreenError = ""
                         readArmed = false
                         if (beamioTab != null) {
@@ -658,6 +660,7 @@ class MainActivity : ComponentActivity() {
                         uid = readScreenUid,
                         status = readScreenStatus,
                         assets = readScreenAssets,
+                        rawResponseJson = readScreenRawJson,
                         error = readScreenError,
                         settlementViaQr = readViaQr,
                         onBack = { closeReadScreen() },
@@ -939,6 +942,7 @@ class MainActivity : ComponentActivity() {
         readScreenWallet = null
         readScreenStatus = ReadStatus.Waiting
         readScreenAssets = null
+        readScreenRawJson = null
         readScreenError = ""
     }
 
@@ -965,6 +969,7 @@ class MainActivity : ComponentActivity() {
                 readScreenWallet = null
                 readScreenStatus = ReadStatus.Loading
                 readScreenAssets = null
+                readScreenRawJson = null
                 readScreenError = ""
                 readArmed = true
                 initArmed = false
@@ -1026,6 +1031,7 @@ class MainActivity : ComponentActivity() {
                 readScreenWallet = null
                 readScreenStatus = ReadStatus.Waiting
                 readScreenAssets = null
+                readScreenRawJson = null
                 readScreenError = ""
                 readArmed = true
                 initArmed = false
@@ -2384,6 +2390,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     if (parsed.ok) {
                         readScreenAssets = parsed
+                        readScreenRawJson = json
                         readScreenStatus = ReadStatus.Success
                         readScreenError = ""
                     } else {
@@ -2648,6 +2655,7 @@ class MainActivity : ComponentActivity() {
                     val fromScan = nfcFetchingInfo
                     if (parsed.ok) {
                         readScreenAssets = parsed
+                        readScreenRawJson = json
                         readScreenStatus = ReadStatus.Success
                         readScreenError = ""
                         if (fromScan) {
@@ -4033,6 +4041,7 @@ internal fun ReadScreen(
     uid: String,
     status: ReadStatus,
     assets: UIDAssets?,
+    rawResponseJson: String? = null,
     error: String,
     settlementViaQr: Boolean = false,
     onBack: () -> Unit,
@@ -4333,6 +4342,61 @@ internal fun ReadScreen(
                                             fontWeight = FontWeight.Medium,
                                             color = Color(0xFF34C759)
                                         )
+                                    }
+                                }
+                            }
+                        }
+                        // Response Data (server response for debugging)
+                        if (rawResponseJson != null && rawResponseJson.isNotBlank()) {
+                            var responseExpanded by remember { mutableStateOf(false) }
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 12.dp)
+                                    .clickable { responseExpanded = !responseExpanded },
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "Response Data",
+                                            fontSize = 15.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF86868b)
+                                        )
+                                        Text(
+                                            if (responseExpanded) "▼" else "▶",
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF86868b)
+                                        )
+                                    }
+                                    if (responseExpanded) {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(max = 400.dp)
+                                                .verticalScroll(rememberScrollState())
+                                                .background(Color(0xFFf8fafc), RoundedCornerShape(8.dp))
+                                                .padding(12.dp)
+                                        ) {
+                                            Text(
+                                                text = try {
+                                                    org.json.JSONObject(rawResponseJson).toString(2)
+                                                } catch (_: Exception) {
+                                                    rawResponseJson
+                                                },
+                                                fontSize = 10.sp,
+                                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                                color = Color(0xFF64748b)
+                                            )
+                                        }
                                     }
                                 }
                             }
