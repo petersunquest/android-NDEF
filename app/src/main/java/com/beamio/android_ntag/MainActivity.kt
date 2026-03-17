@@ -92,10 +92,13 @@ import androidx.compose.material.icons.filled.Nfc
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CreditCard
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.automirrored.filled.Label
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -1122,6 +1125,21 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 val sunParams = readSunParamsFromNdef(tag)
+                // NFC 格式（14 位 hex uid）必须提供 SUN 参数，不符合 SUN 或无法推导 tagID 的不予受理
+                val isNfcUid = uid.length == 14 && uid.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+                if (isNfcUid && sunParams == null) {
+                    val err = "Card does not support SUN. Cannot top up."
+                    runOnUiThread {
+                        val fromScan = nfcFetchingInfo
+                        topupScreenStatus = TopupStatus.Error
+                        topupScreenError = err
+                        if (fromScan) {
+                            nfcFetchingInfo = false
+                            nfcFetchError = err
+                        }
+                    }
+                    return@Thread
+                }
                 // 1. Topup 之前先拉取余额，对齐后端返回码（避免 UID/QR 混淆时解析 HTML 报错）
                 val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
                 if (preAssets == null || !preAssets.ok) {
@@ -1150,7 +1168,7 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
 
-                val prepare = nfcTopupPrepare(uid, amount)
+                val prepare = nfcTopupPrepare(uid, amount, sunParams)
                 if (prepare.error != null) {
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
@@ -1191,7 +1209,7 @@ class MainActivity : ComponentActivity() {
                     prepare.deadline!!,
                     prepare.nonce!!
                 )
-                val result = nfcTopup(uid, amount, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig)
+                val result = nfcTopup(uid, amount, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig, sunParams)
                 runOnUiThread {
                     val fromScan = nfcFetchingInfo
                     if (result.success) {
@@ -1266,16 +1284,16 @@ class MainActivity : ComponentActivity() {
         val wallet: String? = null
     )
 
-    private fun nfcTopupPrepare(uid: String, amount: String): NfcTopupPrepareResult =
-        nfcTopupPrepareInternal(uid = uid, wallet = null, beamioTag = null, amount = amount)
+    private fun nfcTopupPrepare(uid: String, amount: String, sunParams: SunParams? = null): NfcTopupPrepareResult =
+        nfcTopupPrepareInternal(uid = uid, wallet = null, beamioTag = null, amount = amount, sunParams = sunParams)
 
     private fun nfcTopupPrepareWithWallet(wallet: String, amount: String): NfcTopupPrepareResult =
-        nfcTopupPrepareInternal(uid = null, wallet = wallet, beamioTag = null, amount = amount)
+        nfcTopupPrepareInternal(uid = null, wallet = wallet, beamioTag = null, amount = amount, sunParams = null)
 
     private fun nfcTopupPrepareWithBeamioTag(beamioTag: String, amount: String): NfcTopupPrepareResult =
-        nfcTopupPrepareInternal(uid = null, wallet = null, beamioTag = beamioTag, amount = amount)
+        nfcTopupPrepareInternal(uid = null, wallet = null, beamioTag = beamioTag, amount = amount, sunParams = null)
 
-    private fun nfcTopupPrepareInternal(uid: String?, wallet: String?, beamioTag: String?, amount: String): NfcTopupPrepareResult {
+    private fun nfcTopupPrepareInternal(uid: String?, wallet: String?, beamioTag: String?, amount: String, sunParams: SunParams? = null): NfcTopupPrepareResult {
         val url = java.net.URL("$BEAMIO_API/api/nfcTopupPrepare")
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.requestMethod = "POST"
@@ -1287,6 +1305,7 @@ class MainActivity : ComponentActivity() {
             if (uid != null) put("uid", uid)
             if (wallet != null) put("wallet", wallet)
             if (beamioTag != null) put("beamioTag", beamioTag)
+            sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             put("amount", amount)
             put("currency", "CAD")
             put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
@@ -1500,7 +1519,7 @@ class MainActivity : ComponentActivity() {
 
     private data class NfcTopupResult(val success: Boolean, val txHash: String?, val error: String?)
 
-    private fun nfcTopup(uid: String, amount: String, cardAddr: String, data: String, deadline: Long, nonce: String, adminSignature: String): NfcTopupResult {
+    private fun nfcTopup(uid: String, amount: String, cardAddr: String, data: String, deadline: Long, nonce: String, adminSignature: String, sunParams: SunParams? = null): NfcTopupResult {
         val url = java.net.URL("$BEAMIO_API/api/nfcTopup")
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.requestMethod = "POST"
@@ -1515,6 +1534,7 @@ class MainActivity : ComponentActivity() {
             put("nonce", nonce)
             put("adminSignature", adminSignature)
             put("uid", uid)
+            sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             put("workflow", "adminTopup")
             put("topupMode", "admin")
         }.toString()
@@ -4194,11 +4214,30 @@ internal fun ReadScreen(
                                     modifier = Modifier.padding(16.dp),
                                     verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    Text("Account", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
-                                    FlowRow(
+                                    Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text("Account", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                                        counterVal?.let { cnt ->
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(999.dp))
+                                                    .background(Color.Black.copy(alpha = 0.06f))
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Icon(Icons.Filled.Refresh, null, Modifier.size(12.dp), tint = Color.Gray)
+                                                Text("$cnt", fontSize = 11.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = Color.Black)
+                                            }
+                                        }
+                                    }
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         eoaAddr?.let { addr ->
                                             AddressCapsule(
@@ -4208,6 +4247,7 @@ internal fun ReadScreen(
                                                 }
                                             )
                                         }
+                                        Spacer(modifier = Modifier.weight(1f))
                                         aaAddr?.let { addr ->
                                             AddressCapsule(
                                                 address = addr,
@@ -4217,16 +4257,29 @@ internal fun ReadScreen(
                                             )
                                         }
                                     }
-                                    FlowRow(
+                                    Row(
                                         modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         displayUid?.let { uidVal ->
-                                            HexCopyCapsule(label = "UID", value = uidVal, copyLabel = "uid")
+                                            HexCopyCapsule(
+                                                value = uidVal,
+                                                copyLabel = "uid",
+                                                leadingIcon = {
+                                                    Icon(Icons.Filled.Fingerprint, null, Modifier.size(12.dp), tint = Color(0xFF1562f0))
+                                                }
+                                            )
                                         }
+                                        Spacer(modifier = Modifier.weight(1f))
                                         if (tagId != null) {
-                                            HexCopyCapsule(label = "TagID", value = tagId, copyLabel = "tagId")
+                                            HexCopyCapsule(
+                                                value = tagId,
+                                                copyLabel = "tagId",
+                                                leadingIcon = {
+                                                    Icon(Icons.AutoMirrored.Filled.Label, null, Modifier.size(12.dp), tint = Color(0xFF7C3AED))
+                                                }
+                                            )
                                         } else {
                                             Row(
                                                 modifier = Modifier
@@ -4236,12 +4289,11 @@ internal fun ReadScreen(
                                                 verticalAlignment = Alignment.CenterVertically,
                                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                                             ) {
-                                                Text("TagID", fontSize = 10.sp, color = Color.Gray)
+                                                Icon(Icons.AutoMirrored.Filled.Label, null, Modifier.size(12.dp), tint = Color(0xFF7C3AED))
                                                 Text("—", fontSize = 11.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = Color.Gray)
                                             }
                                         }
                                     }
-                                    counterVal?.let { Text("Counter: $it", fontSize = 12.sp, color = Color.Black) }
                                 }
                             }
                             Spacer(modifier = Modifier.height(12.dp))
@@ -5066,12 +5118,13 @@ fun WelcomePanelNoAA(
     }
 }
 
-/** 十六进制值胶囊：label + 短缩 hex + copy 图标，点击复制完整值，成功后绿色 check 约 2 秒 */
+/** 十六进制值胶囊：leadingIcon（或 label 文本）+ 短缩 hex + copy 图标，点击复制完整值，成功后绿色 check 约 2 秒 */
 @Composable
 private fun HexCopyCapsule(
-    label: String,
     value: String,
     copyLabel: String,
+    leadingIcon: @Composable (() -> Unit)? = null,
+    label: String? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -5083,6 +5136,7 @@ private fun HexCopyCapsule(
         }
     }
     val short = if (value.length >= 10) "${value.take(6)}…${value.takeLast(4)}" else value
+    val desc = label ?: copyLabel
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(999.dp))
@@ -5096,7 +5150,11 @@ private fun HexCopyCapsule(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Text(label, fontSize = 10.sp, color = Color.Gray)
+        if (leadingIcon != null) {
+            leadingIcon()
+        } else if (label != null) {
+            Text(label, fontSize = 10.sp, color = Color.Gray)
+        }
         Text(
             short,
             fontSize = 11.sp,
@@ -5105,7 +5163,7 @@ private fun HexCopyCapsule(
         )
         Icon(
             if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-            contentDescription = "Copy $label",
+            contentDescription = "Copy $desc",
             modifier = Modifier.size(12.dp),
             tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
         )
