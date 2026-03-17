@@ -250,6 +250,9 @@ class MainActivity : ComponentActivity() {
         const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x02BAe511632354584b198951B42eC73BACBc4E98"
         /** CCSA 卡（与 config/base-addresses.json CCSA_CARD_ADDRESS 一致） */
         const val BASE_CCSA_CARD_ADDRESS = "0x2032A363BB2cf331142391fC0DAd21D6504922C7"
+        /** Base RPC，遵循 beamio-base-rpc */
+        private const val BASE_RPC_URL = "https://1rpc.io/base"
+        private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
     }
@@ -349,6 +352,10 @@ class MainActivity : ComponentActivity() {
     /** 终端首页头部：当前钱包 beamio profile 及上层 admin（merchant）profile */
     private var terminalProfile by mutableStateOf<TerminalProfile?>(null)
     private var terminalAdminProfile by mutableStateOf<TerminalProfile?>(null)
+
+    /** 卡统计：Charge=periodTransferAmount，Top-Up=redeemMintCounterFromClear */
+    private var cardChargeAmount by mutableStateOf<Double?>(null)
+    private var cardTopUpAmount by mutableStateOf<Double?>(null)
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) qrScanningActive = true
@@ -518,11 +525,23 @@ class MainActivity : ComponentActivity() {
                 }
                 LaunchedEffect(showWelcomePage, showOnboardingScreen, hasAAAccount) {
                     if (!showWelcomePage && !showOnboardingScreen && BeamioWeb3Wallet.isInitialized()) {
+                        val wallet = BeamioWeb3Wallet.getAddress() ?: ""
+                        if (wallet.isNotEmpty()) {
+                            val (cachedTerm, cachedAdmin) = loadProfileCache(wallet)
+                            terminalProfile = cachedTerm
+                            terminalAdminProfile = cachedAdmin
+                        }
                         Thread {
-                            val (profile, admin) = fetchTerminalProfileSync(BeamioWeb3Wallet.getAddress())
+                            val wallet = BeamioWeb3Wallet.getAddress()
+                            if (wallet.isNullOrEmpty()) return@Thread
+                            val (profile, admin) = fetchTerminalProfileSync(wallet)
+                            val (charge, topUp) = fetchCardStatsSync(wallet)
                             runOnUiThread {
-                                terminalProfile = profile
-                                terminalAdminProfile = admin
+                                if (profile != null) terminalProfile = profile
+                                if (admin != null) terminalAdminProfile = admin
+                                if (profile != null || admin != null) saveProfileCache(wallet, profile, admin)
+                                if (charge != null) cardChargeAmount = charge
+                                if (topUp != null) cardTopUpAmount = topUp
                             }
                         }.start()
                     }
@@ -763,6 +782,8 @@ class MainActivity : ComponentActivity() {
                         walletAddress = if (BeamioWeb3Wallet.isInitialized()) BeamioWeb3Wallet.getAddress() else null,
                         terminalProfile = terminalProfile,
                         adminProfile = terminalAdminProfile,
+                        chargeAmount = cardChargeAmount,
+                        topUpAmount = cardTopUpAmount,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -794,6 +815,8 @@ class MainActivity : ComponentActivity() {
                         walletAddress = if (BeamioWeb3Wallet.isInitialized()) BeamioWeb3Wallet.getAddress() else null,
                         terminalProfile = terminalProfile,
                         adminProfile = terminalAdminProfile,
+                        chargeAmount = cardChargeAmount,
+                        topUpAmount = cardTopUpAmount,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -1077,11 +1100,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun executeNfcTopup(uid: String, amount: String) {
+    private fun executeNfcTopup(tag: Tag, uid: String, amount: String) {
         Thread {
             try {
+                val sunParams = readSunParamsFromNdef(tag)
                 // 1. Topup 之前先拉取余额，对齐后端返回码（避免 UID/QR 混淆时解析 HTML 报错）
-                val preAssets = fetchUidAssetsSync(uid)
+                val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
                 if (preAssets == null || !preAssets.ok) {
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
@@ -1166,7 +1190,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenStatus = TopupStatus.Loading
                         Thread {
                             Thread.sleep(3000)
-                            val postAssets = fetchUidAssetsSync(uid)
+                            val postAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
@@ -1188,6 +1212,7 @@ class MainActivity : ComponentActivity() {
                                     topupScreenPostBalance = "—"
                                 }
                                 topupScreenStatus = TopupStatus.Success
+                                scheduleCardStatsRefetchAfterDelay()
                             }
                         }.start()
                     } else {
@@ -1404,6 +1429,7 @@ class MainActivity : ComponentActivity() {
                                     topupScreenPostBalance = "—"
                                 }
                                 topupScreenStatus = TopupStatus.Success
+                                scheduleCardStatsRefetchAfterDelay()
                             }
                         }.start()
                     } else {
@@ -1585,9 +1611,11 @@ class MainActivity : ComponentActivity() {
         return (points6.toDouble() / rate).toLong()
     }
 
-    private fun executePayment(uid: String, amountCad: String, payee: String) {
+    private fun executePayment(tag: Tag, uid: String, amountCad: String, payee: String) {
         Thread {
             try {
+                val sunParams = readSunParamsFromNdef(tag)
+                val effectiveUid = sunParams?.uid ?: uid
                 val amountNum = amountCad.toDoubleOrNull() ?: 0.0
                 if (amountNum <= 0) {
                     runOnUiThread {
@@ -1618,7 +1646,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
                 steps = updateStep(steps, "membership", StepStatus.success, "NFC card payment")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
-                val assets = fetchUidAssetsSync(uid)
+                val assets = fetchUidAssetsSync(effectiveUid, sunParams)
                 if (assets == null || !assets.ok) {
                     steps = updateStep(steps, "analyzingAssets", StepStatus.error, assets?.error ?: "Card not registered")
                     runOnUiThread {
@@ -1688,7 +1716,7 @@ class MainActivity : ComponentActivity() {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = payByNfcUidWithContainer(uid, amountUsdc6, payee, assets, oracle)
+                val result = payByNfcUidWithContainer(effectiveUid, amountUsdc6, payee, assets, oracle)
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 runOnUiThread {
@@ -1707,7 +1735,7 @@ class MainActivity : ComponentActivity() {
                         }
                         Thread {
                             Thread.sleep(3000)
-                            val postAssets = fetchUidAssetsSync(uid)
+                            val postAssets = fetchUidAssetsSync(effectiveUid, sunParams)
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
@@ -1715,6 +1743,7 @@ class MainActivity : ComponentActivity() {
                                     paymentScreenPostBalance = "—"
                                 }
                                 paymentScreenStatus = PaymentStatus.Success
+                                scheduleCardStatsRefetchAfterDelay()
                             }
                         }.start()
                     } else {
@@ -1996,6 +2025,7 @@ class MainActivity : ComponentActivity() {
                                     paymentScreenPostBalance = "—"
                                 }
                                 paymentScreenStatus = PaymentStatus.Success
+                                scheduleCardStatsRefetchAfterDelay()
                             }
                         }.start()
                     } else {
@@ -2061,7 +2091,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun fetchUidAssetsSync(uid: String): UIDAssets? {
+    /** SUN params from NDEF URL for getUIDAssets verification. */
+    private data class SunParams(val uid: String, val e: String, val c: String, val m: String)
+
+    /** Read uid,e,c,m from NDEF URL if card has valid SUN format. Returns null if NDEF missing or template (e/c/m all 0). */
+    private fun readSunParamsFromNdef(tag: Tag): SunParams? {
+        val ndef = Ndef.get(tag) ?: return null
+        return try {
+            ndef.connect()
+            val msg = ndef.cachedNdefMessage ?: ndef.ndefMessage
+            ndef.close()
+            val url = msg?.records?.firstNotNullOfOrNull { it.toUri()?.toString() } ?: return null
+            val uri = Uri.parse(url)
+            val uid = uri.getQueryParameter("uid")?.trim() ?: return null
+            val e = uri.getQueryParameter("e")?.trim() ?: return null
+            val c = uri.getQueryParameter("c")?.trim() ?: return null
+            val m = uri.getQueryParameter("m")?.trim() ?: return null
+            if (e.length != 64 || c.length != 6 || m.length != 16) return null
+            if (!e.matches(Regex("^[0-9a-fA-F]+$")) || !c.matches(Regex("^[0-9a-fA-F]+$")) || !m.matches(Regex("^[0-9a-fA-F]+$"))) return null
+            if (e.all { it == '0' } && c.all { it == '0' } && m.all { it == '0' }) return null
+            SunParams(uid, e, c, m)
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { ndef.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun fetchUidAssetsSync(uid: String, sunParams: SunParams? = null): UIDAssets? {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/getUIDAssets")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2070,7 +2127,10 @@ class MainActivity : ComponentActivity() {
             conn.doOutput = true
             conn.connectTimeout = 15000
             conn.readTimeout = 15000
-            val body = org.json.JSONObject().apply { put("uid", uid) }.toString()
+            val body = org.json.JSONObject().apply {
+                put("uid", uid)
+                sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+            }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val respBody = if (code in 200..299) conn.inputStream else conn.errorStream
@@ -2366,6 +2426,58 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 从本地加载 profile 缓存，遵循 beamio-ai-onchain-fetch：首屏优先使用本地可信数据 */
+    private fun loadProfileCache(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
+        return try {
+            val prefs = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+            val key = wallet.lowercase()
+            val termJson = prefs.getString("term:$key", null)
+            val adminJson = prefs.getString("admin:$key", null)
+            val term = termJson?.let { parseTerminalProfileFromJson(it) }
+            val admin = adminJson?.let { parseTerminalProfileFromJson(it) }
+            Pair(term, admin)
+        } catch (_: Exception) {
+            Pair(null, null)
+        }
+    }
+
+    private fun parseTerminalProfileFromJson(json: String): TerminalProfile? {
+        return try {
+            val o = org.json.JSONObject(json)
+            TerminalProfile(
+                accountName = o.optString("accountName").takeIf { it.isNotEmpty() },
+                first_name = o.optString("first_name").takeIf { it.isNotEmpty() },
+                last_name = o.optString("last_name").takeIf { it.isNotEmpty() },
+                image = o.optString("image").takeIf { it.isNotEmpty() },
+                address = o.optString("address").takeIf { it.isNotEmpty() }
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 保存可信 profile 到本地，仅成功拉取时调用 */
+    private fun saveProfileCache(wallet: String, terminal: TerminalProfile?, admin: TerminalProfile?) {
+        try {
+            val prefs = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+            val key = wallet.lowercase()
+            prefs.edit().apply {
+                if (terminal != null) putString("term:$key", terminalToJson(terminal))
+                if (admin != null) putString("admin:$key", terminalToJson(admin))
+                apply()
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun terminalToJson(p: TerminalProfile): String =
+        org.json.JSONObject().apply {
+            put("accountName", p.accountName ?: "")
+            put("first_name", p.first_name ?: "")
+            put("last_name", p.last_name ?: "")
+            put("image", p.image ?: "")
+            put("address", p.address ?: "")
+        }.toString()
+
     /** 拉取终端 profile 与上层 admin profile。参照 biz.tsx：cardOwner → searchUsername → BeamioCapsule。从 BeamioUserCard 卡合约获取 admin 列表，upperAdmin/owner → search-users → adminProfile。 */
     private fun fetchTerminalProfileSync(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
         val profile = fetchSearchUsersSync(wallet)
@@ -2425,7 +2537,90 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun fetchUidAssets(uid: String) {
+    /** 业务变更（topup/charge 完成）后 4 秒主动拉取 Charge/Top-Up，遵循 beamio-chain-fetch-protocol：业务变更时刷新。仅成功时更新，不覆盖可信数据。 */
+    private fun scheduleCardStatsRefetchAfterDelay() {
+        Thread {
+            Thread.sleep(4000)
+            val wallet = BeamioWeb3Wallet.getAddress() ?: ""
+            if (wallet.isNotEmpty()) {
+                val (charge, topUp) = fetchCardStatsSync(wallet)
+                runOnUiThread {
+                    if (charge != null) cardChargeAmount = charge
+                    if (topUp != null) cardTopUpAmount = topUp
+                }
+            }
+        }.start()
+    }
+
+    /** 直接从链上获取 periodTransferAmount(Charge) 与 redeemMintCounterFromClear(Top-Up)，不依赖 API。eth_call getAdminStatsFull(admin, PERIOD_DAY, 0, 0)。失败时返回 null，遵循 beamio-ai-onchain-fetch。 */
+    private fun fetchCardStatsSync(wallet: String): Pair<Double?, Double?> {
+        if (wallet.isNullOrEmpty()) {
+            Log.w("getCardStats", "wallet empty, skip fetch")
+            return Pair(null, null)
+        }
+        val adminAddr = wallet.removePrefix("0x").lowercase()
+        if (adminAddr.length != 40 || !adminAddr.all { it in '0'..'9' || it in 'a'..'f' }) {
+            Log.w("getCardStats", "invalid admin address")
+            return Pair(null, null)
+        }
+        return try {
+            val data = buildGetAdminStatsFullCalldata(adminAddr)
+            val reqBody = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"$BEAMIO_USER_CARD_ASSET_ADDRESS","data":"$data"},"latest"],"id":1}"""
+            val conn = java.net.URL(BASE_RPC_URL).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.outputStream.use { it.write(reqBody.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val json = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            if (code in 200..299) {
+                val root = org.json.JSONObject(json)
+                val result = root.optString("result", "")
+                val err = root.optJSONObject("error")
+                if (err != null) {
+                    Log.w("getCardStats", "RPC error: ${err.optString("message", "")}")
+                    return Pair(null, null)
+                }
+                if (result.isEmpty() || result == "0x") {
+                    Log.w("getCardStats", "empty result")
+                    return Pair(null, null)
+                }
+                val (charge, topUp) = decodeGetAdminStatsFullResult(result)
+                Log.d("getCardStats", "chain ok charge=$charge topUp=$topUp")
+                Pair(charge, topUp)
+            } else {
+                Log.w("getCardStats", "HTTP $code body=${json.take(200)}")
+                Pair(null, null)
+            }
+        } catch (e: Exception) {
+            Log.w("getCardStats", "chain fetch failed", e)
+            Pair(null, null)
+        }
+    }
+
+    /** getAdminStatsFull(address,uint8,uint256,uint256) selector=0x9abc4888, PERIOD_DAY=1 */
+    private fun buildGetAdminStatsFullCalldata(adminAddrLower: String): String {
+        val addrPadded = adminAddrLower.padStart(64, '0')
+        val periodDay = "1".padStart(64, '0')
+        val zero = "0".padStart(64, '0')
+        return "0x9abc4888" + addrPadded + periodDay + zero + zero
+    }
+
+    /** 解析 getAdminStatsFull 返回：periodTransferAmount 在 offset 352，redeemMintCounterFromClear 在 offset 608。除以 1e6。 */
+    private fun decodeGetAdminStatsFullResult(hex: String): Pair<Double, Double> {
+        val raw = hex.removePrefix("0x")
+        if (raw.length < 1280) return 0.0 to 0.0
+        val chargeHex = raw.substring(704, 768)
+        val topUpHex = raw.substring(1216, 1280)
+        val charge = java.math.BigInteger(chargeHex, 16).toDouble() / 1_000_000
+        val topUp = java.math.BigInteger(topUpHex, 16).toDouble() / 1_000_000
+        return charge to topUp
+    }
+
+    private fun fetchUidAssets(uid: String, sunParams: SunParams? = null) {
         Thread {
             try {
                 val url = java.net.URL("$BEAMIO_API/api/getUIDAssets")
@@ -2435,7 +2630,10 @@ class MainActivity : ComponentActivity() {
                 conn.doOutput = true
                 conn.connectTimeout = 15000
                 conn.readTimeout = 15000
-                val body = org.json.JSONObject().apply { put("uid", uid) }.toString()
+                val body = org.json.JSONObject().apply {
+                    put("uid", uid)
+                    sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+                }.toString()
                 conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
                 val code = conn.responseCode
                 val respBody = if (code in 200..299) conn.inputStream else conn.errorStream
@@ -2794,7 +2992,7 @@ class MainActivity : ComponentActivity() {
             paymentScreenStatus = PaymentStatus.Routing
             paymentScreenError = ""
             paymentArmed = false
-            executePayment(uid, paymentScreenAmount, BeamioWeb3Wallet.getAddress())
+            executePayment(tag, uid, paymentScreenAmount, BeamioWeb3Wallet.getAddress())
             return
         }
 
@@ -2807,7 +3005,7 @@ class MainActivity : ComponentActivity() {
             topupScreenStatus = TopupStatus.Loading
             topupScreenError = ""
             topupArmed = false
-            executeNfcTopup(uid, topupScreenAmount)
+            executeNfcTopup(tag, uid, topupScreenAmount)
             return
         }
 
@@ -2823,6 +3021,7 @@ class MainActivity : ComponentActivity() {
 
         if (readArmed) {
             val uid = tag.id?.joinToString("") { b -> "%02X".format(b) } ?: "Read failed"
+            val sunParams = readSunParamsFromNdef(tag)
             readViaQr = false
             scanWaitingForNfc = false
             nfcFetchingInfo = true
@@ -2833,7 +3032,7 @@ class MainActivity : ComponentActivity() {
             readScreenAssets = null
             readScreenError = ""
             readArmed = false
-            fetchUidAssets(uid)
+            fetchUidAssets(sunParams?.uid ?: uid, sunParams)
         }
     }
 
@@ -4151,7 +4350,7 @@ internal fun ReadScreen(
                             onClick = onTopupClick,
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .height(24.dp)
+                                .height(48.dp)
                                 .padding(bottom = 12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White)
                         ) {
@@ -4161,7 +4360,7 @@ internal fun ReadScreen(
                         }
                         Button(
                             onClick = onBack,
-                            modifier = Modifier.fillMaxWidth().height(24.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
                         ) {
                             Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
@@ -4751,6 +4950,53 @@ fun WelcomePanelNoAA(
     }
 }
 
+/** 地址胶囊：圆角胶囊样式，短缩 0x1234…5678 + 右侧 copy 图标，点击复制完整地址，成功后绿色 check 约 2 秒。遵循 address-capsule-ui 守则 */
+@Composable
+private fun AddressCapsule(
+    address: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var copied by mutableStateOf(false)
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(2000)
+            copied = false
+        }
+    }
+    val short = if (address.length >= 10) "${address.take(6)}…${address.takeLast(4)}" else address
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color.Black.copy(alpha = 0.06f))
+            .clickable(enabled = address.length >= 10) {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                cm?.setPrimaryClip(ClipData.newPlainText("address", address))
+                copied = true
+            }
+            .padding(horizontal = 8.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Box(
+            modifier = Modifier.size(6.dp).background(Color(0xFF34C759), CircleShape)
+        )
+        Text(
+            short,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.Black,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+        )
+        Icon(
+            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+            contentDescription = "Copy address",
+            modifier = Modifier.size(12.dp),
+            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
+        )
+    }
+}
+
 /** Beamio 标准胶囊（紧凑版）：左侧头像，右侧 displayName + @accountName。无 profile 时用 fallbackAddress 短缩显示 */
 @Composable
 private fun BeamioCapsuleCompact(
@@ -4768,7 +5014,7 @@ private fun BeamioCapsuleCompact(
         if (isEmpty()) append(tag ?: fallbackAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "—")
     }
     val avatarSeed = tag ?: "Beamio"
-    val avatarUrl = "https://api.dicebear.com/8.x/fun-emoji/svg?seed=${java.net.URLEncoder.encode(avatarSeed, "UTF-8")}"
+    val avatarUrl = "https://api.dicebear.com/8.x/fun-emoji/png?seed=${java.net.URLEncoder.encode(avatarSeed, "UTF-8")}"
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(999.dp))
@@ -4785,10 +5031,11 @@ private fun BeamioCapsuleCompact(
                 .clip(CircleShape),
             contentScale = ContentScale.Crop
         )
-        Column {
+        Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
             Text(
                 displayName,
                 fontSize = 12.sp,
+                lineHeight = 14.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color.Black,
                 maxLines = 1,
@@ -4798,6 +5045,7 @@ private fun BeamioCapsuleCompact(
                 Text(
                     beamioTag,
                     fontSize = 10.sp,
+                    lineHeight = 12.sp,
                     fontWeight = FontWeight.Medium,
                     color = Color.Black.copy(alpha = 0.7f),
                     maxLines = 1,
@@ -4816,6 +5064,8 @@ fun NdefScreen(
     walletAddress: String?,
     terminalProfile: TerminalProfile? = null,
     adminProfile: TerminalProfile? = null,
+    chargeAmount: Double? = null,
+    topUpAmount: Double? = null,
     onCopyWalletClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
@@ -4865,17 +5115,11 @@ fun NdefScreen(
                         contentScale = ContentScale.Crop
                     )
                 }
-                Column {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     val beamioTag = terminalProfile?.accountName?.let { "@$it" }
                         ?: walletAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
                         ?: "Terminal"
                     Text(beamioTag, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Box(
-                            modifier = Modifier.size(6.dp).background(Color(0xFF1562f0), CircleShape)
-                        )
-                        Text("Active Node", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
-                    }
                 }
             }
             // Right: admin BeamioCapsule (avatar + displayName + @accountName)
@@ -4922,16 +5166,24 @@ fun NdefScreen(
                                     Icon(Icons.Filled.ArrowDownward, null, Modifier.size(10.dp), tint = Color(0xFF1562f0))
                                 }
                                 Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                                Text("Today", fontSize = 9.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1562f0), modifier = Modifier.background(Color(0xFF1562f0).copy(alpha = 0.15f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
                             }
-                            Row(verticalAlignment = Alignment.Bottom) {
-                                Text("$845", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                                Text(".00", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 1.dp))
+                            Row {
+                                val (numPart, decPart) = if (chargeAmount != null) {
+                                    val s = "%.2f".format(chargeAmount)
+                                    val dot = s.indexOf('.')
+                                    if (dot >= 0) s.substring(0, dot) to s.substring(dot)
+                                    else s to ""
+                                } else "—" to ""
+                                Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                Text(if (decPart.isNotEmpty()) decPart else "", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
                             }
                         }
                         Box(
                             modifier = Modifier
                                 .width(1.dp)
-                                .height(44.dp)
+                                .height(88.dp)
                                 .background(Color.White.copy(alpha = 0.1f))
                         )
                         Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
@@ -4945,12 +5197,18 @@ fun NdefScreen(
                                 Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                             }
                             Row(
-                                verticalAlignment = Alignment.Bottom,
                                 horizontalArrangement = Arrangement.End,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("$400", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                                Text(".00", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.padding(bottom = 1.dp))
+                                val (numPart, decPart) = if (topUpAmount != null) {
+                                    val s = "%.2f".format(topUpAmount)
+                                    val dot = s.indexOf('.')
+                                    if (dot >= 0) s.substring(0, dot) to s.substring(dot)
+                                    else s to ""
+                                } else "—" to ""
+                                Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                Text(if (decPart.isNotEmpty()) decPart else "", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
                             }
                         }
                     }
