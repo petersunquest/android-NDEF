@@ -177,6 +177,15 @@ internal data class NftItem(
     val isExpired: Boolean
 )
 
+/** getTerminalProfile API 返回的 profile 结构 */
+data class TerminalProfile(
+    val accountName: String?,
+    val first_name: String?,
+    val last_name: String?,
+    val image: String?,
+    val address: String?
+)
+
 private data class MetadataTier(
     val minUsdc6: Long,
     val name: String?,
@@ -235,12 +244,12 @@ class MainActivity : ComponentActivity() {
         const val SUN_BASE_URL = "https://api.beamio.app/api/sun"
         /** 与 SilentPassUI utils/constants.ts beamioApi 一致 */
         const val BEAMIO_API = "https://beamio.app"
-        /** CCSA 卡地址（与 chainAddresses BASE_CCSA_CARD_ADDRESS 一致） */
-        const val BASE_CCSA_CARD_ADDRESS = "0x2032A363BB2cf331142391fC0DAd21D6504922C7"
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
         /** 基础设施卡（与 SilentPassUI BEAMIO_USER_CARD_ASSET_ADDRESS 一致，新创建卡合约地址） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xa86a8406B06bD6c332b4b380A0EAced822218Eff"
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x02BAe511632354584b198951B42eC73BACBc4E98"
+        /** CCSA 卡（与 config/base-addresses.json CCSA_CARD_ADDRESS 一致） */
+        const val BASE_CCSA_CARD_ADDRESS = "0x2032A363BB2cf331142391fC0DAd21D6504922C7"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
     }
@@ -336,6 +345,10 @@ class MainActivity : ComponentActivity() {
 
     /** AA 账号检测：null=未检测/检测中，true=有 AA，false=无 AA。无 AA 时显示欢迎面板 */
     private var hasAAAccount by mutableStateOf<Boolean?>(null)
+
+    /** 终端首页头部：当前钱包 beamio profile 及上层 admin（merchant）profile */
+    private var terminalProfile by mutableStateOf<TerminalProfile?>(null)
+    private var terminalAdminProfile by mutableStateOf<TerminalProfile?>(null)
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) qrScanningActive = true
@@ -499,6 +512,17 @@ class MainActivity : ComponentActivity() {
                                 }
                             } catch (_: Exception) {
                                 runOnUiThread { hasAAAccount = true }
+                            }
+                        }.start()
+                    }
+                }
+                LaunchedEffect(showWelcomePage, showOnboardingScreen, hasAAAccount) {
+                    if (!showWelcomePage && !showOnboardingScreen && BeamioWeb3Wallet.isInitialized()) {
+                        Thread {
+                            val (profile, admin) = fetchTerminalProfileSync(BeamioWeb3Wallet.getAddress())
+                            runOnUiThread {
+                                terminalProfile = profile
+                                terminalAdminProfile = admin
                             }
                         }.start()
                     }
@@ -737,6 +761,8 @@ class MainActivity : ComponentActivity() {
                         readUrlText = readUrlText,
                         readParamText = readParamText,
                         walletAddress = if (BeamioWeb3Wallet.isInitialized()) BeamioWeb3Wallet.getAddress() else null,
+                        terminalProfile = terminalProfile,
+                        adminProfile = terminalAdminProfile,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -766,6 +792,8 @@ class MainActivity : ComponentActivity() {
                         readUrlText = readUrlText,
                         readParamText = readParamText,
                         walletAddress = if (BeamioWeb3Wallet.isInitialized()) BeamioWeb3Wallet.getAddress() else null,
+                        terminalProfile = terminalProfile,
+                        adminProfile = terminalAdminProfile,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -2333,6 +2361,65 @@ class MainActivity : ComponentActivity() {
             val json = respBody?.use { it.bufferedReader().readText() } ?: "{}"
             conn.disconnect()
             parseUidAssetsJson(json)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 拉取终端 profile 与上层 admin profile。参照 biz.tsx：cardOwner → searchUsername → BeamioCapsule。从 BeamioUserCard 卡合约获取 admin 列表，upperAdmin/owner → search-users → adminProfile。 */
+    private fun fetchTerminalProfileSync(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
+        val profile = fetchSearchUsersSync(wallet)
+        val upperAdmin = fetchGetCardAdminInfoSync(wallet)
+        val adminProfile = if (upperAdmin != null) fetchSearchUsersSync(upperAdmin) else null
+        return Pair(profile, adminProfile)
+    }
+
+    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 默认 BEAMIO_USER_CARD_ASSET_ADDRESS。 */
+    private fun fetchGetCardAdminInfoSync(wallet: String): String? {
+        return try {
+            val url = java.net.URL("$BEAMIO_API/api/getCardAdminInfo?cardAddress=${java.net.URLEncoder.encode(BEAMIO_USER_CARD_ASSET_ADDRESS, "UTF-8")}&wallet=${java.net.URLEncoder.encode(wallet, "UTF-8")}")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val json = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            if (code in 200..299) {
+                val root = org.json.JSONObject(json)
+                if (root.optBoolean("ok", false)) {
+                    root.optString("upperAdmin").takeIf { it.isNotEmpty() && it != "null" }
+                        ?: root.optString("owner").takeIf { it.isNotEmpty() && it != "null" }
+                } else null
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** GET /api/search-users?keyward=... - 解析 results[0] 为 TerminalProfile */
+    private fun fetchSearchUsersSync(keyward: String): TerminalProfile? {
+        return try {
+            val url = java.net.URL("$BEAMIO_API/api/search-users?keyward=${java.net.URLEncoder.encode(keyward, "UTF-8")}")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val json = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            if (code in 200..299) {
+                val root = org.json.JSONObject(json)
+                val results = root.optJSONArray("results")
+                val first = results?.optJSONObject(0) ?: return null
+                TerminalProfile(
+                    accountName = first.optString("username").takeIf { it.isNotEmpty() } ?: first.optString("accountName").takeIf { it.isNotEmpty() },
+                    first_name = first.optString("first_name").takeIf { it.isNotEmpty() },
+                    last_name = first.optString("last_name").takeIf { it.isNotEmpty() },
+                    image = first.optString("image").takeIf { it.isNotEmpty() },
+                    address = first.optString("address").takeIf { it.isNotEmpty() }
+                )
+            } else null
         } catch (_: Exception) {
             null
         }
@@ -4664,12 +4751,71 @@ fun WelcomePanelNoAA(
     }
 }
 
+/** Beamio 标准胶囊（紧凑版）：左侧头像，右侧 displayName + @accountName。无 profile 时用 fallbackAddress 短缩显示 */
+@Composable
+private fun BeamioCapsuleCompact(
+    profile: TerminalProfile,
+    fallbackAddress: String?,
+    modifier: Modifier = Modifier
+) {
+    val tag = profile.accountName
+    val beamioTag = tag?.let { "@$it" }
+    val displayName = buildString {
+        val first = profile.first_name?.trim() ?: ""
+        val lastRaw = profile.last_name?.trim()?.split("\r\n")?.firstOrNull() ?: ""
+        val last = if (lastRaw.startsWith("{")) "" else lastRaw
+        append("$first $last".trim())
+        if (isEmpty()) append(tag ?: fallbackAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "—")
+    }
+    val avatarSeed = tag ?: "Beamio"
+    val avatarUrl = "https://api.dicebear.com/8.x/fun-emoji/svg?seed=${java.net.URLEncoder.encode(avatarSeed, "UTF-8")}"
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color.Black.copy(alpha = 0.06f))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        AsyncImage(
+            model = profile.image?.takeIf { it.isNotBlank() } ?: avatarUrl,
+            contentDescription = null,
+            modifier = Modifier
+                .size(28.dp)
+                .clip(CircleShape),
+            contentScale = ContentScale.Crop
+        )
+        Column {
+            Text(
+                displayName,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.Black,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (beamioTag != null) {
+                Text(
+                    beamioTag,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.Black.copy(alpha = 0.7f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun NdefScreen(
     uidText: String,
     readUrlText: String,
     readParamText: String,
     walletAddress: String?,
+    terminalProfile: TerminalProfile? = null,
+    adminProfile: TerminalProfile? = null,
     onCopyWalletClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
@@ -4691,7 +4837,7 @@ fun NdefScreen(
             .windowInsetsPadding(WindowInsets.statusBars),
         verticalArrangement = Arrangement.spacedBy(0.dp)
     ) {
-        // Header: B icon + Terminal + Active Node (compact)
+        // Header: B icon + beamio tag (left) | admin BeamioCapsule (right)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -4720,7 +4866,10 @@ fun NdefScreen(
                     )
                 }
                 Column {
-                    Text("Terminal", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                    val beamioTag = terminalProfile?.accountName?.let { "@$it" }
+                        ?: walletAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
+                        ?: "Terminal"
+                    Text(beamioTag, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         Box(
                             modifier = Modifier.size(6.dp).background(Color(0xFF1562f0), CircleShape)
@@ -4728,6 +4877,14 @@ fun NdefScreen(
                         Text("Active Node", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
                     }
                 }
+            }
+            // Right: admin BeamioCapsule (avatar + displayName + @accountName)
+            if (adminProfile != null) {
+                BeamioCapsuleCompact(
+                    profile = adminProfile,
+                    fallbackAddress = adminProfile.address,
+                    modifier = Modifier
+                )
             }
         }
 
