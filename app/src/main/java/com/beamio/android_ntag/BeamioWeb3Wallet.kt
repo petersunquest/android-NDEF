@@ -11,7 +11,7 @@ import java.math.BigInteger
  * 不维护多份钱包；top-up 等函数不自行维护设备钱包。
  */
 object BeamioWeb3Wallet {
-    private const val BASE_CARD_FACTORY = "0xfB5E3F2AbFe24DC17970d78245BeF56aAE8cb71a"
+    private const val BASE_CARD_FACTORY = "0x331a8ebc41afbAf01D78Fd2684D609407527DA18"
     private const val BASE_CHAIN_ID = 8453L
 
     private var keyPair: ECKeyPair? = null
