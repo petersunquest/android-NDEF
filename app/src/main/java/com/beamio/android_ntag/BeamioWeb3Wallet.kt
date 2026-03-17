@@ -7,8 +7,8 @@ import org.web3j.utils.Numeric
 import java.math.BigInteger
 
 /**
- * Web3 钱包对象，用于离线签名 ExecuteForAdmin（nfcTopup）。
- * 使用 MainActivity 中的 privateKey 初始化。
+ * 全局设备 POS 钱包。Onboarding 完成后创建并持久化，后续 top-up、charge 等均使用此钱包签名。
+ * 不维护多份钱包；top-up 等函数不自行维护设备钱包。
  */
 object BeamioWeb3Wallet {
     private const val BASE_CARD_FACTORY = "0x331a8ebc41afbAf01D78Fd2684D609407527DA18"
