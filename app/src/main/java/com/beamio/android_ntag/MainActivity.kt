@@ -43,6 +43,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -91,7 +93,9 @@ import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -157,6 +161,14 @@ internal data class UIDAssets(
     val ok: Boolean,
     val address: String? = null,
     val aaAddress: String? = null,
+    /** NFC 流程下服务端返回的 UID */
+    val uid: String? = null,
+    /** NFC 流程下服务端返回的 TagID（hex） */
+    val tagIdHex: String? = null,
+    /** NFC 流程下服务端返回的 counter 十六进制 */
+    val counterHex: String? = null,
+    /** NFC 流程下服务端返回的 counter 十进制 */
+    val counter: Int? = null,
     val cardAddress: String? = null,
     val points: String? = null,
     val points6: String? = null,
@@ -2825,12 +2837,20 @@ class MainActivity : ComponentActivity() {
             }
             val unitPriceUSDC6 = root.optString("unitPriceUSDC6").takeIf { it.isNotEmpty() }
             val beamioUserCard = root.optString("beamioUserCard").takeIf { it.isNotEmpty() }
+            val uidVal = root.optString("uid").takeIf { it.isNotEmpty() }
+            val tagIdHexVal = root.optString("tagIdHex").takeIf { it.isNotEmpty() }
+            val counterHexVal = root.optString("counterHex").takeIf { it.isNotEmpty() }
+            val counterVal = root.optInt("counter", -1).takeIf { it >= 0 }
             if (cards != null) {
                 val first = cards.firstOrNull()
                 UIDAssets(
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    uid = uidVal,
+                    tagIdHex = tagIdHexVal,
+                    counterHex = counterHexVal,
+                    counter = counterVal,
                     cardAddress = first?.cardAddress,
                     points = first?.points,
                     points6 = first?.points6,
@@ -2849,6 +2869,10 @@ class MainActivity : ComponentActivity() {
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    uid = uidVal,
+                    tagIdHex = tagIdHexVal,
+                    counterHex = counterHexVal,
+                    counter = counterVal,
                     cardAddress = if (isDeprecatedLegacy) null else legacyCardAddr,
                     points = if (isDeprecatedLegacy) null else root.optString("points").takeIf { it.isNotEmpty() },
                     points6 = if (isDeprecatedLegacy) null else root.optString("points6").takeIf { it.isNotEmpty() },
@@ -4036,6 +4060,7 @@ private fun parseHexColor(hex: String?): Color? {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun ReadScreen(
     uid: String,
@@ -4051,7 +4076,6 @@ internal fun ReadScreen(
     val voucherBalance = assets?.points?.toDoubleOrNull() ?: 0.0
     val dateString = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US).format(java.util.Date())
     val timeString = java.text.SimpleDateFormat("h:mm a", java.util.Locale.US).format(java.util.Date())
-    val shortAddr = assets?.address?.let { if (it.length > 10) "${it.take(6)}...${it.takeLast(4)}" else it } ?: "—"
 
     Column(
         modifier = modifier
@@ -4153,6 +4177,75 @@ internal fun ReadScreen(
                             .padding(horizontal = 20.dp)
                             .padding(bottom = 24.dp)
                     ) {
+                        // Account summary: EOA, AA, UID, TagID, Counter
+                        val eoaAddr = assets?.address?.takeIf { it.isNotEmpty() }
+                        val aaAddr = assets?.aaAddress?.takeIf { it.isNotEmpty() }
+                        val displayUid = assets?.uid?.takeIf { it.isNotEmpty() } ?: uid.takeIf { it.isNotEmpty() }
+                        val tagId = assets?.tagIdHex?.takeIf { it.isNotEmpty() }
+                        val counterVal = assets?.counter
+                        if (eoaAddr != null || aaAddr != null || displayUid != null || tagId != null || counterVal != null) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(16.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text("Account", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+                                    FlowRow(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        eoaAddr?.let { addr ->
+                                            AddressCapsule(
+                                                address = addr,
+                                                leadingIcon = {
+                                                    Icon(Icons.Filled.AccountBalanceWallet, null, Modifier.size(12.dp), tint = Color(0xFF1562f0))
+                                                }
+                                            )
+                                        }
+                                        aaAddr?.let { addr ->
+                                            AddressCapsule(
+                                                address = addr,
+                                                leadingIcon = {
+                                                    Icon(Icons.Filled.CreditCard, null, Modifier.size(12.dp), tint = Color(0xFF7C3AED))
+                                                }
+                                            )
+                                        }
+                                    }
+                                    FlowRow(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        displayUid?.let { uidVal ->
+                                            HexCopyCapsule(label = "UID", value = uidVal, copyLabel = "uid")
+                                        }
+                                        if (tagId != null) {
+                                            HexCopyCapsule(label = "TagID", value = tagId, copyLabel = "tagId")
+                                        } else {
+                                            Row(
+                                                modifier = Modifier
+                                                    .clip(RoundedCornerShape(999.dp))
+                                                    .background(Color.Black.copy(alpha = 0.06f))
+                                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                            ) {
+                                                Text("TagID", fontSize = 10.sp, color = Color.Gray)
+                                                Text("—", fontSize = 11.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = Color.Gray)
+                                            }
+                                        }
+                                    }
+                                    counterVal?.let { Text("Counter: $it", fontSize = 12.sp, color = Color.Black) }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
                         // USDC on Base (like web EOA layer)
                         val usdcBal = assets?.usdcBalance?.toDoubleOrNull() ?: 0.0
                         Card(
@@ -4301,47 +4394,6 @@ internal fun ReadScreen(
                                                 }
                                             }
                                         }
-                                    }
-                                }
-                            }
-                        }
-                        // Account summary
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 24.dp),
-                            shape = RoundedCornerShape(20.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White),
-                            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
-                        ) {
-                            Column {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(20.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("Account", fontSize = 15.sp, color = Color(0xFF86868b))
-                                    Text(shortAddr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(20.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("Settlement", fontSize = 15.sp, color = Color(0xFF86868b))
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Filled.Shield, null, Modifier.size(14.dp), tint = Color(0xFF34C759))
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            if (settlementViaQr) "App Validator" else "NTAG 424 DNA",
-                                            fontSize = 15.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            color = Color(0xFF34C759)
-                                        )
                                     }
                                 }
                             }
@@ -5014,10 +5066,57 @@ fun WelcomePanelNoAA(
     }
 }
 
-/** 地址胶囊：圆角胶囊样式，短缩 0x1234…5678 + 右侧 copy 图标，点击复制完整地址，成功后绿色 check 约 2 秒。遵循 address-capsule-ui 守则 */
+/** 十六进制值胶囊：label + 短缩 hex + copy 图标，点击复制完整值，成功后绿色 check 约 2 秒 */
+@Composable
+private fun HexCopyCapsule(
+    label: String,
+    value: String,
+    copyLabel: String,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(2000)
+            copied = false
+        }
+    }
+    val short = if (value.length >= 10) "${value.take(6)}…${value.takeLast(4)}" else value
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color.Black.copy(alpha = 0.06f))
+            .clickable(enabled = value.isNotEmpty()) {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                cm?.setPrimaryClip(ClipData.newPlainText(copyLabel, value))
+                copied = true
+            }
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(label, fontSize = 10.sp, color = Color.Gray)
+        Text(
+            short,
+            fontSize = 11.sp,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            color = Color.Black
+        )
+        Icon(
+            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+            contentDescription = "Copy $label",
+            modifier = Modifier.size(12.dp),
+            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
+        )
+    }
+}
+
+/** 地址胶囊：圆角胶囊样式，左侧可选 icon（或绿点）+ 短缩 0x1234…5678 + 右侧 copy 图标，点击复制完整地址，成功后绿色 check 约 2 秒。遵循 address-capsule-ui 守则 */
 @Composable
 private fun AddressCapsule(
     address: String,
+    leadingIcon: @Composable (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -5042,9 +5141,13 @@ private fun AddressCapsule(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        Box(
-            modifier = Modifier.size(6.dp).background(Color(0xFF34C759), CircleShape)
-        )
+        if (leadingIcon != null) {
+            leadingIcon()
+        } else {
+            Box(
+                modifier = Modifier.size(6.dp).background(Color(0xFF34C759), CircleShape)
+            )
+        }
         Text(
             short,
             fontSize = 11.sp,
