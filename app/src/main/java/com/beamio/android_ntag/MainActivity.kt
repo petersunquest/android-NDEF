@@ -262,7 +262,7 @@ class MainActivity : ComponentActivity() {
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
         /** 基础设施卡（与 x402sdk chainAddresses.BEAMIO_USER_CARD_ASSET_ADDRESS 一致） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x74f35741ad8bc75d873a8d7d140ae5ffb529ac0f"
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x4504c5f3d02ba762be8e10419ad44ea0c069fdbf"
         /** CCSA 卡（与 config/base-addresses.json CCSA_CARD_ADDRESS 一致） */
         const val BASE_CCSA_CARD_ADDRESS = "0x2032A363BB2cf331142391fC0DAd21D6504922C7"
         /** Base RPC，遵循 beamio-base-rpc */
