@@ -1765,7 +1765,7 @@ class MainActivity : ComponentActivity() {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = payByNfcUidWithContainer(effectiveUid, amountUsdc6, payee, assets, oracle)
+                val result = payByNfcUidWithContainer(effectiveUid, amountUsdc6, payee, assets, oracle, sunParams)
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 runOnUiThread {
@@ -2201,11 +2201,11 @@ class MainActivity : ComponentActivity() {
         } ?: emptyList()
     }
 
-    /** 新流程：Android 自行 Smart Routing 构建 container，服务端仅签名并 relay。CCSA + 基础设施卡均可扣款 */
-    private fun payByNfcUidWithContainer(uid: String, amountUsdc6: String, payee: String, assets: UIDAssets, oracle: OracleRates): PayByNfcResult {
+    /** 新流程：Android 自行 Smart Routing 构建 container，服务端仅签名并 relay。CCSA + 基础设施卡均可扣款。NFC 格式(14 位 hex uid)时需传 sunParams(e,c,m) 做 SUN 校验。 */
+    private fun payByNfcUidWithContainer(uid: String, amountUsdc6: String, payee: String, assets: UIDAssets, oracle: OracleRates, sunParams: SunParams? = null): PayByNfcResult {
         val amountBig = amountUsdc6.toLongOrNull() ?: 0L
         if (amountBig <= 0) return PayByNfcResult(false, null, "Invalid amountUsdc6")
-        val prepare = payByNfcUidPrepare(uid, payee, amountUsdc6)
+        val prepare = payByNfcUidPrepare(uid, payee, amountUsdc6, sunParams)
         val ok = prepare["ok"] == true
         val account = prepare["account"] as? String
         val nonce = prepare["nonce"] as? String
@@ -2320,10 +2320,10 @@ class MainActivity : ComponentActivity() {
             put("nonce", nonce)
             put("deadline", deadline)
         }
-        return payByNfcUidSignContainer(uid, containerPayload, amountUsdc6)
+        return payByNfcUidSignContainer(uid, containerPayload, amountUsdc6, sunParams)
     }
 
-    private fun payByNfcUidPrepare(uid: String, payee: String, amountUsdc6: String): Map<String, Any?> {
+    private fun payByNfcUidPrepare(uid: String, payee: String, amountUsdc6: String, sunParams: SunParams? = null): Map<String, Any?> {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/payByNfcUidPrepare")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2336,6 +2336,7 @@ class MainActivity : ComponentActivity() {
                 put("uid", uid)
                 put("payee", payee)
                 put("amountUsdc6", amountUsdc6)
+                sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -2357,7 +2358,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun payByNfcUidSignContainer(uid: String, containerPayload: org.json.JSONObject, amountUsdc6: String): PayByNfcResult {
+    private fun payByNfcUidSignContainer(uid: String, containerPayload: org.json.JSONObject, amountUsdc6: String, sunParams: SunParams? = null): PayByNfcResult {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/payByNfcUidSignContainer")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2370,6 +2371,7 @@ class MainActivity : ComponentActivity() {
                 put("uid", uid)
                 put("containerPayload", containerPayload)
                 put("amountUsdc6", amountUsdc6)
+                sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -2602,7 +2604,7 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    /** 直接从链上获取 periodTransferAmount(Charge) 与 redeemMintCounterFromClear(Top-Up)，不依赖 API。eth_call getAdminStatsFull(admin, PERIOD_DAY, 0, 0)。失败时返回 null，遵循 beamio-ai-onchain-fetch。 */
+    /** 直接从链上获取 periodTransferAmount(Charge) 与 periodMint(Top-Up)，不依赖 API。eth_call getAdminStatsFull(admin, PERIOD_DAY, 0, 0)。wallet 须为卡上 admin 才有非零数据。失败时返回 null，遵循 beamio-ai-onchain-fetch。 */
     private fun fetchCardStatsSync(wallet: String): Pair<Double?, Double?> {
         if (wallet.isNullOrEmpty()) {
             Log.w("getCardStats", "wallet empty, skip fetch")
@@ -2659,12 +2661,12 @@ class MainActivity : ComponentActivity() {
         return "0x9abc4888" + addrPadded + periodDay + zero + zero
     }
 
-    /** 解析 getAdminStatsFull 返回：periodTransferAmount 在 offset 352，redeemMintCounterFromClear 在 offset 608。除以 1e6。 */
+    /** 解析 getAdminStatsFull 返回。ABI：外层 offset 32B，struct 自 byte 32 起；periodTransferAmount=index11(hex 768-831)，periodMint=index8(hex 576-639)。除以 1e6。 */
     private fun decodeGetAdminStatsFullResult(hex: String): Pair<Double, Double> {
         val raw = hex.removePrefix("0x")
-        if (raw.length < 1280) return 0.0 to 0.0
-        val chargeHex = raw.substring(704, 768)
-        val topUpHex = raw.substring(1216, 1280)
+        if (raw.length < 832) return 0.0 to 0.0
+        val chargeHex = raw.substring(768, 832)   // periodTransferAmount (index 11)
+        val topUpHex = raw.substring(576, 640)    // periodMint (index 8)
         val charge = java.math.BigInteger(chargeHex, 16).toDouble() / 1_000_000
         val topUp = java.math.BigInteger(topUpHex, 16).toDouble() / 1_000_000
         return charge to topUp
