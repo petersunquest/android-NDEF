@@ -7,11 +7,13 @@ import org.web3j.utils.Numeric
 import java.math.BigInteger
 
 /**
- * 全局设备 POS 钱包。Onboarding 完成后创建并持久化，后续 top-up、charge 等均使用此钱包签名。
- * 不维护多份钱包；top-up 等函数不自行维护设备钱包。
+ * 全局设备 POS 钱包。Onboarding 完成后创建并持久化。
+ * Home 页 charge 面板 ID 地址（panel ID address）= getAddress()，即 POS App 全局钱包。
+ * 所有签字（NFC topup、Charge、payByNfcUid 等）必须使用本钱包，不得存在第二份设备钱包。
  */
 object BeamioWeb3Wallet {
-    private const val BASE_CARD_FACTORY = "0x331a8ebc41afbAf01D78Fd2684D609407527DA18"
+    /** 必须与 x402sdk chainAddresses.BASE_CARD_FACTORY 一致，否则 EIP-712 digest 不同，服务端 recoverAddress 会得到错误 signer */
+    private const val BASE_CARD_FACTORY = "0xfB5E3F2AbFe24DC17970d78245BeF56aAE8cb71a"
     private const val BASE_CHAIN_ID = 8453L
 
     private var keyPair: ECKeyPair? = null

@@ -261,8 +261,8 @@ class MainActivity : ComponentActivity() {
         const val BEAMIO_API = "https://beamio.app"
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-        /** 基础设施卡（与 SilentPassUI BEAMIO_USER_CARD_ASSET_ADDRESS 一致，新创建卡合约地址） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x02BAe511632354584b198951B42eC73BACBc4E98"
+        /** 基础设施卡（与 x402sdk chainAddresses.BEAMIO_USER_CARD_ASSET_ADDRESS 一致） */
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x74f35741ad8bc75d873a8d7d140ae5ffb529ac0f"
         /** CCSA 卡（与 config/base-addresses.json CCSA_CARD_ADDRESS 一致） */
         const val BASE_CCSA_CARD_ADDRESS = "0x2032A363BB2cf331142391fC0DAd21D6504922C7"
         /** Base RPC，遵循 beamio-base-rpc */
@@ -1124,6 +1124,7 @@ class MainActivity : ComponentActivity() {
     private fun executeNfcTopup(tag: Tag, uid: String, amount: String) {
         Thread {
             try {
+                Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid")
                 val sunParams = readSunParamsFromNdef(tag)
                 // NFC 格式（14 位 hex uid）必须提供 SUN 参数，不符合 SUN 或无法推导 tagID 的不予受理
                 val isNfcUid = uid.length == 14 && uid.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
@@ -1202,6 +1203,10 @@ class MainActivity : ComponentActivity() {
                     topupScreenTierDescription = topupCard?.tierDescription
                     topupScreenMemberNo = memberNo.ifEmpty { null }
                 }
+
+                // panel ID address = 全局 POS 钱包，topup 签字必须使用此地址（BeamioWeb3Wallet 唯一真相来源）
+                val panelIdAddress = BeamioWeb3Wallet.getAddress()
+                Log.d("Topup", "[Topup Debug] NFC topup: panel ID address (signer)=$panelIdAddress | cardAddr=${prepare.cardAddr}")
 
                 val adminSig = BeamioWeb3Wallet.signExecuteForAdmin(
                     prepare.cardAddr!!,
@@ -1338,6 +1343,7 @@ class MainActivity : ComponentActivity() {
     private fun executeTopupWithBeamioTag(beamioTag: String, amount: String) {
         Thread {
             try {
+                Log.d("Topup", "[Topup Debug] executeTopupWithBeamioTag entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | beamioTag=$beamioTag")
                 val prepare = nfcTopupPrepareWithBeamioTag(beamioTag, amount)
                 if (prepare.error != null) {
                     runOnUiThread {
@@ -1369,6 +1375,7 @@ class MainActivity : ComponentActivity() {
     private fun executeWalletTopup(wallet: String, amount: String) {
         Thread {
             try {
+                Log.d("Topup", "[Topup Debug] executeWalletTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | customerWallet=$wallet")
                 val prepare = nfcTopupPrepareWithWallet(wallet, amount)
                 if (prepare.error != null) {
                     runOnUiThread {
@@ -1428,6 +1435,10 @@ class MainActivity : ComponentActivity() {
                     topupScreenTierDescription = topupCard?.tierDescription
                     topupScreenMemberNo = memberNo.ifEmpty { null }
                 }
+
+                // panel ID address = 全局 POS 钱包，topup 签字必须使用此地址（BeamioWeb3Wallet 唯一真相来源）
+                val panelIdAddress = BeamioWeb3Wallet.getAddress()
+                Log.d("Topup", "[Topup Debug] Wallet topup: panel ID address (signer)=$panelIdAddress | customerWallet=$wallet | cardAddr=${prepare.cardAddr}")
 
                 val adminSig = BeamioWeb3Wallet.signExecuteForAdmin(
                     prepare.cardAddr!!,
@@ -3885,7 +3896,7 @@ private fun TopupSuccessContent(
         ) {
             OutlinedButton(
                 onClick = { printTopupReceipt(context, amount, postBalance, cardCurrency, address, txHash, dateString, timeString) },
-                modifier = Modifier.fillMaxWidth().height(24.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
             ) {
@@ -3895,7 +3906,7 @@ private fun TopupSuccessContent(
             }
             Button(
                 onClick = onDone,
-                modifier = Modifier.fillMaxWidth().height(24.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
             ) {
                 Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
@@ -5306,6 +5317,9 @@ fun NdefScreen(
             walletCopied = false
         }
     }
+    LaunchedEffect(walletAddress) {
+        Log.d("Home", "[Home Debug] charge panel ID address (walletAddress)=${walletAddress ?: "null"}")
+    }
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -5340,11 +5354,22 @@ fun NdefScreen(
                         contentScale = ContentScale.Crop
                     )
                 }
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     val beamioTag = terminalProfile?.accountName?.let { "@$it" }
                         ?: walletAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
                         ?: "Terminal"
                     Text(beamioTag, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                    if (walletAddress != null && walletAddress.length >= 10) {
+                        LaunchedEffect(walletAddress) {
+                            Log.d("Home", "[Home Debug] beamioTag row wallet address capsule: $walletAddress")
+                        }
+                        AddressCapsule(
+                            address = walletAddress,
+                            leadingIcon = {
+                                Icon(Icons.Filled.AccountBalanceWallet, null, Modifier.size(12.dp), tint = Color(0xFF1562f0))
+                            }
+                        )
+                    }
                 }
             }
             // Right: admin BeamioCapsule (avatar + displayName + @accountName)
