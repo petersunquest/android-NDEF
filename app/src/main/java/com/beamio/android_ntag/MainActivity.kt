@@ -18,6 +18,9 @@ import android.nfc.tech.NdefFormatable
 import android.nfc.tech.IsoDep
 import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.print.PrintAttributes
@@ -39,6 +42,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -94,7 +98,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.AccountBalanceWallet
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Fingerprint
@@ -112,6 +116,7 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -120,8 +125,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -130,7 +137,11 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.roundToInt
+import java.util.concurrent.CountDownLatch
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
@@ -227,7 +238,7 @@ internal sealed class PaymentStatus {
     object Waiting : PaymentStatus()
     object Routing : PaymentStatus()   // Smart Routing 分析中
     object Submitting : PaymentStatus() // 调用 payByNfcUid 中
-    object Refreshing : PaymentStatus() // 支付完成，等待 3s 后拉取最新余额
+    object Refreshing : PaymentStatus() // unused: post-tx balance fetch uses refreshBalance routing step + Submitting
     object Success : PaymentStatus()
     object Error : PaymentStatus()
 }
@@ -240,17 +251,26 @@ internal data class RoutingStep(
 )
 internal enum class StepStatus { pending, loading, success, error }
 
-private val ROUTING_STEP_IDS = listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute", "sendTx", "waitTx")
+private val ROUTING_STEP_IDS = listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute", "sendTx", "waitTx", "refreshBalance")
 private fun createRoutingSteps() = listOf(
     RoutingStep("detectingUser", "Detecting User", "", StepStatus.pending),
     RoutingStep("membership", "Checking Membership", "", StepStatus.pending),
     RoutingStep("analyzingAssets", "Analyzing Assets", "", StepStatus.pending),
     RoutingStep("optimizingRoute", "Optimizing Route", "", StepStatus.pending),
     RoutingStep("sendTx", "Sending transaction", "", StepStatus.pending),
-    RoutingStep("waitTx", "Waiting for transaction", "", StepStatus.pending)
+    RoutingStep("waitTx", "Waiting for transaction", "", StepStatus.pending),
+    RoutingStep("refreshBalance", "Refreshing balance", "", StepStatus.pending)
 )
 private fun updateStep(steps: List<RoutingStep>, id: String, status: StepStatus, detail: String = "") =
     steps.map { if (it.id == id) it.copy(status = status, detail = detail) else it }
+
+/** Smart Routing 在 280dp 卡内最多显示条数：新步骤从底部增加，超出则顶部丢弃 */
+private const val PAYMENT_ROUTING_MONITOR_MAX_VISIBLE_STEPS = 6
+
+internal fun filterPaymentRoutingStepsForDisplay(steps: List<RoutingStep>): List<RoutingStep> =
+    steps
+        .filter { it.status != StepStatus.pending || it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") }
+        .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
 
 class MainActivity : ComponentActivity() {
     private companion object {
@@ -268,6 +288,8 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
+        /** 付款动态 QR 解析失败时的 Logcat 标签（adb logcat -s BeamioQrPayment） */
+        private const val LOG_QR_PAYMENT_PARSE = "BeamioQrPayment"
     }
 
     private var showTopupScreen by mutableStateOf(false)
@@ -349,7 +371,6 @@ class MainActivity : ComponentActivity() {
     private var pendingScanAction by mutableStateOf("read") // "read" | "payment" | "topup"
     private var scanMethodBackTipSubtotal by mutableStateOf("0")
     private var scanMethodBackTipRate by mutableStateOf(0.0)
-    private var topupFromReadScreen by mutableStateOf(false) // 从 Balance Loaded 进入 topup，直接使用已读 UID/钱包
     private var showInitFlowScreen by mutableStateOf(false)
     private var showInitReconfirm by mutableStateOf(false)
     private var initReconfirmAllowContinue by mutableStateOf(false)
@@ -359,6 +380,18 @@ class MainActivity : ComponentActivity() {
     private var pendingInitUseDefaultKey0: Boolean = false
     private var nfcAdapter: NfcAdapter? = null
     private var qrScanningActive by mutableStateOf(false) // 按下 Scan QR 后，在 280.dp 方框内显示相机
+    /** Payment QR 解析失败时递增，用于重建 EmbeddedQrScanner、清除 lastText 去重，便于同一画面内继续扫同一码 */
+    private var paymentQrDecodeResetKey by mutableStateOf(0)
+    /** Charge + Scan QR：已扫到码，正在解析（关相机、中央 280dp 显示 loading） */
+    private var paymentQrInterpreting by mutableStateOf(false)
+    /** Charge + Scan QR：解析失败时在中央卡片展示（英文） */
+    private var paymentQrParseError by mutableStateOf("")
+    /** QR Top-up：扫码后留在 Scan 页中央显示 Sign & execute，成功/失败再进入 TopupScreen */
+    private var topupQrSigningInProgress by mutableStateOf(false)
+    /** NFC Top-up：贴卡后留在选方式页中央 280dp 显示 Sign & execute，成功后再进 TopupScreen 完成页 */
+    private var topupNfcExecuteInProgress by mutableStateOf(false)
+    /** QR Top-up 在选方式页失败：中央白卡片展示文案，点此区域重试 */
+    private var topupQrExecuteError by mutableStateOf("")
 
     /** AA 账号检测：null=未检测/检测中，true=有 AA，false=无 AA。无 AA 时显示欢迎面板 */
     private var hasAAAccount by mutableStateOf<Boolean?>(null)
@@ -370,6 +403,18 @@ class MainActivity : ComponentActivity() {
     /** 卡统计：Charge=periodTransferAmount，Top-Up=redeemMintCounterFromClear */
     private var cardChargeAmount by mutableStateOf<Double?>(null)
     private var cardTopUpAmount by mutableStateOf<Double?>(null)
+
+    /** Top-up / Charge 成功后等待链上统计更新；与 baseline 比较，直到变化或放弃 */
+    private var pendingVerifyChargeStats by mutableStateOf(false)
+    private var pendingVerifyTopUpStats by mutableStateOf(false)
+    private var baselineChargeStats: Double? = null
+    private var baselineTopUpStats: Double? = null
+    /** RPC 拉取失败时在仪表盘对应金额旁显示黄色感叹号 */
+    private var cardStatsChargeRpcWarning by mutableStateOf(false)
+    private var cardStatsTopUpRpcWarning by mutableStateOf(false)
+
+    private val cardStatsVerifyLock = Any()
+    @Volatile private var cardStatsVerifyThreadRunning = false
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) qrScanningActive = true
@@ -395,25 +440,148 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 解析 QR 中的 OpenContainerRelayPayload（由 signAAtoEOA_USDC_with_BeamioContainerMainRelayedOpen 生成）
-     * 新格式：{ account, currencyType, nonce, deadline, signature, validBefore? }
-     * 旧格式：{ account, to, items, signature }（兼容保留）
-     */
-    private fun parseOpenContainerRelayPayload(content: String): org.json.JSONObject? {
+    /** 从文本中截取第一个 `{` 到最后一个 `}`，忽略前后缀（如误扫到空白、BOM、前缀文案） */
+    private fun extractJsonObjectSubstring(raw: String): String? {
+        val start = raw.indexOf('{')
+        val end = raw.lastIndexOf('}')
+        if (start < 0 || end <= start) return null
+        return raw.substring(start, end + 1)
+    }
+
+    /** account / signature / nonce 等：兼容 JSON 里为 string 或 number */
+    private fun org.json.JSONObject.optStringCoerced(key: String): String {
+        if (!has(key)) return ""
         return try {
-            val root = org.json.JSONObject(content)
-            val account = root.optString("account")
-            val sig = root.optString("signature")
-            if (account.isEmpty() || sig.isEmpty()) return null
-            // 新格式：account + signature + (nonce|deadline|validBefore) 任一即可
-            val hasNewFormat = root.has("currencyType") || root.has("nonce") || root.has("deadline") || root.has("validBefore")
-            if (hasNewFormat) return root
-            // 旧格式：需 to + items
-            val to = root.optString("to")
-            val items = root.optJSONArray("items")
-            if (to.isNotEmpty() && items != null && items.length() > 0) root else null
+            val v = get(key)
+            when (v) {
+                is String -> v
+                is Number -> v.toString()
+                else -> if (v == null || v == org.json.JSONObject.NULL) "" else v.toString()
+            }
         } catch (_: Exception) {
-            null
+            ""
+        }
+    }
+
+    /**
+     * 将扫码内容解析为 JSON（支持 BOM、首尾空白、前缀后缀、外层 JSON 字符串、单层 openContainerPayload 包装）。
+     */
+    private fun parseJsonObjectForQrPayment(content: String): org.json.JSONObject? {
+        var t = content.trim()
+        if (t.startsWith("\uFEFF")) t = t.substring(1).trim()
+        if (t.isEmpty()) return null
+        val candidate = extractJsonObjectSubstring(t) ?: t
+        return try {
+            org.json.JSONObject(candidate)
+        } catch (_: Exception) {
+            try {
+                when (val v = org.json.JSONTokener(candidate).nextValue()) {
+                    is String -> {
+                        val inner = v.trim().let { if (it.startsWith("\uFEFF")) it.substring(1).trim() else it }
+                        val sub = extractJsonObjectSubstring(inner) ?: inner
+                        org.json.JSONObject(sub)
+                    }
+                    is org.json.JSONObject -> v
+                    else -> null
+                }
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    /**
+     * React / SilentPassUI OpenContainerMain 离线签名（containerMainRelayedOpen）：含 currencyType，不含固定 to/items。
+     * 封闭 relay（ContainerMain + itemsHash）JSON 含 to + 非空 items，且通常无 currencyType — 不可按 open relay 处理。
+     */
+    private fun normalizeReactOpenRelayPayload(o: org.json.JSONObject) {
+        val vb = o.optStringCoerced("validBefore").trim()
+        val dl = o.optStringCoerced("deadline").trim()
+        when {
+            dl.isEmpty() && vb.isNotEmpty() -> o.put("deadline", vb)
+            vb.isEmpty() && dl.isNotEmpty() -> o.put("validBefore", dl)
+        }
+        if (!o.has("maxAmount")) {
+            o.put("maxAmount", "0")
+        }
+        if (!o.has("currencyType")) {
+            o.put("currencyType", 4)
+        }
+    }
+
+    private data class OpenQrParseResult(
+        val payload: org.json.JSONObject?,
+        val rejectReason: String?
+    )
+
+    /** Logcat：完整原始扫码串（分块），便于对照 JSON / 隐藏字符。仅解析失败时调用。 */
+    private fun logPaymentQrParseDebug(raw: String, rejectReason: String) {
+        val tag = LOG_QR_PAYMENT_PARSE
+        Log.w(tag, "parse FAILED: $rejectReason | length=${raw.length}")
+        if (raw.isEmpty()) return
+        val maxChunk = 3500
+        var start = 0
+        var part = 0
+        while (start < raw.length && part < 30) {
+            val end = min(start + maxChunk, raw.length)
+            Log.w(tag, "raw_part_$part=${raw.substring(start, end)}")
+            start = end
+            part++
+        }
+        if (start < raw.length) {
+            Log.w(tag, "... log truncated: ${raw.length - start} chars not shown (max ${maxChunk * 30} in log)")
+        }
+    }
+
+    /** 解析 QR 中的 OpenContainerRelayPayload（由 signAAtoEOA_USDC_with_BeamioContainerMainRelayedOpen 生成）
+     * Open relay：{ account, currencyType, nonce, deadline, signature, validBefore? }（validBefore 可与 deadline 二选一，由 normalize 补全）
+     * 封闭 relay：{ account, to, items, nonce, deadline, signature }（兼容保留）
+     */
+    private fun parseOpenContainerRelayPayload(content: String): OpenQrParseResult {
+        return try {
+            var root = parseJsonObjectForQrPayment(content)
+                ?: return OpenQrParseResult(null, "not a JSON object (see raw below)")
+            root.optJSONObject("openContainerPayload")?.let { root = it }
+            val account = root.optStringCoerced("account").trim()
+            val sig = root.optStringCoerced("signature").trim()
+            if (account.isEmpty()) {
+                val keyList = buildString {
+                    val ki = root.keys()
+                    while (ki.hasNext()) {
+                        if (isNotEmpty()) append(',')
+                        append(ki.next())
+                    }
+                }
+                return OpenQrParseResult(null, "missing or empty account (keys=$keyList)")
+            }
+            if (sig.isEmpty()) {
+                return OpenQrParseResult(null, "missing or empty signature")
+            }
+
+            val to = root.optStringCoerced("to").trim()
+            val items = root.optJSONArray("items")
+            val hasClosedRelayItems =
+                to.isNotEmpty() && items != null && items.length() > 0
+
+            val isOpenRelayQr = when {
+                root.has("currencyType") -> true
+                hasClosedRelayItems -> false
+                else -> root.has("nonce") && (root.has("deadline") || root.has("validBefore"))
+            }
+
+            when {
+                isOpenRelayQr -> {
+                    normalizeReactOpenRelayPayload(root)
+                    OpenQrParseResult(root, null)
+                }
+                hasClosedRelayItems -> OpenQrParseResult(root, null)
+                else -> OpenQrParseResult(
+                    null,
+                    "neither open relay (need currencyType or nonce+deadline/validBefore without to+items) nor closed relay (need to+non-empty items)"
+                )
+            }
+        } catch (e: Exception) {
+            OpenQrParseResult(null, "exception: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -424,13 +592,23 @@ class MainActivity : ComponentActivity() {
     private fun handleQrScanResult(content: String) {
         when (pendingScanAction) {
             "payment" -> {
-                val payload = parseOpenContainerRelayPayload(content)
-                if (payload != null) {
-                    qrScanningActive = false
-                    executeQrPayment(payload)
-                } else {
-                    uidText = "Cannot parse payment code. Please scan the customer's Dynamic QR"
-                }
+                qrScanningActive = false
+                paymentQrParseError = ""
+                paymentQrInterpreting = true
+                vibratePaymentQrAck()
+                Thread {
+                    val parsed = parseOpenContainerRelayPayload(content)
+                    runOnUiThread {
+                        paymentQrInterpreting = false
+                        if (parsed.payload != null) {
+                            executeQrPayment(parsed.payload)
+                        } else {
+                            logPaymentQrParseDebug(content, parsed.rejectReason ?: "unknown")
+                            paymentQrParseError = humanizePaymentQrRejectReason(parsed.rejectReason ?: "unknown")
+                            paymentQrDecodeResetKey++
+                        }
+                    }
+                }.start()
             }
             else -> {
                 val beamioTab = parseBeamioTabFromUrl(content)
@@ -465,8 +643,8 @@ class MainActivity : ComponentActivity() {
                         }
                         qrScanningActive = false
                         topupViaQr = true
-                        showScanMethodScreen = false
-                        showTopupScreen = true
+                        topupQrSigningInProgress = true
+                        topupQrExecuteError = ""
                         topupScreenUid = beamioTab ?: ""
                         topupScreenWallet = wallet
                         topupScreenStatus = TopupStatus.Loading
@@ -568,6 +746,15 @@ class MainActivity : ComponentActivity() {
                         Thread { prefetchInfraCardMetadata() }.start()
                     }
                 }
+                LaunchedEffect(topupScreenStatus, topupQrSigningInProgress) {
+                    if (!topupQrSigningInProgress) return@LaunchedEffect
+                    if (topupScreenStatus is TopupStatus.Success) {
+                        topupQrSigningInProgress = false
+                        topupQrExecuteError = ""
+                        showScanMethodScreen = false
+                        showTopupScreen = true
+                    }
+                }
                 when {
                     showWelcomePage -> WelcomePage(
                         versionName = BuildConfig.VERSION_NAME ?: "1.0",
@@ -614,7 +801,26 @@ class MainActivity : ComponentActivity() {
                         scanWaitingForNfc = scanWaitingForNfc,
                         nfcFetchingInfo = nfcFetchingInfo,
                         nfcFetchError = nfcFetchError,
-                        onScanMethodChange = { s -> scanMethodState = s },
+                        topupQrSigningInProgress = topupQrSigningInProgress,
+                        topupNfcExecuteInProgress = topupNfcExecuteInProgress,
+                        topupExecuteUidDisplay = topupScreenUid,
+                        topupQrExecuteError = topupQrExecuteError,
+                        onRetryTopupQrExecute = { retryTopupQrExecute() },
+                        onScanMethodChange = { s ->
+                            scanMethodState = s
+                            paymentQrParseError = ""
+                            paymentQrInterpreting = false
+                            if (s == "nfc") qrScanningActive = false
+                        },
+                        embeddedQrResetKey = if (pendingScanAction == "payment") paymentQrDecodeResetKey else 0,
+                        paymentQrInterpreting = paymentQrInterpreting,
+                        paymentQrParseError = paymentQrParseError,
+                        onRetryPaymentQrScan = {
+                            paymentQrParseError = ""
+                            paymentQrDecodeResetKey++
+                            if (scanMethodState == "qr") qrScanningActive = true
+                        },
+                        onRetryPaymentAfterError = { retryChargeAfterScanMethodError() },
                         pendingAction = pendingScanAction,
                         totalAmount = when (pendingScanAction) {
                             "payment" -> paymentScreenAmount
@@ -624,6 +830,7 @@ class MainActivity : ComponentActivity() {
                         paymentStatus = if (pendingScanAction == "payment") paymentScreenStatus else null,
                         paymentRoutingSteps = if (pendingScanAction == "payment") paymentScreenRoutingSteps else emptyList(),
                         paymentError = if (pendingScanAction == "payment") paymentScreenError else "",
+                        paymentNfcUid = if (pendingScanAction == "payment") paymentScreenUid else "",
                         paymentAmount = if (pendingScanAction == "payment") paymentScreenAmount else "",
                         paymentPayee = if (pendingScanAction == "payment") paymentScreenPayee else "",
                         paymentTxHash = if (pendingScanAction == "payment") paymentScreenTxHash else "",
@@ -639,10 +846,14 @@ class MainActivity : ComponentActivity() {
                         paymentCardType = if (pendingScanAction == "payment") paymentScreenCardType else null,
                         onPaymentDone = {
                             showScanMethodScreen = false
+                            showTipScreen = false
+                            showAmountInputScreen = false
+                            qrScanningActive = false
+                            scanWaitingForNfc = false
+                            nfcFetchingInfo = false
+                            nfcFetchError = ""
+                            paymentArmed = false
                             resetPaymentScreenState()
-                            tipScreenSubtotal = scanMethodBackTipSubtotal
-                            selectedTipRate = scanMethodBackTipRate
-                            showTipScreen = true
                         },
                         onProceed = { proceedFromScanMethod() },
                         onProceedNfcStay = { armForNfcScan() },
@@ -662,6 +873,9 @@ class MainActivity : ComponentActivity() {
                             scanWaitingForNfc = false
                             nfcFetchingInfo = false
                             nfcFetchError = ""
+                            topupNfcExecuteInProgress = false
+                            topupQrSigningInProgress = false
+                            topupQrExecuteError = ""
                             readArmed = false
                             topupArmed = false
                             paymentArmed = false
@@ -685,7 +899,6 @@ class MainActivity : ComponentActivity() {
                         settlementViaQr = readViaQr,
                         onBack = { closeReadScreen() },
                         onTopupClick = {
-                            topupFromReadScreen = true
                             closeReadScreen()
                             amountInput = "0"
                             amountInputMode = "topup"
@@ -698,7 +911,6 @@ class MainActivity : ComponentActivity() {
                         amount = amountInput,
                         onPadClick = { v -> handleAmountPadClick(v) },
                         onBack = {
-                            topupFromReadScreen = false
                             showAmountInputScreen = false
                             amountInput = "0"
                         },
@@ -709,39 +921,8 @@ class MainActivity : ComponentActivity() {
                                 amountInput = "0"
                                 when (amountInputMode) {
                                     "topup" -> {
-                                        if (topupFromReadScreen) {
-                                            topupFromReadScreen = false
-                                            val walletFromRead = readScreenAssets?.address?.takeIf { it.isNotEmpty() }
-                                                ?: readScreenWallet?.takeIf { it.isNotEmpty() }
-                                            val beamioFromRead = readScreenUid.takeIf { it.isNotEmpty() }
-                                            when {
-                                                walletFromRead != null -> {
-                                                    resetTopupScreenState()
-                                                    topupScreenAmount = amt
-                                                    topupScreenWallet = walletFromRead
-                                                    topupScreenUid = ""
-                                                    topupViaQr = readViaQr  // 继承 QR balance 的协议，settlement 显示 App Validator
-                                                    topupScreenStatus = TopupStatus.Loading  // 从 Balance Loaded 进入，直接显示 loading，无需 tap card
-                                                    showTopupScreen = true
-                                                    executeWalletTopup(walletFromRead, amt)
-                                                    resetReadScreenState()
-                                                }
-                                                beamioFromRead != null -> {
-                                                    resetTopupScreenState()
-                                                    topupScreenAmount = amt
-                                                    topupScreenUid = beamioFromRead
-                                                    topupScreenWallet = null
-                                                    topupViaQr = readViaQr  // 继承 QR balance 的协议，settlement 显示 App Validator
-                                                    topupScreenStatus = TopupStatus.Loading  // 从 Balance Loaded 进入，直接显示 loading，无需 tap card
-                                                    showTopupScreen = true
-                                                    executeTopupWithBeamioTag(beamioFromRead, amt)
-                                                    resetReadScreenState()
-                                                }
-                                                else -> startTopup(amt)
-                                            }
-                                        } else {
-                                            startTopup(amt)
-                                        }
+                                        // 与 Home Top-up 一致：金额 → 选方式（NFC / QR）→ 贴卡或扫码，不再从 Balance Loaded 直跳 execute
+                                        startTopup(amt)
                                     }
                                     "charge" -> {
                                         tipScreenSubtotal = amt
@@ -807,6 +988,8 @@ class MainActivity : ComponentActivity() {
                         adminProfile = terminalAdminProfile,
                         chargeAmount = cardChargeAmount,
                         topUpAmount = cardTopUpAmount,
+                        chargeStatsRpcWarning = cardStatsChargeRpcWarning,
+                        topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -840,6 +1023,8 @@ class MainActivity : ComponentActivity() {
                         adminProfile = terminalAdminProfile,
                         chargeAmount = cardChargeAmount,
                         topUpAmount = cardTopUpAmount,
+                        chargeStatsRpcWarning = cardStatsChargeRpcWarning,
+                        topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -911,6 +1096,38 @@ class MainActivity : ComponentActivity() {
     private fun closeTopupScreen() {
         showTopupScreen = false
         topupArmed = false
+        topupQrSigningInProgress = false
+        topupNfcExecuteInProgress = false
+        topupQrExecuteError = ""
+    }
+
+    /** Wallet / beamioTag Top-up 错误：QR 且在选方式页时留在 Scan 中央卡片，否则进 TopupScreen */
+    private fun applyTopupQrScanScreenError(message: String) {
+        topupScreenError = message
+        topupScreenStatus = TopupStatus.Error
+        if (topupViaQr && showScanMethodScreen) {
+            topupQrSigningInProgress = false
+            topupQrExecuteError = message
+        } else {
+            topupQrExecuteError = ""
+            if (!showTopupScreen) showTopupScreen = true
+        }
+    }
+
+    private fun retryTopupQrExecute() {
+        if (topupQrExecuteError.isEmpty()) return
+        topupQrExecuteError = ""
+        topupQrSigningInProgress = true
+        topupScreenStatus = TopupStatus.Loading
+        topupScreenError = ""
+        when {
+            topupScreenUid.isNotBlank() -> executeTopupWithBeamioTag(topupScreenUid, topupScreenAmount)
+            topupScreenWallet != null -> executeWalletTopup(topupScreenWallet!!, topupScreenAmount)
+            else -> {
+                topupQrSigningInProgress = false
+                applyTopupQrScanScreenError("Missing customer link. Scan QR again.")
+            }
+        }
     }
 
     /** 重置支付相关状态，避免 cancel 后再次 Charge 时残留旧数据 */
@@ -934,10 +1151,46 @@ class MainActivity : ComponentActivity() {
         paymentScreenTierName = null
         paymentScreenCardType = null
         paymentScreenMemberNo = null
+        paymentQrInterpreting = false
+        paymentQrParseError = ""
+    }
+
+    /** Charge 动态 QR：扫到码后短振动，提示进入解析阶段 */
+    private fun vibratePaymentQrAck() {
+        val v: Vibrator? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+        if (v == null) return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                v.vibrate(VibrationEffect.createOneShot(85, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(85)
+            }
+        } catch (_: SecurityException) {
+        }
+    }
+
+    private fun humanizePaymentQrRejectReason(reason: String): String {
+        return when {
+            reason.startsWith("not a JSON object") -> "Invalid QR: data is not valid JSON."
+            reason.startsWith("missing or empty account") -> "Invalid QR: missing customer account."
+            reason.startsWith("missing or empty signature") -> "Invalid QR: missing payment signature."
+            reason.startsWith("neither open relay") -> "Invalid QR: unrecognized payment format."
+            reason.startsWith("exception:") -> "Could not read payment code. Please try again."
+            else -> "Could not read payment code."
+        }
     }
 
     /** 重置充值相关状态 */
     private fun resetTopupScreenState() {
+        topupQrSigningInProgress = false
+        topupNfcExecuteInProgress = false
+        topupQrExecuteError = ""
         topupViaQr = false
         topupScreenUid = ""
         topupScreenWallet = null
@@ -977,6 +1230,43 @@ class MainActivity : ComponentActivity() {
         pendingScanAction = "payment"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+    }
+
+    /** Charge 在选方式页 Smart Routing 失败后：NFC 回到等待贴卡；QR 留在 Scan QR 并打开相机扫码 */
+    private fun retryChargeAfterScanMethodError() {
+        if (pendingScanAction != "payment") return
+        nfcFetchingInfo = false
+        nfcFetchError = ""
+        paymentQrInterpreting = false
+        paymentQrParseError = ""
+        if (scanMethodState == "qr") {
+            scanWaitingForNfc = false
+            paymentArmed = false
+            paymentScreenUid = ""
+            paymentScreenStatus = PaymentStatus.Waiting
+            paymentScreenTxHash = ""
+            paymentScreenError = ""
+            paymentScreenRoutingSteps = emptyList()
+            paymentScreenPreBalance = null
+            paymentScreenPostBalance = null
+            paymentScreenCardCurrency = null
+            paymentScreenCardBackground = null
+            paymentScreenCardImage = null
+            paymentScreenCardName = null
+            paymentScreenTierName = null
+            paymentScreenCardType = null
+            paymentScreenMemberNo = null
+            scanMethodState = "qr"
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                qrScanningActive = true
+            } else {
+                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+            }
+        } else {
+            qrScanningActive = false
+            scanMethodState = "nfc"
+            armForNfcScan()
+        }
     }
 
     /** NFC 模式下：按下 Continue 后留在本页，显示 loading，等待贴卡获得 UID */
@@ -1019,7 +1309,8 @@ class MainActivity : ComponentActivity() {
             }
             "payment" -> {
                 paymentScreenUid = ""
-                paymentScreenStatus = PaymentStatus.Routing
+                // Stay in Waiting until a tag is read; Routing triggers Smart Routing UI and hides scanWaitingForNfc.
+                paymentScreenStatus = PaymentStatus.Waiting
                 paymentScreenTxHash = ""
                 paymentScreenError = ""
                 paymentScreenRoutingSteps = emptyList()
@@ -1041,6 +1332,28 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun proceedFromScanMethod() {
+        if (pendingScanAction == "topup") {
+            scanWaitingForNfc = false
+            topupViaQr = false
+            topupScreenUid = ""
+            topupScreenWallet = null
+            topupScreenStatus = TopupStatus.Waiting
+            topupScreenTxHash = ""
+            topupScreenError = ""
+            topupScreenPreBalance = null
+            topupScreenPostBalance = null
+            topupScreenCardCurrency = null
+            topupScreenAddress = null
+            topupScreenCardBackground = null
+            topupScreenCardImage = null
+            topupScreenTierName = null
+            topupScreenTierDescription = null
+            topupArmed = true
+            readArmed = false
+            initArmed = false
+            paymentArmed = false
+            return
+        }
         showScanMethodScreen = false
         scanWaitingForNfc = false
         when (pendingScanAction) {
@@ -1059,27 +1372,6 @@ class MainActivity : ComponentActivity() {
                 paymentArmed = false
                 topupArmed = false
                 uidText = "Please tap card to read UID..."
-            }
-            "topup" -> {
-                topupViaQr = false
-                showTopupScreen = true
-                topupScreenUid = ""
-                topupScreenWallet = null
-                topupScreenStatus = TopupStatus.Waiting
-                topupScreenTxHash = ""
-                topupScreenError = ""
-                topupScreenPreBalance = null
-                topupScreenPostBalance = null
-                topupScreenCardCurrency = null
-                topupScreenAddress = null
-                topupScreenCardBackground = null
-                topupScreenCardImage = null
-                topupScreenTierName = null
-                topupScreenTierDescription = null
-                topupArmed = true
-                readArmed = false
-                initArmed = false
-                paymentArmed = false
             }
             "payment" -> {
                 showPaymentScreen = true
@@ -1126,20 +1418,20 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun executeNfcTopup(tag: Tag, uid: String, amount: String) {
+    private fun executeNfcTopup(tag: Tag, uid: String, amount: String, fromScanMethodFlow: Boolean = false) {
         Thread {
             try {
-                Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid")
+                Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid fromScanMethodFlow=$fromScanMethodFlow")
                 val sunParams = readSunParamsFromNdef(tag)
                 // NFC 格式（14 位 hex uid）必须提供 SUN 参数，不符合 SUN 或无法推导 tagID 的不予受理
                 val isNfcUid = uid.length == 14 && uid.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
                 if (isNfcUid && sunParams == null) {
                     val err = "Card does not support SUN. Cannot top up."
                     runOnUiThread {
-                        val fromScan = nfcFetchingInfo
+                        topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
                         topupScreenError = err
-                        if (fromScan) {
+                        if (fromScanMethodFlow) {
                             nfcFetchingInfo = false
                             nfcFetchError = err
                         }
@@ -1149,26 +1441,28 @@ class MainActivity : ComponentActivity() {
                 // 1. Topup 之前先拉取余额，对齐后端返回码（避免 UID/QR 混淆时解析 HTML 报错）
                 val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
                 if (preAssets == null || !preAssets.ok) {
+                    val errMsg = preAssets?.error ?: "Query failed"
                     runOnUiThread {
-                        val fromScan = nfcFetchingInfo
+                        topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
-                        topupScreenError = preAssets?.error ?: "Query failed"
-                        if (fromScan) {
+                        topupScreenError = errMsg
+                        if (fromScanMethodFlow) {
                             nfcFetchingInfo = false
-                            nfcFetchError = preAssets?.error ?: "Query failed"
+                            nfcFetchError = errMsg
                         }
                     }
                     return@Thread
                 }
                 val amountCad = amount.toDoubleOrNull() ?: 0.0
                 if (!hasMembershipNft(preAssets) && amountCad < 50.0) {
+                    val errMsg = "Top-up not allowed without membership card. Please purchase a card first."
                     runOnUiThread {
-                        val fromScan = nfcFetchingInfo
+                        topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
-                        topupScreenError = "Top-up not allowed without membership card. Please purchase a card first."
-                        if (fromScan) {
+                        topupScreenError = errMsg
+                        if (fromScanMethodFlow) {
                             nfcFetchingInfo = false
-                            nfcFetchError = topupScreenError
+                            nfcFetchError = errMsg
                         }
                     }
                     return@Thread
@@ -1177,10 +1471,10 @@ class MainActivity : ComponentActivity() {
                 val prepare = nfcTopupPrepare(uid, amount, sunParams)
                 if (prepare.error != null) {
                     runOnUiThread {
-                        val fromScan = nfcFetchingInfo
+                        topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
                         topupScreenError = prepare.error!!
-                        if (fromScan) {
+                        if (fromScanMethodFlow) {
                             nfcFetchingInfo = false
                             nfcFetchError = prepare.error!!
                         }
@@ -1220,17 +1514,18 @@ class MainActivity : ComponentActivity() {
                     prepare.nonce!!
                 )
                 val result = nfcTopup(uid, amount, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig, sunParams)
+                val keepOnScanUntilSuccess = fromScanMethodFlow
                 runOnUiThread {
-                    val fromScan = nfcFetchingInfo
+                    nfcFetchingInfo = false
                     if (result.success) {
                         topupScreenPostBalance = null
                         topupScreenTxHash = result.txHash ?: ""
                         topupScreenError = ""
                         topupScreenUid = uid
-                        if (fromScan) {
-                            topupViaQr = false
-                            nfcFetchingInfo = false
-                            showScanMethodScreen = false
+                        topupViaQr = false
+                        if (keepOnScanUntilSuccess) {
+                            topupNfcExecuteInProgress = true
+                        } else {
                             showTopupScreen = true
                         }
                         topupScreenStatus = TopupStatus.Loading
@@ -1258,27 +1553,35 @@ class MainActivity : ComponentActivity() {
                                     topupScreenPostBalance = "—"
                                 }
                                 topupScreenStatus = TopupStatus.Success
-                                scheduleCardStatsRefetchAfterDelay()
+                                if (keepOnScanUntilSuccess) {
+                                    topupNfcExecuteInProgress = false
+                                    showScanMethodScreen = false
+                                    showTopupScreen = true
+                                }
+                                scheduleCardStatsRefetchUntilChanged(expectChargeChange = false, expectTopUpChange = true)
                             }
                         }.start()
                     } else {
+                        val errMsg = result.error ?: "Top-up failed"
+                        topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
-                        topupScreenError = result.error ?: "Top-up failed"
-                        if (fromScan) {
+                        topupScreenError = errMsg
+                        if (fromScanMethodFlow) {
                             nfcFetchingInfo = false
-                            nfcFetchError = result.error ?: "Top-up failed"
+                            nfcFetchError = errMsg
                         }
                     }
                 }
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeNfcTopup", e)
                 runOnUiThread {
-                    val fromScan = nfcFetchingInfo
+                    val errMsg = e.message ?: "Execution failed"
+                    topupNfcExecuteInProgress = false
                     topupScreenStatus = TopupStatus.Error
-                    topupScreenError = e.message ?: "Execution failed"
-                    if (fromScan) {
+                    topupScreenError = errMsg
+                    if (fromScanMethodFlow) {
                         nfcFetchingInfo = false
-                        nfcFetchError = e.message ?: "Execution failed"
+                        nfcFetchError = errMsg
                     }
                 }
             }
@@ -1351,28 +1654,19 @@ class MainActivity : ComponentActivity() {
                 Log.d("Topup", "[Topup Debug] executeTopupWithBeamioTag entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | beamioTag=$beamioTag")
                 val prepare = nfcTopupPrepareWithBeamioTag(beamioTag, amount)
                 if (prepare.error != null) {
-                    runOnUiThread {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = prepare.error!!
-                    }
+                    runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
                     return@Thread
                 }
                 val wallet = prepare.wallet
                 if (wallet == null) {
-                    runOnUiThread {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = "Server did not return wallet. Please retry"
-                    }
+                    runOnUiThread { applyTopupQrScanScreenError("Server did not return wallet. Please retry") }
                     return@Thread
                 }
                 runOnUiThread { topupScreenWallet = wallet }
                 executeWalletTopupInternal(wallet, amount, prepare)
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeTopupWithBeamioTag", e)
-                runOnUiThread {
-                    topupScreenStatus = TopupStatus.Error
-                    topupScreenError = e.message ?: "Execution failed"
-                }
+                runOnUiThread { applyTopupQrScanScreenError(e.message ?: "Execution failed") }
             }
         }.start()
     }
@@ -1383,19 +1677,13 @@ class MainActivity : ComponentActivity() {
                 Log.d("Topup", "[Topup Debug] executeWalletTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | customerWallet=$wallet")
                 val prepare = nfcTopupPrepareWithWallet(wallet, amount)
                 if (prepare.error != null) {
-                    runOnUiThread {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = prepare.error!!
-                    }
+                    runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
                     return@Thread
                 }
                 executeWalletTopupInternal(wallet, amount, prepare)
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeWalletTopup", e)
-                runOnUiThread {
-                    topupScreenStatus = TopupStatus.Error
-                    topupScreenError = e.message ?: "Execution failed"
-                }
+                runOnUiThread { applyTopupQrScanScreenError(e.message ?: "Execution failed") }
             }
         }.start()
     }
@@ -1405,17 +1693,13 @@ class MainActivity : ComponentActivity() {
                 // 1. Topup 之前先拉取余额，对齐后端 400/404/500 返回码
                 val preAssets = fetchWalletAssetsSync(wallet)
                 if (preAssets == null || !preAssets.ok) {
-                    runOnUiThread {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = preAssets?.error ?: "Query failed"
-                    }
+                    runOnUiThread { applyTopupQrScanScreenError(preAssets?.error ?: "Query failed") }
                     return
                 }
                 val amountCad = amount.toDoubleOrNull() ?: 0.0
                 if (!hasMembershipNft(preAssets) && amountCad < 50.0) {
                     runOnUiThread {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = "Top-up not allowed without membership card. Please purchase a card first."
+                        applyTopupQrScanScreenError("Top-up not allowed without membership card. Please purchase a card first.")
                     }
                     return
                 }
@@ -1457,6 +1741,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenPostBalance = null
                         topupScreenTxHash = result.txHash ?: ""
                         topupScreenError = ""
+                        topupQrExecuteError = ""
                         topupScreenStatus = TopupStatus.Loading
                         Thread {
                             Thread.sleep(3000)
@@ -1482,20 +1767,16 @@ class MainActivity : ComponentActivity() {
                                     topupScreenPostBalance = "—"
                                 }
                                 topupScreenStatus = TopupStatus.Success
-                                scheduleCardStatsRefetchAfterDelay()
+                                scheduleCardStatsRefetchUntilChanged(expectChargeChange = false, expectTopUpChange = true)
                             }
                         }.start()
                     } else {
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = result.error ?: "Top-up failed"
+                        applyTopupQrScanScreenError(result.error ?: "Top-up failed")
                     }
                 }
         } catch (e: Exception) {
             Log.e("MainActivity", "executeWalletTopupInternal", e)
-            runOnUiThread {
-                topupScreenStatus = TopupStatus.Error
-                topupScreenError = e.message ?: "Execution failed"
-            }
+            runOnUiThread { applyTopupQrScanScreenError(e.message ?: "Execution failed") }
         }
     }
 
@@ -1773,38 +2054,48 @@ class MainActivity : ComponentActivity() {
                 val result = payByNfcUidWithContainer(effectiveUid, amountUsdc6, payee, assets, oracle, sunParams)
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
-                runOnUiThread {
-                    val fromScan = nfcFetchingInfo
-                    paymentScreenRoutingSteps = steps
-                    if (result.success) {
+                if (!result.success) {
+                    runOnUiThread {
+                        val fromScan = nfcFetchingInfo
+                        paymentScreenRoutingSteps = steps
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = result.error ?: "Payment failed"
+                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = result.error ?: "Payment failed" }
+                    }
+                } else {
+                    steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
+                    runOnUiThread {
+                        val fromScan = nfcFetchingInfo
+                        paymentScreenRoutingSteps = steps
                         paymentScreenPostBalance = null
-                        paymentScreenStatus = PaymentStatus.Refreshing
+                        paymentScreenStatus = PaymentStatus.Submitting
                         paymentScreenTxHash = result.txHash ?: ""
                         paymentScreenError = ""
                         if (fromScan) {
                             paymentViaQr = false
                             nfcFetchingInfo = false
-                            showScanMethodScreen = false
-                            showPaymentScreen = true
                         }
-                        Thread {
-                            Thread.sleep(3000)
-                            val postAssets = fetchUidAssetsSync(effectiveUid, sunParams)
-                            runOnUiThread {
-                                if (postAssets != null && postAssets.ok) {
-                                    paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
-                                } else {
-                                    paymentScreenPostBalance = "—"
-                                }
-                                paymentScreenStatus = PaymentStatus.Success
-                                scheduleCardStatsRefetchAfterDelay()
-                            }
-                        }.start()
-                    } else {
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = result.error ?: "Payment failed"
-                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = result.error ?: "Payment failed" }
                     }
+                    Thread {
+                        Thread.sleep(3000)
+                        val postAssets = fetchUidAssetsSync(effectiveUid, sunParams)
+                        val stepsAfter = updateStep(
+                            steps,
+                            "refreshBalance",
+                            StepStatus.success,
+                            if (postAssets != null && postAssets.ok) "Updated" else "Unavailable"
+                        )
+                        runOnUiThread {
+                            paymentScreenRoutingSteps = stepsAfter
+                            if (postAssets != null && postAssets.ok) {
+                                paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
+                            } else {
+                                paymentScreenPostBalance = "—"
+                            }
+                            paymentScreenStatus = PaymentStatus.Success
+                            scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                        }
+                    }.start()
                 }
             } catch (e: Exception) {
                 Log.e("MainActivity", "executePayment", e)
@@ -2023,24 +2314,46 @@ class MainActivity : ComponentActivity() {
                     infraPointsWei > 0 -> (if (hasMaxAmount && beamioUserCardAddr != null) beamioUserCardAddr else BEAMIO_USER_CARD_ASSET_ADDRESS)
                     else -> null
                 }
-                runOnUiThread {
-                    paymentScreenRoutingSteps = steps
-                    nfcFetchingInfo = false
-                    if (result.success) {
+                if (!result.success) {
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = steps
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = result.error ?: "Payment failed"
+                    }
+                } else {
+                    steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = steps
+                        nfcFetchingInfo = false
                         paymentScreenPostBalance = null
-                        paymentScreenStatus = PaymentStatus.Refreshing
+                        paymentScreenStatus = PaymentStatus.Submitting
                         paymentScreenTxHash = result.txHash ?: ""
                         paymentScreenError = ""
                         paymentViaQr = true
-                        showScanMethodScreen = false
-                        showPaymentScreen = true
-                        Thread {
-                            // 等待 5 秒确保链上确认（Base ~2s/block），避免拿到扣款前状态
-                            Thread.sleep(5000)
-                            var postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
-                            var postCad = postAssets?.let { a ->
+                    }
+                    Thread {
+                        // 等待 5 秒确保链上确认（Base ~2s/block），避免拿到扣款前状态
+                        Thread.sleep(5000)
+                        var postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
+                        var postCad = postAssets?.let { a ->
+                            if (!a.ok) null else {
+                                val card = deductedCardAddress?.let { addr ->
+                                    a.cards?.find { it.cardAddress.equals(addr, ignoreCase = true) }
+                                }
+                                if (card != null) {
+                                    val pts6 = card.points6.toLongOrNull() ?: 0L
+                                    (pts6 / 1_000_000.0) * getRateForCurrency("CAD", oracle) / getRateForCurrency(card.cardCurrency, oracle)
+                                } else {
+                                    totalBalanceCadFromAssets(a, oracle)
+                                }
+                            }
+                        }
+                        if (postCad != null && postCad >= preBalanceForCheck - 0.01 && merchantAmountCad > 0.001) {
+                            Thread.sleep(3000)
+                            postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
+                            postCad = postAssets?.let { a ->
                                 if (!a.ok) null else {
-                                    // 扣款来自单卡时，显示该卡余额（与用户预期一致）；否则显示总资产
                                     val card = deductedCardAddress?.let { addr ->
                                         a.cards?.find { it.cardAddress.equals(addr, ignoreCase = true) }
                                     }
@@ -2052,40 +2365,25 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
-                            // 若扣款后余额仍 >= 扣款前，可能链上未确认，重试一次
-                            if (postCad != null && postCad >= preBalanceForCheck - 0.01 && merchantAmountCad > 0.001) {
-                                Thread.sleep(3000)
-                                postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
-                                postCad = postAssets?.let { a ->
-                                    if (!a.ok) null else {
-                                        val card = deductedCardAddress?.let { addr ->
-                                            a.cards?.find { it.cardAddress.equals(addr, ignoreCase = true) }
-                                        }
-                                        if (card != null) {
-                                            val pts6 = card.points6.toLongOrNull() ?: 0L
-                                            (pts6 / 1_000_000.0) * getRateForCurrency("CAD", oracle) / getRateForCurrency(card.cardCurrency, oracle)
-                                        } else {
-                                            totalBalanceCadFromAssets(a, oracle)
-                                        }
-                                    }
-                                }
+                        }
+                        val finalPostCad = postCad
+                        val stepsAfter = updateStep(
+                            steps,
+                            "refreshBalance",
+                            StepStatus.success,
+                            if (postAssets != null && postAssets.ok && finalPostCad != null) "Updated" else "Unavailable"
+                        )
+                        runOnUiThread {
+                            paymentScreenRoutingSteps = stepsAfter
+                            if (postAssets != null && postAssets.ok && finalPostCad != null) {
+                                paymentScreenPostBalance = "%.2f".format(finalPostCad)
+                            } else {
+                                paymentScreenPostBalance = "—"
                             }
-                            val finalPostCad = postCad
-                            runOnUiThread {
-                                // 使用拉取的 postAssets 计算余额，不使用 pre - subtotal - tip 本地计算
-                                if (postAssets != null && postAssets.ok && finalPostCad != null) {
-                                    paymentScreenPostBalance = "%.2f".format(finalPostCad)
-                                } else {
-                                    paymentScreenPostBalance = "—"
-                                }
-                                paymentScreenStatus = PaymentStatus.Success
-                                scheduleCardStatsRefetchAfterDelay()
-                            }
-                        }.start()
-                    } else {
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = result.error ?: "Payment failed"
-                    }
+                            paymentScreenStatus = PaymentStatus.Success
+                            scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                        }
+                    }.start()
                 }
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeQrPayment", e)
@@ -2594,16 +2892,102 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 业务变更（topup/charge 完成）后 4 秒主动拉取 Charge/Top-Up，遵循 beamio-chain-fetch-protocol：业务变更时刷新。仅成功时更新，不覆盖可信数据。 */
-    private fun scheduleCardStatsRefetchAfterDelay() {
+    private fun statsDashboardAmountChanged(baseline: Double?, current: Double): Boolean {
+        if (baseline == null) return true
+        return abs(current - baseline) > 1e-5
+    }
+
+    /**
+     * Top-up / Charge 成功后：每 6 秒链上拉取一次，直到对应统计相对 baseline 已变化（链上已反映）。
+     * RPC 失败时不覆盖已有金额，并对正在等待验证的一侧显示黄色感叹号。
+     */
+    private fun scheduleCardStatsRefetchUntilChanged(expectChargeChange: Boolean, expectTopUpChange: Boolean) {
+        runOnUiThread {
+            if (expectChargeChange) {
+                pendingVerifyChargeStats = true
+                cardStatsChargeRpcWarning = false
+                baselineChargeStats = cardChargeAmount
+            }
+            if (expectTopUpChange) {
+                pendingVerifyTopUpStats = true
+                cardStatsTopUpRpcWarning = false
+                baselineTopUpStats = cardTopUpAmount
+            }
+            startCardStatsVerifyLoopIfNeeded()
+        }
+    }
+
+    private fun applyCardStatsFetchForVerify(charge: Double?, topUp: Double?) {
+        val rpcFail = charge == null && topUp == null
+        if (rpcFail) {
+            if (pendingVerifyChargeStats) cardStatsChargeRpcWarning = true
+            if (pendingVerifyTopUpStats) cardStatsTopUpRpcWarning = true
+            return
+        }
+        if (charge != null) {
+            cardChargeAmount = charge
+            if (pendingVerifyChargeStats) {
+                cardStatsChargeRpcWarning = false
+                if (statsDashboardAmountChanged(baselineChargeStats, charge)) {
+                    pendingVerifyChargeStats = false
+                }
+            }
+        }
+        if (topUp != null) {
+            cardTopUpAmount = topUp
+            if (pendingVerifyTopUpStats) {
+                cardStatsTopUpRpcWarning = false
+                if (statsDashboardAmountChanged(baselineTopUpStats, topUp)) {
+                    pendingVerifyTopUpStats = false
+                }
+            }
+        }
+    }
+
+    private fun startCardStatsVerifyLoopIfNeeded() {
+        synchronized(cardStatsVerifyLock) {
+            if (cardStatsVerifyThreadRunning) return
+            cardStatsVerifyThreadRunning = true
+        }
         Thread {
-            Thread.sleep(4000)
-            val wallet = BeamioWeb3Wallet.getAddress() ?: ""
-            if (wallet.isNotEmpty()) {
-                val (charge, topUp) = fetchCardStatsSync(wallet)
+            var stoppedBecauseVerified = false
+            try {
+                val maxIterations = 60
+                var iter = 0
+                while (iter < maxIterations) {
+                    Thread.sleep(6000)
+                    iter++
+                    val wallet = BeamioWeb3Wallet.getAddress()?.takeIf { it.isNotEmpty() } ?: break
+                    val pair = fetchCardStatsSync(wallet)
+                    val latch = CountDownLatch(1)
+                    val continueLoop = booleanArrayOf(false)
+                    runOnUiThread {
+                        try {
+                            applyCardStatsFetchForVerify(pair.first, pair.second)
+                            continueLoop[0] = pendingVerifyChargeStats || pendingVerifyTopUpStats
+                        } finally {
+                            latch.countDown()
+                        }
+                    }
+                    latch.await()
+                    if (!continueLoop[0]) {
+                        stoppedBecauseVerified = true
+                        break
+                    }
+                }
                 runOnUiThread {
-                    if (charge != null) cardChargeAmount = charge
-                    if (topUp != null) cardTopUpAmount = topUp
+                    if (!stoppedBecauseVerified && (pendingVerifyChargeStats || pendingVerifyTopUpStats)) {
+                        pendingVerifyChargeStats = false
+                        pendingVerifyTopUpStats = false
+                        cardStatsChargeRpcWarning = false
+                        cardStatsTopUpRpcWarning = false
+                    }
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                synchronized(cardStatsVerifyLock) {
+                    cardStatsVerifyThreadRunning = false
                 }
             }
         }.start()
@@ -3110,13 +3494,14 @@ class MainActivity : ComponentActivity() {
         if (topupArmed) {
             val uid = tag.id?.joinToString("") { b -> "%02X".format(b) } ?: return
             scanWaitingForNfc = false
-            nfcFetchingInfo = true
+            nfcFetchingInfo = false
             nfcFetchError = ""
+            topupNfcExecuteInProgress = true
             topupScreenUid = uid
             topupScreenStatus = TopupStatus.Loading
             topupScreenError = ""
             topupArmed = false
-            executeNfcTopup(tag, uid, topupScreenAmount)
+            executeNfcTopup(tag, uid, topupScreenAmount, fromScanMethodFlow = true)
             return
         }
 
@@ -3649,9 +4034,10 @@ internal fun TopupScreen(
                         verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
                         CircularProgressIndicator()
-                        Text(text = "Sign and execute Topup...", fontSize = 14.sp)
+                        Text(text = "Sign & execute", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                        Text(text = "Completing top-up…", fontSize = 13.sp, color = Color(0xFF64748b))
                         if (uid.isNotBlank()) {
-                            Text(text = "UID: $uid", fontSize = 12.sp)
+                            Text(text = "UID: $uid", fontSize = 12.sp, color = Color(0xFF86868b))
                         }
                     }
                 }
@@ -4324,6 +4710,13 @@ internal fun ReadScreen(
             is ReadStatus.Success -> {
                 val balanceScroll = rememberScrollState()
                 var responseExpanded by remember(rawResponseJson) { mutableStateOf(false) }
+                var topupButtonEnabled by remember { mutableStateOf(true) }
+                // 每次进入 Balance Loaded（uid / 账户变化）重新计时 1 分钟
+                LaunchedEffect(uid, assets?.aaAddress, assets?.address) {
+                    topupButtonEnabled = true
+                    delay(60_000L)
+                    topupButtonEnabled = false
+                }
                 val cardList = assets?.cards?.takeIf { it.isNotEmpty() }
                     ?: listOfNotNull(assets?.cardAddress?.let { addr ->
                         // 兼容旧接口：若仅返回单卡字段，也按“服务端返回资产”展示，不做 CCSA/基础设施硬编码。
@@ -4600,21 +4993,30 @@ internal fun ReadScreen(
                                 .padding(horizontal = sidePad)
                                 .padding(top = gapSm, bottom = bottomPad)
                         ) {
+                            val actionBtnH = btnH
                             Button(
                                 onClick = onTopupClick,
+                                enabled = topupButtonEnabled,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(btnH)
-                                    .padding(bottom = if (compact) 8.dp else 10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1562f0), contentColor = Color.White)
+                                    .height(actionBtnH),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF1562f0),
+                                    contentColor = Color.White,
+                                    disabledContainerColor = Color(0xFF1562f0).copy(alpha = 0.35f),
+                                    disabledContentColor = Color.White.copy(alpha = 0.55f)
+                                )
                             ) {
                                 Icon(Icons.Filled.Add, null, Modifier.size(14.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text("Top-Up Card Now", fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.SemiBold)
                             }
+                            Spacer(modifier = Modifier.height(if (compact) 8.dp else 10.dp))
                             Button(
                                 onClick = onBack,
-                                modifier = Modifier.fillMaxWidth().height(btnH),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(actionBtnH),
                                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
                             ) {
                                 Text("Done", fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.SemiBold)
@@ -4685,28 +5087,18 @@ private fun PaymentSuccessContent(
             .verticalScroll(rememberScrollState())
             .background(Color(0xFFf5f5f7))
     ) {
-        // Header: icon + Payment Approved + amount
+        // Header: Approved + amount（无顶部 icon）
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(top = 24.dp, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Box(
-                modifier = Modifier
-                    .size(56.dp)
-                    .background(Color.White, CircleShape)
-                    .padding(12.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(Icons.Filled.CheckCircle, null, Modifier.size(32.dp), tint = Color(0xFF34C759))
-            }
             Text(
                 "Approved",
                 fontSize = 20.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = Color.Black,
-                modifier = Modifier.padding(top = 8.dp)
+                color = Color.Black
             )
             val (amtPrefix, amtStr, amtSuffix) = formatBalanceWithCurrencyProtocol(amountNum, currency)
             Row(
@@ -4930,7 +5322,10 @@ private fun PaymentSuccessContent(
             }
         }
 
-        // Print and Done buttons
+        // Print and Done buttons (same height — 24.dp was clipping label + icon)
+        val approvedActionButtonModifier = Modifier
+            .fillMaxWidth()
+            .height(48.dp)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -4940,20 +5335,149 @@ private fun PaymentSuccessContent(
         ) {
             OutlinedButton(
                 onClick = { printChargeReceipt(context, amount, subtotal, tip, postBalance, cardCurrency, payee, txHash, dateString, timeString) },
-                modifier = Modifier.fillMaxWidth().height(24.dp),
+                modifier = approvedActionButtonModifier,
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
             ) {
-                Icon(Icons.Filled.Print, null, Modifier.size(14.dp))
+                Icon(Icons.Filled.Print, null, Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Print Receipt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
             Button(
                 onClick = onDone,
-                modifier = Modifier.fillMaxWidth().height(24.dp),
+                modifier = approvedActionButtonModifier,
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
             ) {
                 Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PaymentRoutingMonitorRow(step: RoutingStep) {
+    val mono = FontFamily.Monospace
+    val lineColor = Color(0xFF8AE06C)
+    val pendingColor = Color(0xFF5c6b5c)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Box(
+            modifier = Modifier.width(16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            when (step.status) {
+                StepStatus.loading -> CircularProgressIndicator(
+                    modifier = Modifier.size(11.dp),
+                    strokeWidth = 1.2.dp,
+                    color = lineColor
+                )
+                StepStatus.success -> Text("OK", fontSize = 8.sp, fontFamily = mono, color = lineColor)
+                StepStatus.error -> Text("NO", fontSize = 8.sp, fontFamily = mono, color = Color(0xFFFF8A80))
+                StepStatus.pending -> Text("--", fontSize = 8.sp, fontFamily = mono, color = pendingColor)
+            }
+        }
+        val line = buildString {
+            append(step.label)
+            if (step.detail.isNotBlank()) {
+                append(" ")
+                append(step.detail)
+            }
+        }
+        Text(
+            text = line,
+            fontSize = 10.sp,
+            lineHeight = 12.sp,
+            fontFamily = mono,
+            color = when (step.status) {
+                StepStatus.pending -> pendingColor
+                StepStatus.error -> Color(0xFFFFB4A8)
+                else -> lineColor
+            },
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+/**
+ * Smart Routing 中央区域：整块尺寸即为深色「显示屏」（无白底、无标题），无滚动条；
+ * 仅显示最近 [PAYMENT_ROUTING_MONITOR_MAX_VISIBLE_STEPS] 条，新行从底部加入时顶行移出。
+ */
+@Composable
+internal fun PaymentRoutingMonitorDisplayCard(
+    steps: List<RoutingStep>,
+    modifier: Modifier = Modifier,
+    errorLine: String? = null,
+    footerLine: String? = null,
+    /** English hint below error; shown when [errorLine] is non-blank */
+    retryHintEnglish: String? = null,
+    onRetryClick: (() -> Unit)? = null
+) {
+    val visible = filterPaymentRoutingStepsForDisplay(steps).takeLast(PAYMENT_ROUTING_MONITOR_MAX_VISIBLE_STEPS)
+    val screenBg = Color(0xFF0f1419)
+    val bezelStroke = Color(0xFF3d4553)
+    Card(
+        modifier = modifier.then(
+            if (onRetryClick != null) Modifier.clickable(onClick = onRetryClick) else Modifier
+        ),
+        shape = RoundedCornerShape(32.dp),
+        colors = CardDefaults.cardColors(containerColor = screenBg),
+        border = BorderStroke(2.dp, bezelStroke)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp, vertical = 10.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                verticalArrangement = Arrangement.Bottom
+            ) {
+                visible.forEach { step -> PaymentRoutingMonitorRow(step) }
+            }
+            if (!errorLine.isNullOrBlank()) {
+                Text(
+                    text = errorLine,
+                    fontSize = 10.sp,
+                    color = Color(0xFFFF6B6B),
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
+                        .basicMarquee()
+                )
+            }
+            if (!retryHintEnglish.isNullOrBlank() && !errorLine.isNullOrBlank()) {
+                Text(
+                    text = retryHintEnglish,
+                    fontSize = 9.sp,
+                    color = Color(0xFF7c8a99),
+                    fontFamily = FontFamily.Monospace,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
+                )
+            }
+            if (!footerLine.isNullOrBlank()) {
+                Text(
+                    text = footerLine,
+                    fontSize = 9.sp,
+                    color = Color(0xFF8b939e),
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
             }
         }
     }
@@ -5001,7 +5525,7 @@ internal fun PaymentScreen(
                 }
                 }
             }
-            is PaymentStatus.Refreshing -> {
+            is PaymentStatus.Routing, is PaymentStatus.Submitting, is PaymentStatus.Refreshing -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                     Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
@@ -5010,71 +5534,11 @@ internal fun PaymentScreen(
                             .weight(1f),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(modifier = Modifier.size(48.dp))
-                            Text(
-                                text = "Refreshing balance...",
-                                fontSize = 16.sp,
-                                color = Color(0xFF64748b),
-                                modifier = Modifier.padding(top = 16.dp)
-                            )
-                        }
+                        PaymentRoutingMonitorDisplayCard(
+                            steps = routingSteps,
+                            modifier = Modifier.size(280.dp)
+                        )
                     }
-                }
-            }
-            is PaymentStatus.Routing, is PaymentStatus.Submitting -> {
-                Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .verticalScroll(rememberScrollState())
-                    ) {
-                    Text(
-                        text = "Smart Routing Analysis",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(top = 16.dp, bottom = 16.dp)
-                    )
-                    routingSteps
-                        .filter { it.status != StepStatus.pending || it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") }
-                        .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
-                        .forEach { step ->
-                            Row(
-                                modifier = Modifier.padding(vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .padding(end = 16.dp)
-                                        .size(40.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    when (step.status) {
-                                        StepStatus.loading -> CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                                        StepStatus.success -> Text("✓", fontSize = 20.sp, color = Color(0xFF22c55e))
-                                        StepStatus.error -> Text("✗", fontSize = 20.sp, color = Color(0xFFef4444))
-                                        StepStatus.pending -> Text("•", fontSize = 14.sp, color = Color(0xFF94a3b8))
-                                    }
-                                }
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = step.label,
-                                        fontSize = 15.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    if (step.detail.isNotBlank()) {
-                                        Text(
-                                            text = step.detail,
-                                            fontSize = 13.sp,
-                                            color = Color(0xFF64748b)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                }
                 }
             }
             is PaymentStatus.Success -> PaymentSuccessContent(
@@ -5096,57 +5560,20 @@ internal fun PaymentScreen(
                 onDone = onBack
             )
             is PaymentStatus.Error -> {
-                Column(
-                    modifier = Modifier.fillMaxSize().padding(16.dp)
-                ) {
+                Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                     Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
-                    Column(
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
-                            .padding(top = 16.dp)
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
                     ) {
-                    if (routingSteps.isNotEmpty()) {
-                        Text(
-                            text = "Smart Routing Analysis",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(bottom = 16.dp)
+                        PaymentRoutingMonitorDisplayCard(
+                            steps = routingSteps,
+                            modifier = Modifier.size(280.dp),
+                            errorLine = error,
+                            footerLine = uid.takeIf { it.isNotBlank() }?.let { "UID: $it" }
                         )
-                        routingSteps
-                            .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
-                            .forEach { step ->
-                                Row(
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .padding(end = 16.dp)
-                                            .size(40.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        when (step.status) {
-                                            StepStatus.loading -> CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                                            StepStatus.success -> Text("✓", fontSize = 20.sp, color = Color(0xFF22c55e))
-                                            StepStatus.error -> Text("✗", fontSize = 20.sp, color = Color(0xFFef4444))
-                                            StepStatus.pending -> Text("•", fontSize = 14.sp, color = Color(0xFF94a3b8))
-                                        }
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(text = step.label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                                        if (step.detail.isNotBlank()) {
-                                            Text(text = step.detail, fontSize = 13.sp, color = Color(0xFF64748b))
-                                        }
-                                    }
-                                }
-                            }
-                        Spacer(modifier = Modifier.height(16.dp))
-                    }
-                    Text(text = "❌ $error", fontSize = 14.sp)
-                    if (uid.isNotBlank()) {
-                        Text(text = "UID: $uid", fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
-                    }
                     }
                 }
             }
@@ -5257,74 +5684,28 @@ private fun HexCopyCapsule(
     }
 }
 
-/** 地址胶囊：圆角胶囊样式，左侧可选 icon（或绿点）+ 短缩 0x1234…5678 + 右侧 copy 图标，点击复制完整地址，成功后绿色 check 约 2 秒。遵循 address-capsule-ui 守则 */
-@Composable
-private fun AddressCapsule(
-    address: String,
-    leadingIcon: @Composable (() -> Unit)? = null,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    var copied by mutableStateOf(false)
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(2000)
-            copied = false
-        }
-    }
-    val short = if (address.length >= 10) "${address.take(6)}…${address.takeLast(4)}" else address
-    Row(
-        modifier = modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(Color.Black.copy(alpha = 0.06f))
-            .clickable(enabled = address.length >= 10) {
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                cm?.setPrimaryClip(ClipData.newPlainText("address", address))
-                copied = true
-            }
-            .padding(horizontal = 8.dp, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        if (leadingIcon != null) {
-            leadingIcon()
-        } else {
-            Box(
-                modifier = Modifier.size(6.dp).background(Color(0xFF34C759), CircleShape)
-            )
-        }
-        Text(
-            short,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = Color.Black,
-            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-        )
-        Icon(
-            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-            contentDescription = "Copy address",
-            modifier = Modifier.size(12.dp),
-            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
-        )
-    }
+/** 姓名字段：空白或字面量 "null" 视为无值（避免 API/JSON 把 null 序列化成字符串） */
+private fun sanitizeProfileNamePart(raw: String?): String {
+    val t = raw?.trim() ?: ""
+    if (t.isEmpty() || t.equals("null", ignoreCase = true)) return ""
+    return t
 }
 
-/** Beamio 标准胶囊（紧凑版）：左侧头像，右侧 displayName + @accountName。无 profile 时用 fallbackAddress 短缩显示 */
+/** Beamio 标准胶囊（紧凑版）：左侧头像，右侧 displayName + @accountName。无 first/last 时不显示第一行；无 @tag 时用 fallback 单行 */
 @Composable
 private fun BeamioCapsuleCompact(
     profile: TerminalProfile,
     fallbackAddress: String?,
     modifier: Modifier = Modifier
 ) {
-    val tag = profile.accountName
+    val tag = sanitizeProfileNamePart(profile.accountName).takeIf { it.isNotEmpty() }
     val beamioTag = tag?.let { "@$it" }
-    val displayName = buildString {
-        val first = profile.first_name?.trim() ?: ""
-        val lastRaw = profile.last_name?.trim()?.split("\r\n")?.firstOrNull() ?: ""
-        val last = if (lastRaw.startsWith("{")) "" else lastRaw
-        append("$first $last".trim())
-        if (isEmpty()) append(tag ?: fallbackAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it } ?: "—")
-    }
+    val first = sanitizeProfileNamePart(profile.first_name)
+    val lastRaw = profile.last_name?.trim()?.split("\r\n")?.firstOrNull() ?: ""
+    val last = if (lastRaw.startsWith("{")) "" else sanitizeProfileNamePart(lastRaw)
+    val displayName = "$first $last".trim()
+    val hasNameRow = displayName.isNotEmpty()
+    val shortFallback = fallbackAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
     val avatarSeed = tag ?: "Beamio"
     val avatarUrl = "https://api.dicebear.com/8.x/fun-emoji/png?seed=${java.net.URLEncoder.encode(avatarSeed, "UTF-8")}"
     Row(
@@ -5344,15 +5725,17 @@ private fun BeamioCapsuleCompact(
             contentScale = ContentScale.Crop
         )
         Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
-            Text(
-                displayName,
-                fontSize = 12.sp,
-                lineHeight = 14.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color.Black,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            if (hasNameRow) {
+                Text(
+                    displayName,
+                    fontSize = 12.sp,
+                    lineHeight = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.Black,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
             if (beamioTag != null) {
                 Text(
                     beamioTag,
@@ -5363,8 +5746,82 @@ private fun BeamioCapsuleCompact(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
+            } else if (!hasNameRow) {
+                Text(
+                    shortFallback ?: "—",
+                    fontSize = 12.sp,
+                    lineHeight = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.Black,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
+    }
+}
+
+@Composable
+private fun homeDashboardShimmerBrush(progress: Float): Brush {
+    val density = LocalDensity.current
+    val widthPx = with(density) { 160.dp.toPx() }
+    val travel = progress * widthPx * 2.2f - widthPx * 0.5f
+    return Brush.linearGradient(
+        colorStops = arrayOf(
+            0f to Color.White.copy(alpha = 0.06f),
+            0.42f to Color.White.copy(alpha = 0.28f),
+            0.58f to Color.White.copy(alpha = 0.28f),
+            1f to Color.White.copy(alpha = 0.06f)
+        ),
+        start = Offset(travel, 0f),
+        end = Offset(travel + widthPx * 0.55f, 48f)
+    )
+}
+
+/** Home 仪表盘金额未就绪：流光占位，替代「—」 */
+@Composable
+private fun HomeDashboardStatLoadingPlaceholder(
+    alignEnd: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val infinite = rememberInfiniteTransition(label = "homeDashShimmer")
+    val progress by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1300, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmer"
+    )
+    val brush = homeDashboardShimmerBrush(progress)
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start
+    ) {
+        Text(
+            "$",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White.copy(alpha = 0.42f)
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Box(
+            Modifier
+                .width(68.dp)
+                .height(34.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(brush)
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        Box(
+            Modifier
+                .width(28.dp)
+                .height(14.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(brush)
+        )
     }
 }
 
@@ -5378,6 +5835,8 @@ fun NdefScreen(
     adminProfile: TerminalProfile? = null,
     chargeAmount: Double? = null,
     topUpAmount: Double? = null,
+    chargeStatsRpcWarning: Boolean = false,
+    topUpStatsRpcWarning: Boolean = false,
     onCopyWalletClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
@@ -5431,21 +5890,11 @@ fun NdefScreen(
                     )
                 }
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    val beamioTag = terminalProfile?.accountName?.let { "@$it" }
+                    val accountForTag = sanitizeProfileNamePart(terminalProfile?.accountName)
+                    val titleLine = accountForTag.takeIf { it.isNotEmpty() }?.let { "@$it" }
                         ?: walletAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
                         ?: "Terminal"
-                    Text(beamioTag, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                    if (walletAddress != null && walletAddress.length >= 10) {
-                        LaunchedEffect(walletAddress) {
-                            Log.d("Home", "[Home Debug] beamioTag row wallet address capsule: $walletAddress")
-                        }
-                        AddressCapsule(
-                            address = walletAddress,
-                            leadingIcon = {
-                                Icon(Icons.Filled.AccountBalanceWallet, null, Modifier.size(12.dp), tint = Color(0xFF1562f0))
-                            }
-                        )
-                    }
+                    Text(titleLine, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
                 }
             }
             // Right: admin BeamioCapsule (avatar + displayName + @accountName)
@@ -5494,16 +5943,32 @@ fun NdefScreen(
                                 Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                                 Text("Today", fontSize = 9.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1562f0), modifier = Modifier.background(Color(0xFF1562f0).copy(alpha = 0.15f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
                             }
-                            Row {
-                                val (numPart, decPart) = if (chargeAmount != null) {
+                            if (chargeAmount != null) {
+                                Row(verticalAlignment = Alignment.Bottom) {
                                     val s = "%.2f".format(chargeAmount)
                                     val dot = s.indexOf('.')
-                                    if (dot >= 0) s.substring(0, dot) to s.substring(dot)
-                                    else s to ""
-                                } else "—" to ""
-                                Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                Text(if (decPart.isNotEmpty()) decPart else "", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                    val numPart = if (dot >= 0) s.substring(0, dot) else s
+                                    val decPart = if (dot >= 0) s.substring(dot) else ""
+                                    Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                    Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.alignByBaseline()
+                                    ) {
+                                        Text(decPart, fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                        if (chargeStatsRpcWarning) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Icon(
+                                                Icons.Filled.Warning,
+                                                contentDescription = "Charge stats sync failed",
+                                                modifier = Modifier.size(14.dp),
+                                                tint = Color(0xFFFFC107)
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                HomeDashboardStatLoadingPlaceholder(alignEnd = false)
                             }
                         }
                         Box(
@@ -5522,19 +5987,36 @@ fun NdefScreen(
                                 }
                                 Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
                             }
-                            Row(
-                                horizontalArrangement = Arrangement.End,
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                val (numPart, decPart) = if (topUpAmount != null) {
+                            if (topUpAmount != null) {
+                                Row(
+                                    horizontalArrangement = Arrangement.End,
+                                    verticalAlignment = Alignment.Bottom,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
                                     val s = "%.2f".format(topUpAmount)
                                     val dot = s.indexOf('.')
-                                    if (dot >= 0) s.substring(0, dot) to s.substring(dot)
-                                    else s to ""
-                                } else "—" to ""
-                                Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                Text(if (decPart.isNotEmpty()) decPart else "", fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                    val numPart = if (dot >= 0) s.substring(0, dot) else s
+                                    val decPart = if (dot >= 0) s.substring(dot) else ""
+                                    Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                    Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.alignByBaseline()
+                                    ) {
+                                        Text(decPart, fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                        if (topUpStatsRpcWarning) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Icon(
+                                                Icons.Filled.Warning,
+                                                contentDescription = "Top-up stats sync failed",
+                                                modifier = Modifier.size(14.dp),
+                                                tint = Color(0xFFFFC107)
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                HomeDashboardStatLoadingPlaceholder(alignEnd = true)
                             }
                         }
                     }
@@ -5728,12 +6210,28 @@ internal fun ScanMethodSelectionScreen(
     nfcFetchingInfo: Boolean = false,
     nfcFetchError: String = "",
     qrScanningActive: Boolean = false,
+    /** 仅 payment：解析失败时递增以重建扫码视图，去掉同一段 payload 的 lastText 去重 */
+    embeddedQrResetKey: Int = 0,
+    paymentQrInterpreting: Boolean = false,
+    paymentQrParseError: String = "",
+    onRetryPaymentQrScan: () -> Unit = {},
+    /** Charge Smart Routing 失败：点击中央显示器后回到等待贴卡重试 */
+    onRetryPaymentAfterError: () -> Unit = {},
+    topupQrSigningInProgress: Boolean = false,
+    /** NFC 贴卡后：与 QR 共用中央白卡 Sign & execute，不单独进 TopupScreen */
+    topupNfcExecuteInProgress: Boolean = false,
+    /** 中央执行态可选展示 UID / beamioTag（与 TopupScreen Loading 一致） */
+    topupExecuteUidDisplay: String = "",
+    topupQrExecuteError: String = "",
+    onRetryTopupQrExecute: () -> Unit = {},
     onScanMethodChange: (String) -> Unit,
     pendingAction: String,
     totalAmount: String,
     paymentStatus: PaymentStatus? = null,
     paymentRoutingSteps: List<RoutingStep> = emptyList(),
     paymentError: String = "",
+    /** NFC Charge：失败态底部可选展示客户卡 UID */
+    paymentNfcUid: String = "",
     paymentAmount: String = "",
     paymentPayee: String = "",
     paymentTxHash: String = "",
@@ -5783,124 +6281,248 @@ internal fun ScanMethodSelectionScreen(
                 if (true) {
                     // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
                     if (showPaymentSuccess) {
-                    // Charge 贴卡成功后：在中间窗口显示 PaymentSuccessContent，不跳新页
-                    Column(
+                    // 仅使用 PaymentSuccessContent 内部 verticalScroll；外层不可再包 verticalScroll，否则子项高度无界会崩溃
+                    PaymentSuccessContent(
+                        amount = paymentAmount,
+                        payee = paymentPayee,
+                        txHash = paymentTxHash,
+                        subtotal = paymentSubtotal,
+                        tip = paymentTip,
+                        postBalance = paymentPostBalance,
+                        cardCurrency = paymentCardCurrency,
+                        memberNo = paymentMemberNo,
+                        cardBackground = paymentCardBackground,
+                        cardImage = paymentCardImage,
+                        cardName = paymentCardName,
+                        tierName = paymentTierName,
+                        cardType = paymentCardType,
+                        settlementViaQr = scanMethod == "qr",
+                        onDone = onPaymentDone,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else if (showPaymentError) {
+                    Box(
                         modifier = Modifier
-                            .fillMaxSize()
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
+                            .wrapContentHeight()
                     ) {
-                        PaymentSuccessContent(
-                            amount = paymentAmount,
-                            payee = paymentPayee,
-                            txHash = paymentTxHash,
-                            subtotal = paymentSubtotal,
-                            tip = paymentTip,
-                            postBalance = paymentPostBalance,
-                            cardCurrency = paymentCardCurrency,
-                            memberNo = paymentMemberNo,
-                            cardBackground = paymentCardBackground,
-                            cardImage = paymentCardImage,
-                            cardName = paymentCardName,
-                            tierName = paymentTierName,
-                            cardType = paymentCardType,
-                            settlementViaQr = scanMethod == "qr",
-                            onDone = onPaymentDone,
-                            modifier = Modifier.fillMaxWidth()
+                        PaymentRoutingMonitorDisplayCard(
+                            steps = paymentRoutingSteps,
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center),
+                            errorLine = paymentError,
+                            footerLine = paymentNfcUid.takeIf { it.isNotBlank() }?.let { "UID: $it" },
+                            retryHintEnglish = "Tap center to retry",
+                            onRetryClick = onRetryPaymentAfterError
                         )
                     }
-                } else if (showPaymentError) {
-                    // Charge 贴卡失败：显示 Smart Routing 步骤 + 错误
-                    Column(
+                } else if (pendingAction == "payment" && paymentQrParseError.isNotEmpty()) {
+                    Box(
                         modifier = Modifier
-                            .fillMaxSize()
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp)
+                            .wrapContentHeight()
+                            .clickable { onRetryPaymentQrScan() }
                     ) {
-                        Text(
-                            text = "Smart Routing Analysis",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(top = 16.dp, bottom = 16.dp),
-                            color = Color.Black
-                        )
-                        paymentRoutingSteps
-                            .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
-                            .forEach { step ->
-                                Row(
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
+                        Card(
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center),
+                            shape = RoundedCornerShape(32.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp)
+                            ) {
+                                Text(
+                                    paymentQrParseError,
+                                    fontSize = 14.sp,
+                                    color = Color(0xFFef4444),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                                Text(
+                                    "Tap the center area to scan again",
+                                    fontSize = 15.sp,
+                                    color = Color(0xFF86868b),
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .padding(bottom = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                } else if (pendingAction == "payment" && paymentQrInterpreting) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center)
+                        ) {
+                            Card(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(24.dp)
                                 ) {
-                                    Box(
+                                    CircularProgressIndicator(
                                         modifier = Modifier
-                                            .padding(end = 16.dp)
-                                            .size(40.dp),
-                                        contentAlignment = Alignment.Center
+                                            .size(96.dp)
+                                            .align(Alignment.Center),
+                                        color = Color(0xFF1562f0),
+                                        strokeWidth = 2.dp
+                                    )
+                                    Column(
+                                        modifier = Modifier.align(Alignment.BottomCenter),
+                                        horizontalAlignment = Alignment.CenterHorizontally
                                     ) {
-                                        when (step.status) {
-                                            StepStatus.loading -> CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color(0xFF1562f0))
-                                            StepStatus.success -> Text("✓", fontSize = 20.sp, color = Color(0xFF22c55e))
-                                            StepStatus.error -> Text("✗", fontSize = 20.sp, color = Color(0xFFef4444))
-                                            StepStatus.pending -> Text("•", fontSize = 14.sp, color = Color(0xFF94a3b8))
-                                        }
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(text = step.label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                                        if (step.detail.isNotBlank()) {
-                                            Text(text = step.detail, fontSize = 13.sp, color = Color(0xFF86868b))
-                                        }
+                                        Text(
+                                            "Processing…",
+                                            fontSize = 18.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.Black
+                                        )
+                                        Text(
+                                            "Reading payment code.",
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF86868b),
+                                            modifier = Modifier.padding(top = 4.dp),
+                                            textAlign = TextAlign.Center
+                                        )
                                     }
                                 }
                             }
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(text = "❌ $paymentError", fontSize = 14.sp, color = Color(0xFFef4444))
+                        }
+                    }
+                } else if (pendingAction == "topup" && topupQrExecuteError.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                            .clickable { onRetryTopupQrExecute() }
+                    ) {
+                        Card(
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center),
+                            shape = RoundedCornerShape(32.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(16.dp)
+                            ) {
+                                Text(
+                                    topupQrExecuteError,
+                                    fontSize = 14.sp,
+                                    color = Color(0xFFef4444),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.align(Alignment.Center)
+                                )
+                                Text(
+                                    "Tap the center area to retry",
+                                    fontSize = 15.sp,
+                                    color = Color(0xFF86868b),
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .padding(bottom = 8.dp)
+                                )
+                            }
+                        }
+                    }
+                } else if (pendingAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) {
+                    // QR / NFC Top-up：留在选方式页；中央白卡显示 Sign & execute + loading
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center)
+                        ) {
+                            Card(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(24.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxWidth(),
+                                        contentAlignment = Alignment.BottomCenter
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier
+                                                .padding(bottom = 20.dp)
+                                                .size(96.dp),
+                                            color = Color(0xFF1562f0),
+                                            strokeWidth = 2.dp
+                                        )
+                                    }
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Text(
+                                            "Sign & execute",
+                                            fontSize = 18.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color.Black
+                                        )
+                                        if (topupExecuteUidDisplay.isNotBlank()) {
+                                            Text(
+                                                topupExecuteUidDisplay,
+                                                fontSize = 11.sp,
+                                                color = Color(0xFF86868b),
+                                                modifier = Modifier.padding(top = 4.dp),
+                                                textAlign = TextAlign.Center,
+                                                maxLines = 2
+                                            )
+                                        }
+                                        Text(
+                                            "Completing top-up…",
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF86868b),
+                                            modifier = Modifier.padding(top = 4.dp),
+                                            textAlign = TextAlign.Center
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if (showPaymentRouting) {
-                    // Charge 贴卡后：显示 Smart Routing 完整流程
-                    Column(
+                    Box(
                         modifier = Modifier
-                            .fillMaxSize()
                             .fillMaxWidth()
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 24.dp)
+                            .wrapContentHeight()
                     ) {
-                        Text(
-                            text = "Smart Routing Analysis",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(top = 16.dp, bottom = 16.dp),
-                            color = Color.Black
+                        PaymentRoutingMonitorDisplayCard(
+                            steps = paymentRoutingSteps,
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center)
                         )
-                        paymentRoutingSteps
-                            .filter { it.status != StepStatus.pending || it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") }
-                            .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
-                            .forEach { step ->
-                                Row(
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .padding(end = 16.dp)
-                                            .size(40.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        when (step.status) {
-                                            StepStatus.loading -> CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color(0xFF1562f0))
-                                            StepStatus.success -> Text("✓", fontSize = 20.sp, color = Color(0xFF22c55e))
-                                            StepStatus.error -> Text("✗", fontSize = 20.sp, color = Color(0xFFef4444))
-                                            StepStatus.pending -> Text("•", fontSize = 14.sp, color = Color(0xFF94a3b8))
-                                        }
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(text = step.label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                                        if (step.detail.isNotBlank()) {
-                                            Text(text = step.detail, fontSize = 13.sp, color = Color(0xFF86868b))
-                                        }
-                                    }
-                                }
-                            }
                     }
                 } else if (scanWaitingForNfc) {
                     // 等待 UID：固定显示等待态（仅图标 + 扫描线），不显示 tap/type 文案
@@ -6083,10 +6705,12 @@ internal fun ScanMethodSelectionScreen(
                             ) {
                                 Box(modifier = Modifier.fillMaxSize()) {
                                     if (qrScanningActive) {
-                                        EmbeddedQrScanner(
-                                            onResult = onQrScanResult,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
+                                        key(embeddedQrResetKey) {
+                                            EmbeddedQrScanner(
+                                                onResult = onQrScanResult,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        }
                                     } else {
                                         Box(
                                             modifier = Modifier
@@ -6116,7 +6740,7 @@ internal fun ScanMethodSelectionScreen(
                                 modifier = Modifier
                                     .size(scanSize)
                                     .align(Alignment.Center)
-                                    .clickable(enabled = !scanWaitingForNfc && !nfcFetchingInfo) {
+                                    .clickable(enabled = !scanWaitingForNfc && !nfcFetchingInfo && !topupNfcExecuteInProgress && !topupQrSigningInProgress) {
                                         onProceedNfcStay?.invoke()
                                     },
                                 shape = RoundedCornerShape(32.dp),
@@ -6149,7 +6773,7 @@ internal fun ScanMethodSelectionScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(
-                    if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess)
+                    if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess && !showPaymentRouting && !showPaymentError && !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty())
                         120.dp
                     else
                         BACK_BUTTON_TOP_BAR_HEIGHT
@@ -6166,7 +6790,7 @@ internal fun ScanMethodSelectionScreen(
                     .align(Alignment.TopStart)
                     .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
             )
-            if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess) {
+            if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess && !showPaymentRouting && !showPaymentError && !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty()) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
