@@ -284,7 +284,7 @@ class MainActivity : ComponentActivity() {
         /** 基础设施卡（与 x402sdk chainAddresses.BEAMIO_USER_CARD_ASSET_ADDRESS 一致） */
         const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x9cda8477c9f03b8759ac64e21941e578908fd750"
         /** Base RPC，遵循 beamio-base-rpc */
-        private const val BASE_RPC_URL = "https://1rpc.io/base"
+        private const val BASE_RPC_URL = "https://base-rpc.conet.network"
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
