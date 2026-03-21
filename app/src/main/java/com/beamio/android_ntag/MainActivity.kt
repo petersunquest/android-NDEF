@@ -175,7 +175,9 @@ internal data class CardItem(
     val cardBackground: String? = null,
     val cardImage: String? = null,
     val tierName: String? = null,
-    val tierDescription: String? = null
+    val tierDescription: String? = null,
+    /** Server: NFT with max on-chain `tiers[i].minUsdc6` on this card (matches `_findBestValidMembership`). */
+    val primaryMemberTokenId: String? = null
 )
 internal data class UIDAssets(
     val ok: Boolean,
@@ -1681,12 +1683,7 @@ class MainActivity : ComponentActivity() {
                 val topupCard = preAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
                 val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
                 val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
-                val memberNo = topupCard?.nfts
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: ""
+                val memberNo = memberNoFromCardItem(topupCard)
                 runOnUiThread {
                     topupScreenPreBalance = preBalanceStr
                     topupScreenCardCurrency = preCurrency
@@ -1730,12 +1727,7 @@ class MainActivity : ComponentActivity() {
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
-                                    val newMemberNo = postCard?.nfts
-                                        ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                                        ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                                        ?.tokenId
-                                        ?.let { "M-%s".format(it.padStart(6, '0')) }
-                                        ?: ""
+                                    val newMemberNo = memberNoFromCardItem(postCard)
                                     if (newMemberNo.isNotEmpty()) {
                                         topupScreenMemberNo = newMemberNo
                                     }
@@ -1903,12 +1895,7 @@ class MainActivity : ComponentActivity() {
                 val topupCard = preAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
                 val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
                 val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
-                val memberNo = topupCard?.nfts
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: ""
+                val memberNo = memberNoFromCardItem(topupCard)
                 runOnUiThread {
                     topupScreenPreBalance = preBalanceStr
                     topupScreenCardCurrency = preCurrency
@@ -1944,12 +1931,7 @@ class MainActivity : ComponentActivity() {
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
-                                    val newMemberNo = postCard?.nfts
-                                        ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                                        ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                                        ?.tokenId
-                                        ?.let { "M-%s".format(it.padStart(6, '0')) }
-                                        ?: ""
+                                    val newMemberNo = memberNoFromCardItem(postCard)
                                     if (newMemberNo.isNotEmpty()) {
                                         topupScreenMemberNo = newMemberNo
                                     }
@@ -2179,18 +2161,7 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success, "Card + USDC balance")
-                val paymentMemberNo = assets.cards
-                    ?.flatMap { it.nfts }
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: assets.nfts
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: ""
+                val paymentMemberNo = memberNoPrimaryFromSortedCardsItem(assets)
                 val paymentCard = assets.cards?.firstOrNull()
                 val payeeWallet = BeamioWeb3Wallet.getAddress()
                 val routingDetails = fetchTierRoutingDetailsForTerminalWalletSync(payeeWallet)
@@ -2386,9 +2357,15 @@ class MainActivity : ComponentActivity() {
                 val tierDiscQr = pickTierDiscountPercentFromAssets(assets, routingDetailsQr?.discountByTierKey ?: emptyMap())
                 val tipQr = paymentScreenTip.toDoubleOrNull() ?: 0.0
                 val requestQr = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
-                val qrPrimaryCardEarly = assets.cards?.firstOrNull { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
-                    ?: assets.cards?.firstOrNull()
-                val payCurrencyQr = qrPrimaryCardEarly?.cardCurrency ?: assets.cardCurrency ?: "CAD"
+                val taxAmtCadQr = requestQr * taxPctQr / 100.0
+                val discAmtCadQr = requestQr * tierDiscQr / 100.0
+                val taxFiat6StrQr = kotlin.math.round(taxAmtCadQr * 1_000_000.0).toLong().toString()
+                val discFiat6StrQr = kotlin.math.round(discAmtCadQr * 1_000_000.0).toLong().toString()
+                val taxBpsQr = kotlin.math.round(taxPctQr * 100.0).toInt().coerceIn(0, 10000)
+                val discBpsQr = (tierDiscQr * 100).coerceIn(0, 10000)
+                // 与 NFC executePayment 一致：账单 request 币种取 cards 首张；tier 折扣仍用 pickTierDiscountPercentFromAssets(全卡 NFT)
+                val paymentCardForQrCharge = assets.cards?.firstOrNull()
+                val payCurrencyQr = paymentCardForQrCharge?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrencyQr = chargeTotalInCurrency(requestQr, taxPctQr, tierDiscQr, tipQr)
                 val enteredUsdc6 = currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
                 if (enteredUsdc6 <= 0) {
@@ -2404,27 +2381,13 @@ class MainActivity : ComponentActivity() {
                 val effectiveUsdc6 = enteredUsdc6
                 steps = updateStep(steps, "membership", StepStatus.success, if (hasCardholder) "Cardholder" else "No membership")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
-                // payload 的 maxAmount 由客户签字锁定，不可修改。maxAmount>0 时合约要求 ERC1155 必须用 Factory 的 beamioUserCard
-                val payloadMaxAmount = payload.optString("maxAmount", "0").toLongOrNull() ?: 0L
-                val hasMaxAmount = payloadMaxAmount > 0L
-                val beamioUserCardAddr = assets.beamioUserCard
-                if (hasMaxAmount && beamioUserCardAddr.isNullOrEmpty()) {
-                    runOnUiThread {
-                        nfcFetchingInfo = false
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = "Service temporarily unavailable (missing beamioUserCard)"
-                    }
-                    return@Thread
-                }
+                // QR Charge：与 NFC payByNfcUidWithContainer 对齐——不按用户卡合约地址（如 CCSA 克隆 0x2032…）拆分 container；
+                // 可扣款余额仍来自 chargeableCards，但 ERC1155 扣款 asset 固定为 BEAMIO_USER_CARD_ASSET_ADDRESS。
                 val unitPriceStr = assets.unitPriceUSDC6
                 val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
                 val cards = chargeableCards(assets)
-                val ccsaCards = if (hasMaxAmount) emptyList() else cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
-                val infraCards = if (hasMaxAmount && beamioUserCardAddr != null) {
-                    cards.filter { it.cardAddress.equals(beamioUserCardAddr, ignoreCase = true) }
-                } else {
-                    cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
-                }
+                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
+                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
                 val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
@@ -2450,14 +2413,28 @@ class MainActivity : ComponentActivity() {
                     ccsaPointsWei = minOf(maxPointsFromAmount, ccsaPoints6)
                     val ccsaValue = (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
                     remaining -= ccsaValue
+                    // 与 NFC 一致：无 USDC 时若 CCSA 可向上取整覆盖全额，则收紧点数避免残留 USDC kind
+                    if (usdcBalance6.toLong() == 0L && remaining > 0 && ccsaPoints6 > ccsaPointsWei) {
+                        val ccsaPointsCeil = (effectiveUsdc6 * 1_000_000 + unitPriceUSDC6 - 1) / unitPriceUSDC6
+                        if (ccsaPointsCeil <= ccsaPoints6) {
+                            ccsaPointsWei = ccsaPointsCeil
+                            remaining = effectiveUsdc6 - (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
+                        }
+                    }
                 }
                 if (remaining > 0 && infraPoints6 > 0 && infraCards.isNotEmpty()) {
                     val infraCard = infraCards.first()
                     val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
                     if (rate > 0) {
-                        val infraValueUsdc6Needed = minOf(remaining, points6ToUsdc6(infraPoints6, infraCard.cardCurrency, oracle))
+                        val infraValueUsdc6Total = points6ToUsdc6(infraPoints6, infraCard.cardCurrency, oracle)
+                        val infraValueUsdc6Needed = minOf(remaining, infraValueUsdc6Total)
                         infraPointsWei = kotlin.math.ceil(infraValueUsdc6Needed * rate).toLong().coerceIn(0L, infraPoints6)
                         remaining = (remaining - points6ToUsdc6(infraPointsWei, infraCard.cardCurrency, oracle)).coerceAtLeast(0L)
+                        if (remaining > 0 && usdcBalance6.toLong() == 0L && infraPointsWei < infraPoints6) {
+                            val extraPoints = kotlin.math.ceil(remaining * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
+                            infraPointsWei += extraPoints
+                            remaining = 0L
+                        }
                     }
                 }
                 var usdcWei = remaining.coerceAtLeast(0L)
@@ -2471,15 +2448,21 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 val composedItems = mutableListOf<Map<String, Any>>()
-                val erc1155AssetForInfra = if (hasMaxAmount && beamioUserCardAddr != null) beamioUserCardAddr else BEAMIO_USER_CARD_ASSET_ADDRESS
                 if (usdcWei > 0) {
                     composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
                 }
-                if (ccsaPointsWei > 0) {
-                    composedItems.add(mapOf("kind" to 1, "asset" to BEAMIO_USER_CARD_ASSET_ADDRESS, "amount" to ccsaPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
-                }
-                if (infraPointsWei > 0) {
-                    composedItems.add(mapOf("kind" to 1, "asset" to erc1155AssetForInfra, "amount" to infraPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
+                // 与 NFC 相同 asset：合并为单条 kind 1，避免两条同 asset 的 container（与贴卡流程一致且利于预检）
+                val beamio1155PointsWei = (ccsaPointsWei + infraPointsWei).coerceAtLeast(0L)
+                if (beamio1155PointsWei > 0) {
+                    composedItems.add(
+                        mapOf(
+                            "kind" to 1,
+                            "asset" to BEAMIO_USER_CARD_ASSET_ADDRESS,
+                            "amount" to beamio1155PointsWei.toString(),
+                            "tokenId" to "0",
+                            "data" to "0x"
+                        )
+                    )
                 }
                 if (composedItems.isEmpty()) {
                     composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to effectiveUsdc6.toString(), "tokenId" to "0", "data" to "0x"))
@@ -2504,27 +2487,20 @@ class MainActivity : ComponentActivity() {
                     finalPayload.put("deadline", finalPayload.optString("validBefore"))
                 }
                 finalPayload.put("to", toAddr)
-                steps = updateStep(steps, "optimizingRoute", StepStatus.success,
-                    if (ccsaPointsWei > 0 && usdcWei > 0) "Hybrid: CCSA + USDC" else if (ccsaPointsWei > 0) "CCSA only" else "USDC only")
-                val qrPaymentMemberNo = assets.cards
-                    ?.flatMap { it.nfts }
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: assets.nfts
-                    ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                    ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                    ?.tokenId
-                    ?.let { "M-%s".format(it.padStart(6, '0')) }
-                    ?: ""
+                steps = updateStep(
+                    steps,
+                    "optimizingRoute",
+                    StepStatus.success,
+                    when {
+                        beamio1155PointsWei > 0 && usdcWei > 0 -> "Hybrid: points + USDC"
+                        beamio1155PointsWei > 0 -> "Points only"
+                        else -> "USDC only"
+                    }
+                )
+                val qrPaymentMemberNo = memberNoPrimaryFromSortedCardsItem(assets)
                 val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
-                // 遵循 APP card 渲染 protocol：按扣款来源选取对应卡（CCSA 优先，否则 infra，否则首卡）
-                val qrPaymentCard = when {
-                    ccsaPointsWei > 0 -> ccsaCards.firstOrNull()
-                    infraPointsWei > 0 -> infraCards.firstOrNull()
-                    else -> assets.cards?.firstOrNull()
-                }
+                // 与 NFC 成功页一致：首张卡作为 Pass 展示来源（税/折扣记账与 NFC 同源）
+                val qrPaymentCard = paymentCardForQrCharge
                 runOnUiThread {
                     paymentChargeBreakdownTaxPercent = taxPctQr
                     paymentChargeBreakdownTierDiscountPercent = tierDiscQr
@@ -2542,17 +2518,31 @@ class MainActivity : ComponentActivity() {
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
                 val currencyAmountStr = "%.2f".format(totalCurrencyQr)
-                val result = postAAtoEOAOpenContainer(finalPayload, listOf(payCurrencyQr), listOf(currencyAmountStr))
+                // 与 payByNfcUidWithContainer 一致：小计/小费用屏幕原始字符串，税/折扣 fiat6+bps 与 NFC 相同算法
+                val subtotalStrForBill = paymentScreenSubtotal.trim().ifEmpty { "%.2f".format(requestQr) }
+                val tipStrForBill = paymentScreenTip.trim().ifEmpty { "0" }
+                val qrChargeBill = OpenContainerChargeBillFields(
+                    subtotal = subtotalStrForBill,
+                    tip = tipStrForBill,
+                    tipRateBps = paymentScreenTipRateBps,
+                    requestCurrency = payCurrencyQr,
+                    taxAmountFiat6 = taxFiat6StrQr,
+                    taxRateBps = taxBpsQr,
+                    discountAmountFiat6 = discFiat6StrQr,
+                    discountRateBps = discBpsQr
+                )
+                val result = postAAtoEOAOpenContainer(
+                    finalPayload,
+                    listOf(payCurrencyQr),
+                    listOf(currencyAmountStr),
+                    qrChargeBill
+                )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 val customerAccountForPostBalance = account  // 显式捕获客户 AA，避免闭包歧义
                 val preBalanceForCheck = totalBalanceCad
                 // 扣款来源卡地址：成功页显示该卡余额（非总资产），与用户预期一致
-                val deductedCardAddress = when {
-                    ccsaPointsWei > 0 -> BEAMIO_USER_CARD_ASSET_ADDRESS
-                    infraPointsWei > 0 -> (if (hasMaxAmount && beamioUserCardAddr != null) beamioUserCardAddr else BEAMIO_USER_CARD_ASSET_ADDRESS)
-                    else -> null
-                }
+                val deductedCardAddress = if (beamio1155PointsWei > 0) BEAMIO_USER_CARD_ASSET_ADDRESS else null
                 if (!result.success) {
                     runOnUiThread {
                         paymentScreenRoutingSteps = steps
@@ -2637,7 +2627,24 @@ class MainActivity : ComponentActivity() {
 
     private data class AAtoEOAResult(val success: Boolean, val txHash: String?, val error: String?)
 
-    private fun postAAtoEOAOpenContainer(payload: org.json.JSONObject, currency: List<String> = emptyList(), currencyAmount: List<String> = emptyList()): AAtoEOAResult {
+    /** QR OpenContainer POST /api/AAtoEOA：与 payByNfcUidSignContainer 同源字段，供 Master 写 TX_TIP 与税/折扣 meta */
+    private data class OpenContainerChargeBillFields(
+        val subtotal: String,
+        val tip: String,
+        val tipRateBps: Int,
+        val requestCurrency: String,
+        val taxAmountFiat6: String,
+        val taxRateBps: Int,
+        val discountAmountFiat6: String,
+        val discountRateBps: Int
+    )
+
+    private fun postAAtoEOAOpenContainer(
+        payload: org.json.JSONObject,
+        currency: List<String> = emptyList(),
+        currencyAmount: List<String> = emptyList(),
+        chargeBill: OpenContainerChargeBillFields? = null
+    ): AAtoEOAResult {
         return try {
             val body = org.json.JSONObject().apply {
                 put("openContainerPayload", payload)
@@ -2657,6 +2664,21 @@ class MainActivity : ComponentActivity() {
                         put("currency", "USDC")
                         put("currencyAmount", "%.2f".format(amt / 1_000_000.0))
                     }
+                }
+                chargeBill?.let { b ->
+                    // 与 payByNfcUidSignContainer JSON 规则一致（税/折扣/小费字段可选、bps 范围 0..10000）
+                    b.subtotal.trim().takeIf { it.isNotEmpty() }?.let { put("nfcSubtotalCurrencyAmount", it) }
+                    put("nfcRequestCurrency", b.requestCurrency.trim().ifEmpty { "CAD" })
+                    b.taxAmountFiat6.trim().takeIf { it.isNotEmpty() }?.let { put("nfcTaxAmountFiat6", it) }
+                    if (b.taxRateBps in 0..10000) put("nfcTaxRateBps", b.taxRateBps)
+                    b.discountAmountFiat6.trim().takeIf { it.isNotEmpty() }?.let { put("nfcDiscountAmountFiat6", it) }
+                    if (b.discountRateBps in 0..10000) put("nfcDiscountRateBps", b.discountRateBps)
+                    val tipNum = b.tip.toDoubleOrNull() ?: 0.0
+                    if (tipNum > 0.0) {
+                        put("nfcTipCurrencyAmount", b.tip.trim())
+                        if (b.tipRateBps > 0) put("nfcTipRateBps", b.tipRateBps)
+                    }
+                    put("merchantCardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
                 }
             }
             val url = java.net.URL("$BEAMIO_API/api/AAtoEOA")
@@ -3682,10 +3704,11 @@ class MainActivity : ComponentActivity() {
         var cardImage = card.cardImage
         // For infra card: use cached tiers only (pre-fetched on Home enter). No per-NFT fetch after topup/charge.
         if (cardImage.isNullOrBlank() && !isInfraCard) {
-            val bestTokenId = card.nfts
-                .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-                .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-                ?.tokenId?.toLongOrNull()
+            val bestTokenId = card.primaryMemberTokenId?.toLongOrNull()?.takeIf { it > 0 }
+                ?: card.nfts
+                    .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
+                    .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
+                    ?.tokenId?.toLongOrNull()
             if (bestTokenId != null) {
                 cardImage = fetchNftTierMetadataImage(card.cardAddress, bestTokenId)
             }
@@ -3748,7 +3771,8 @@ class MainActivity : ComponentActivity() {
                         cardBackground = cardBgRaw.takeIf { it.isNotEmpty() },
                         cardImage = c.optString("cardImage").takeIf { it.isNotEmpty() },
                         tierName = c.optString("tierName").takeIf { it.isNotEmpty() },
-                        tierDescription = c.optString("tierDescription").takeIf { it.isNotEmpty() }
+                        tierDescription = c.optString("tierDescription").takeIf { it.isNotEmpty() },
+                        primaryMemberTokenId = c.optString("primaryMemberTokenId").takeIf { it.isNotEmpty() }
                     )
                 }
             } else {
@@ -5005,6 +5029,33 @@ private fun parseHexColor(hex: String?): Color? {
     }
 }
 
+/** Member # from one card: API `primaryMemberTokenId` (max `tiers[i].minUsdc6`) or legacy max tokenId. */
+private fun memberNoFromCardItem(card: CardItem?): String {
+    if (card == null) return ""
+    val primary = card.primaryMemberTokenId?.trim().orEmpty()
+    if (primary.isNotEmpty() && (primary.toLongOrNull() ?: 0L) > 0L) {
+        return "M-%s".format(primary.padStart(6, '0'))
+    }
+    val legacy = card.nfts
+        .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
+        .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
+        ?.tokenId
+    return legacy?.let { "M-%s".format(it.padStart(6, '0')) } ?: ""
+}
+
+/** `cards` are server-sorted by best-tier minUsdc6 descending. */
+private fun memberNoPrimaryFromSortedCardsItem(assets: UIDAssets): String {
+    for (c in assets.cards.orEmpty()) {
+        val m = memberNoFromCardItem(c)
+        if (m.isNotEmpty()) return m
+    }
+    val legacy = assets.nfts
+        ?.filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
+        ?.maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
+        ?.tokenId
+    return legacy?.let { "M-%s".format(it.padStart(6, '0')) } ?: ""
+}
+
 /** Balance Loaded：单张 Pass 卡展示；compact 时压缩边距与字号以适配一屏 */
 @Composable
 private fun ReadBalancePassCard(
@@ -5013,12 +5064,7 @@ private fun ReadBalancePassCard(
     modifier: Modifier = Modifier
 ) {
     val balanceNum = card.points.toDoubleOrNull() ?: 0.0
-    val memberNo = card.nfts
-        .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0 } == true }
-        .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
-        ?.tokenId
-        ?.let { "M-%s".format(it.padStart(6, '0')) }
-        ?: ""
+    val memberNo = memberNoFromCardItem(card)
     val bgColor = parseHexColor(card.cardBackground) ?: Color(0xFF2C5535)
     val accentGreen = Color(0xFF6ED088)
     val labelGrey = Color(0xFFBBBBBB)
