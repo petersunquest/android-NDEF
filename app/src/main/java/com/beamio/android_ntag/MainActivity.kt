@@ -62,6 +62,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyRow
@@ -276,6 +277,21 @@ internal fun filterPaymentRoutingStepsForDisplay(steps: List<RoutingStep>): List
     steps
         .filter { it.status != StepStatus.pending || it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") }
         .filter { it.id in listOf("detectingUser", "membership", "analyzingAssets", "optimizingRoute") || it.status != StepStatus.pending }
+
+/**
+ * Charge total in request/card currency (no USDC conversion here).
+ * total = requestAmount + (taxPercent/100)*requestAmount - (discountPercent/100)*requestAmount + tipAmount
+ */
+private fun chargeTotalInCurrency(
+    requestAmount: Double,
+    taxPercent: Double,
+    tierDiscountPercent: Int?,
+    tipAmount: Double
+): Double {
+    val tax = requestAmount * (taxPercent / 100.0)
+    val disc = requestAmount * ((tierDiscountPercent ?: 0).toDouble() / 100.0)
+    return requestAmount + tax - disc + tipAmount
+}
 
 class MainActivity : ComponentActivity() {
     private companion object {
@@ -1008,6 +1024,7 @@ class MainActivity : ComponentActivity() {
                     showTipScreen -> TipSelectionScreen(
                         subtotal = tipScreenSubtotal,
                         selectedTipRate = selectedTipRate,
+                        chargeTaxPercent = dashboardInfraTaxPercent,
                         onTipRateSelect = { r -> selectedTipRate = r },
                         onBack = {
                             showTipScreen = false
@@ -1017,7 +1034,8 @@ class MainActivity : ComponentActivity() {
                         onConfirmPay = {
                             val subtotal = tipScreenSubtotal.toDoubleOrNull() ?: 0.0
                             val tip = subtotal * selectedTipRate
-                            val total = subtotal + tip
+                            val taxP = dashboardInfraTaxPercent ?: 0.0
+                            val total = chargeTotalInCurrency(subtotal, taxP, null, tip)
                             val tipBps = kotlin.math.round(selectedTipRate * 10000.0).toInt().coerceIn(0, 10000)
                             scanMethodBackTipSubtotal = tipScreenSubtotal
                             scanMethodBackTipRate = selectedTipRate
@@ -1316,6 +1334,21 @@ class MainActivity : ComponentActivity() {
         scanMethodState = "nfc"
         showScanMethodScreen = true
         syncScanMethodEntryAndTabs()
+        // 与 executePayment 一致：终端 metadata 的 tax 可能比 Home 的 dashboard 更早可用，用于底部 Total Amount（含稅）
+        Thread {
+            try {
+                val d = fetchTierRoutingDetailsForTerminalWalletSync(BeamioWeb3Wallet.getAddress()) ?: return@Thread
+                val taxFromRouting = d.taxPercent
+                runOnUiThread {
+                    paymentChargeBreakdownTaxPercent = taxFromRouting
+                    val sub = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                    val tipAmt = paymentScreenTip.toDoubleOrNull() ?: 0.0
+                    val disc = paymentChargeBreakdownTierDiscountPercent
+                    paymentScreenAmount = "%.2f".format(chargeTotalInCurrency(sub, taxFromRouting, disc, tipAmt))
+                }
+            } catch (_: Exception) {
+            }
+        }.start()
     }
 
     /** Charge 在选方式页 Smart Routing 失败后：NFC 回到等待贴卡；QR 留在 Scan QR 并打开相机扫码 */
@@ -2108,13 +2141,13 @@ class MainActivity : ComponentActivity() {
         return (points6.toDouble() / rate).toLong()
     }
 
-    private fun executePayment(tag: Tag, uid: String, amountCad: String, payee: String) {
+    private fun executePayment(tag: Tag, uid: String, payee: String) {
         Thread {
             try {
                 val sunParams = readSunParamsFromNdef(tag)
                 val effectiveUid = sunParams?.uid ?: uid
-                val amountNum = amountCad.toDoubleOrNull() ?: 0.0
-                if (amountNum <= 0) {
+                val requestEarly = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                if (requestEarly <= 0) {
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
                         paymentScreenStatus = PaymentStatus.Error
@@ -2124,16 +2157,6 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
                 val oracle = fetchOracle()
-                val amountUsdc6 = currencyToUsdc6(amountNum, "CAD", oracle)
-                if (amountUsdc6 == "0") {
-                    runOnUiThread {
-                        val fromScan = nfcFetchingInfo
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = "Amount conversion failed"
-                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = "Amount conversion failed" }
-                    }
-                    return@Thread
-                }
                 var steps = createRoutingSteps()
                 runOnUiThread {
                     paymentScreenStatus = PaymentStatus.Routing
@@ -2180,9 +2203,25 @@ class MainActivity : ComponentActivity() {
                 val discFiat6Str = kotlin.math.round(discAmtCad * 1_000_000.0).toLong().toString()
                 val taxBpsResolved = kotlin.math.round(taxPctResolved * 100.0).toInt().coerceIn(0, 10000)
                 val discBpsResolved = (tierDiscPct * 100).coerceIn(0, 10000)
+                val tipPay = paymentScreenTip.toDoubleOrNull() ?: 0.0
+                val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: "CAD"
+                val totalCurrency = chargeTotalInCurrency(subtotalPay, taxPctResolved, tierDiscPct, tipPay)
+                val amountUsdc6 = currencyToUsdc6(totalCurrency, payCurrency, oracle)
+                if (amountUsdc6 == "0") {
+                    runOnUiThread {
+                        val fromScan = nfcFetchingInfo
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                        paymentScreenRoutingSteps = steps
+                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = "Amount conversion failed" }
+                    }
+                    return@Thread
+                }
                 runOnUiThread {
                     paymentChargeBreakdownTaxPercent = taxPctResolved
                     paymentChargeBreakdownTierDiscountPercent = tierDiscPct
+                    paymentScreenAmount = "%.2f".format(totalCurrency)
+                    paymentScreenCardCurrency = payCurrency
                     paymentScreenMemberNo = paymentMemberNo.ifEmpty { null }
                     paymentScreenCardBackground = paymentCard?.cardBackground
                     paymentScreenCardImage = paymentCard?.cardImage
@@ -2206,7 +2245,6 @@ class MainActivity : ComponentActivity() {
                 val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
                 runOnUiThread {
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
-                    paymentScreenCardCurrency = "CAD"
                 }
                 val required6 = amountUsdc6.toLongOrNull() ?: 0L
                 if (totalBalance6 < required6) {
@@ -2236,7 +2274,7 @@ class MainActivity : ComponentActivity() {
                     nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
                     nfcTipCurrencyAmount = paymentScreenTip,
                     nfcTipRateBps = paymentScreenTipRateBps,
-                    nfcRequestCurrency = "CAD",
+                    nfcRequestCurrency = payCurrency,
                     nfcTaxAmountFiat6 = taxFiat6Str,
                     nfcTaxRateBps = taxBpsResolved,
                     nfcDiscountAmountFiat6 = discFiat6Str,
@@ -2320,22 +2358,12 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                val merchantAmountCad = paymentScreenAmount.toDoubleOrNull() ?: 0.0
-                if (merchantAmountCad <= 0) {
+                val requestQrEarly = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                if (requestQrEarly <= 0) {
                     runOnUiThread {
                         nfcFetchingInfo = false
                         paymentScreenStatus = PaymentStatus.Error
                         paymentScreenError = "Please enter amount first"
-                    }
-                    return@Thread
-                }
-                val oracle = fetchOracle()
-                val enteredUsdc6 = currencyToUsdc6(merchantAmountCad, "CAD", oracle).toLongOrNull() ?: 0L
-                if (enteredUsdc6 <= 0) {
-                    runOnUiThread {
-                        nfcFetchingInfo = false
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = "Amount conversion failed"
                     }
                     return@Thread
                 }
@@ -2351,9 +2379,29 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
+                val oracle = fetchOracle()
+                val payeeWalletTerminal = BeamioWeb3Wallet.getAddress()
+                val routingDetailsQr = fetchTierRoutingDetailsForTerminalWalletSync(payeeWalletTerminal)
+                val taxPctQr = routingDetailsQr?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
+                val tierDiscQr = pickTierDiscountPercentFromAssets(assets, routingDetailsQr?.discountByTierKey ?: emptyMap())
+                val tipQr = paymentScreenTip.toDoubleOrNull() ?: 0.0
+                val requestQr = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                val qrPrimaryCardEarly = assets.cards?.firstOrNull { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
+                    ?: assets.cards?.firstOrNull()
+                val payCurrencyQr = qrPrimaryCardEarly?.cardCurrency ?: assets.cardCurrency ?: "CAD"
+                val totalCurrencyQr = chargeTotalInCurrency(requestQr, taxPctQr, tierDiscQr, tipQr)
+                val enteredUsdc6 = currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
+                if (enteredUsdc6 <= 0) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                    }
+                    return@Thread
+                }
                 val hasCardholder = (assets.cards?.any { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) } == true) ||
                     (assets.points6?.toLongOrNull() ?: 0L) > 0
-                val effectiveUsdc6 = enteredUsdc6  // 按输入总额扣款，不折扣
+                val effectiveUsdc6 = enteredUsdc6
                 steps = updateStep(steps, "membership", StepStatus.success, if (hasCardholder) "Cardholder" else "No membership")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
                 // payload 的 maxAmount 由客户签字锁定，不可修改。maxAmount>0 时合约要求 ERC1155 必须用 Factory 的 beamioUserCard
@@ -2478,6 +2526,8 @@ class MainActivity : ComponentActivity() {
                     else -> assets.cards?.firstOrNull()
                 }
                 runOnUiThread {
+                    paymentChargeBreakdownTaxPercent = taxPctQr
+                    paymentChargeBreakdownTierDiscountPercent = tierDiscQr
                     paymentScreenMemberNo = qrPaymentMemberNo.ifEmpty { null }
                     paymentScreenCardBackground = qrPaymentCard?.cardBackground
                     paymentScreenCardImage = qrPaymentCard?.cardImage
@@ -2485,15 +2535,14 @@ class MainActivity : ComponentActivity() {
                     paymentScreenTierName = qrPaymentCard?.tierName
                     paymentScreenCardType = qrPaymentCard?.cardType
                     paymentScreenPayee = toAddr
-                    paymentScreenSubtotal = "%.2f".format(merchantAmountCad)
+                    paymentScreenAmount = "%.2f".format(totalCurrencyQr)
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
-                    paymentScreenTip = "0"
-                    paymentScreenCardCurrency = "CAD"
+                    paymentScreenCardCurrency = payCurrencyQr
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val currencyAmountCad = "%.2f".format(merchantAmountCad)
-                val result = postAAtoEOAOpenContainer(finalPayload, listOf("CAD"), listOf(currencyAmountCad))
+                val currencyAmountStr = "%.2f".format(totalCurrencyQr)
+                val result = postAAtoEOAOpenContainer(finalPayload, listOf(payCurrencyQr), listOf(currencyAmountStr))
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 val customerAccountForPostBalance = account  // 显式捕获客户 AA，避免闭包歧义
@@ -2539,7 +2588,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        if (postCad != null && postCad >= preBalanceForCheck - 0.01 && merchantAmountCad > 0.001) {
+                        if (postCad != null && postCad >= preBalanceForCheck - 0.01 && totalCurrencyQr > 0.001) {
                             Thread.sleep(3000)
                             postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
                             postCad = postAssets?.let { a ->
@@ -3918,7 +3967,7 @@ class MainActivity : ComponentActivity() {
             paymentScreenStatus = PaymentStatus.Routing
             paymentScreenError = ""
             paymentArmed = false
-            executePayment(tag, uid, paymentScreenAmount, BeamioWeb3Wallet.getAddress())
+            executePayment(tag, uid, BeamioWeb3Wallet.getAddress())
             return
         }
 
@@ -5518,156 +5567,191 @@ private fun PaymentSuccessContent(
     val displayMemberNo = (memberNo?.takeIf { it.isNotBlank() } ?: shortAddr).ifEmpty { "—" }
     val shortTxHash = if (txHash.length > 12) "${txHash.take(7)}...${txHash.takeLast(5)}" else txHash
 
-    Column(
+    // 全屏高度：顶栏 Approved 固定、底栏按钮固定；中间区域占满剩余高度，仅必要时在中间滚动（避免整页超长滚动条）
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .background(Color(0xFFf5f5f7))
     ) {
-        // Header: Approved + amount（无顶部 icon）；Scan 流程下 extraTopInset 与顶栏 overlay 对齐
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 24.dp + extraTopInset, bottom = 12.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                "Approved",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color.Black
-            )
-            val (amtPrefix, amtStr, amtSuffix) = formatBalanceWithCurrencyProtocol(amountNum, currency)
-            Row(
-                modifier = Modifier.padding(top = 4.dp),
-                verticalAlignment = Alignment.Bottom
+        val tightH = maxHeight < 580.dp
+        val vCompactH = maxHeight < 460.dp
+        val headerTopPad = if (vCompactH) 8.dp else if (tightH) 14.dp else 24.dp
+        val headerBottomPad = if (vCompactH) 6.dp else if (tightH) 8.dp else 12.dp
+        val amountTextSp = when {
+            vCompactH -> 26.sp
+            tightH -> 30.sp
+            else -> 36.sp
+        }
+        val cardImgW = when {
+            vCompactH -> 112.dp
+            tightH -> 144.dp
+            else -> 176.dp
+        }
+        val cardImgH = when {
+            vCompactH -> 88.dp
+            tightH -> 115.dp
+            else -> 140.dp
+        }
+        val hPad = if (vCompactH) 14.dp else 20.dp
+        val sectionGapBelowCards = if (vCompactH) 6.dp else if (tightH) 8.dp else 12.dp
+        val routingTopPad = if (vCompactH) 6.dp else 8.dp
+        val receiptTopPad = if (vCompactH) 8.dp else 12.dp
+        val receiptInnerV = if (vCompactH) 6.dp else 8.dp
+        val scrollMid = rememberScrollState()
+
+        Column(Modifier.fillMaxSize()) {
+            // Header: Approved + amount（无顶部 icon）；Scan 流程下 extraTopInset 与顶栏 overlay 对齐
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = headerTopPad + extraTopInset, bottom = headerBottomPad),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("-", fontSize = 16.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                Row(verticalAlignment = Alignment.Bottom) {
-                    if (amtPrefix.isNotEmpty()) Text(amtPrefix, fontSize = 10.sp, color = Color.Black)
-                    Text(amtStr, fontSize = 36.sp, fontWeight = FontWeight.Light, color = Color.Black)
-                    if (amtSuffix.isNotEmpty()) Text(amtSuffix, fontSize = 10.sp, color = Color.Black)
+                Text(
+                    "Approved",
+                    fontSize = if (vCompactH) 18.sp else 20.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.Black
+                )
+                val (amtPrefix, amtStr, amtSuffix) = formatBalanceWithCurrencyProtocol(amountNum, currency)
+                Row(
+                    modifier = Modifier.padding(top = if (vCompactH) 2.dp else 4.dp),
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    Text("-", fontSize = if (vCompactH) 14.sp else 16.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        if (amtPrefix.isNotEmpty()) Text(amtPrefix, fontSize = if (vCompactH) 9.sp else 10.sp, color = Color.Black)
+                        Text(amtStr, fontSize = amountTextSp, fontWeight = FontWeight.Light, color = Color.Black)
+                        if (amtSuffix.isNotEmpty()) Text(amtSuffix, fontSize = if (vCompactH) 9.sp else 10.sp, color = Color.Black)
+                    }
                 }
             }
-        }
 
-        // Voucher Balance card（对齐 Balance Loaded 风格：背景色、图片、布局）
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 12.dp)
-        ) {
-            val cardBgColor = parseHexColor(cardBackground) ?: Color(0xFF2C5535)
-            val accentGreen = Color(0xFF6ED088)
-            val labelGrey = Color(0xFFBBBBBB)
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = cardBgColor)
+            Column(
+                modifier = Modifier
+                    .weight(1f, fill = true)
+                    .fillMaxWidth()
+                    .verticalScroll(scrollMid)
             ) {
-                Box(
+                // Voucher Balance card（对齐 Balance Loaded 风格：背景色、图片、布局）
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 16.dp)
+                        .padding(horizontal = hPad)
+                        .padding(bottom = sectionGapBelowCards)
                 ) {
-                    if (cardImage != null && cardImage.isNotBlank()) {
-                        AsyncImage(
-                            model = cardImage,
-                            contentDescription = "Card",
-                            contentScale = ContentScale.Crop,
-                            alignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(176.dp, 140.dp)
-                                .align(Alignment.TopStart)
-                        )
-                    }
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (cardImage == null || cardImage.isBlank()) {
-                                Icon(Icons.Filled.Favorite, null, Modifier.size(44.dp), tint = accentGreen)
-                            }
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .then(if (cardImage != null && cardImage.isNotBlank()) Modifier.padding(start = 176.dp) else Modifier),
-                                horizontalAlignment = Alignment.End
-                            ) {
-                                Text(
-                                    (cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                )
-                                val subtitle = tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
-                                if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
-                                    Text(subtitle, fontSize = 12.sp, color = labelGrey)
-                                }
-                            }
-                        }
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Bottom
+                    val cardBgColor = parseHexColor(cardBackground) ?: Color(0xFF2C5535)
+                    val accentGreen = Color(0xFF6ED088)
+                    val labelGrey = Color(0xFFBBBBBB)
+                    val voucherInnerPad = if (vCompactH) 14.dp else 20.dp
+                    val voucherInnerBottom = if (vCompactH) 12.dp else 16.dp
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = CardDefaults.cardColors(containerColor = cardBgColor)
                     ) {
-                        Column {
-                            Text("Member No.", fontSize = 11.sp, color = labelGrey)
-                            Text(
-                                displayMemberNo,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text("Balance", fontSize = 11.sp, color = labelGrey)
-                            if (postBalanceNum != null) {
-                                val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = voucherInnerPad, top = voucherInnerPad, end = voucherInnerPad, bottom = voucherInnerBottom)
+                        ) {
+                            if (cardImage != null && cardImage.isNotBlank()) {
+                                AsyncImage(
+                                    model = cardImage,
+                                    contentDescription = "Card",
+                                    contentScale = ContentScale.Crop,
+                                    alignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .size(cardImgW, cardImgH)
+                                        .align(Alignment.TopStart)
+                                )
+                            }
+                            Column(modifier = Modifier.fillMaxWidth()) {
                                 Row(
-                                    verticalAlignment = Alignment.Bottom,
-                                    horizontalArrangement = Arrangement.End
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    if (prefix.isNotEmpty()) {
-                                        Text(prefix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
+                                    if (cardImage == null || cardImage.isBlank()) {
+                                        Icon(Icons.Filled.Favorite, null, Modifier.size(if (vCompactH) 36.dp else 44.dp), tint = accentGreen)
                                     }
-                                    Text(amtStr, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
-                                    if (suffix.isNotEmpty()) {
-                                        Text(suffix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
+                                    Column(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .then(if (cardImage != null && cardImage.isNotBlank()) Modifier.padding(start = cardImgW) else Modifier),
+                                        horizontalAlignment = Alignment.End
+                                    ) {
+                                        Text(
+                                            (cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
+                                            fontSize = 16.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        )
+                                        val subtitle = tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
+                                        if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
+                                            Text(subtitle, fontSize = 12.sp, color = labelGrey)
+                                        }
                                     }
                                 }
-                            } else {
-                                Text("—", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .align(Alignment.BottomCenter),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.Bottom
+                            ) {
+                                Column {
+                                    Text("Member No.", fontSize = 11.sp, color = labelGrey)
+                                    Text(
+                                        displayMemberNo,
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Text("Balance", fontSize = 11.sp, color = labelGrey)
+                                    if (postBalanceNum != null) {
+                                        val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
+                                        Row(
+                                            verticalAlignment = Alignment.Bottom,
+                                            horizontalArrangement = Arrangement.End
+                                        ) {
+                                            if (prefix.isNotEmpty()) {
+                                                Text(prefix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
+                                            }
+                                            Text(amtStr, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
+                                            if (suffix.isNotEmpty()) {
+                                                Text(suffix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
+                                            }
+                                        }
+                                    } else {
+                                        Text("—", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
 
             // Smart Routing: Voucher Deduction (charge amount)
             if (subtotalNum != null) {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = 8.dp),
+                        .padding(top = routingTopPad),
                     shape = RoundedCornerShape(16.dp),
                     colors = CardDefaults.cardColors(containerColor = Color.White),
                     border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
                 ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
+                    Column(modifier = Modifier.padding(if (vCompactH) 10.dp else 12.dp)) {
                         Text(
                             "Smart Routing Engine",
-                            fontSize = 14.sp,
+                            fontSize = if (vCompactH) 13.sp else 14.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.Black,
-                            modifier = Modifier.padding(bottom = 8.dp)
+                            modifier = Modifier.padding(bottom = if (vCompactH) 6.dp else 8.dp)
                         )
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -5755,12 +5839,12 @@ private fun PaymentSuccessContent(
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 12.dp),
+                    .padding(top = receiptTopPad),
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
             ) {
-                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Column(modifier = Modifier.padding(horizontal = if (vCompactH) 12.dp else 16.dp, vertical = receiptInnerV)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -5807,18 +5891,20 @@ private fun PaymentSuccessContent(
                 }
             }
         }
+            }
 
-        // Print and Done buttons (same height — 24.dp was clipping label + icon)
-        val approvedActionButtonModifier = Modifier
-            .fillMaxWidth()
-            .height(48.dp)
-        Column(
-            modifier = Modifier
+            // Print and Done buttons（贴底 + 导航栏安全区，避免整页滚动）
+            val approvedActionButtonModifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp)
-                .padding(bottom = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
+                .height(if (vCompactH) 44.dp else 48.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(horizontal = hPad, vertical = if (vCompactH) 6.dp else 10.dp)
+                    .padding(bottom = if (vCompactH) 6.dp else 10.dp),
+                verticalArrangement = Arrangement.spacedBy(if (vCompactH) 6.dp else 8.dp)
+            ) {
             OutlinedButton(
                 onClick = { printChargeReceipt(context, amount, subtotal, tip, postBalance, cardCurrency, payee, txHash, dateString, timeString) },
                 modifier = approvedActionButtonModifier,
@@ -5835,6 +5921,7 @@ private fun PaymentSuccessContent(
                 colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
             ) {
                 Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
             }
         }
     }
@@ -6240,6 +6327,7 @@ private fun BeamioCapsuleCompact(
             } else if (!hasNameRow) {
                 Text(
                     shortFallback ?: "—",
+
                     fontSize = 12.sp,
                     lineHeight = 14.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -6868,6 +6956,20 @@ internal fun ScanMethodSelectionScreen(
         !(pendingAction == "payment" && paymentQrParseError.isNotEmpty()) &&
         !(pendingAction == "payment" && paymentQrInterpreting)
 
+    /** Charge：底部 Total = request + tax%*request - tier%*request + tip（与链上记账一致）；勿仅用 totalAmount 字符串以免漏税 */
+    val bottomTotalDisplay = if (pendingAction == "payment") {
+        val req = paymentSubtotal?.toDoubleOrNull() ?: 0.0
+        if (req > 0.0) {
+            val tip = paymentTip?.toDoubleOrNull() ?: 0.0
+            val taxP = paymentChargeTaxPercent ?: 0.0
+            chargeTotalInCurrency(req, taxP, paymentChargeTierDiscountPercent, tip)
+        } else {
+            totalAmount.toDoubleOrNull() ?: 0.0
+        }
+    } else {
+        totalAmount.toDoubleOrNull() ?: 0.0
+    }
+
     Box(
         modifier = modifier
             .fillMaxSize()
@@ -6887,7 +6989,7 @@ internal fun ScanMethodSelectionScreen(
                 if (true) {
                     // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
                     if (showPaymentSuccess) {
-                    // 仅使用 PaymentSuccessContent 内部 verticalScroll；外层不可再包 verticalScroll，否则子项高度无界会崩溃
+                    // Approved：PaymentSuccessContent 内顶栏固定、底栏固定；中间 weight(1f)+verticalScroll，勿在外层再包 verticalScroll
                     PaymentSuccessContent(
                         amount = paymentAmount,
                         payee = paymentPayee,
@@ -7449,7 +7551,10 @@ internal fun ScanMethodSelectionScreen(
                 .align(Alignment.BottomCenter)
                 .padding(24.dp)
         ) {
-            if (pendingAction != "read" && totalAmount.isNotBlank() && !showPaymentSuccess) {
+            if (pendingAction != "read" && !showPaymentSuccess &&
+                (pendingAction != "payment" && totalAmount.isNotBlank() ||
+                    pendingAction == "payment" && (bottomTotalDisplay > 0.0 || totalAmount.isNotBlank()))
+            ) {
                 Column(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -7461,101 +7566,13 @@ internal fun ScanMethodSelectionScreen(
                         color = if (pendingAction == "topup") Color(0xFF1562f0) else Color(0xFF86868b)
                     )
                     Text(
-                        "$${"%.2f".format(totalAmount.toDoubleOrNull() ?: 0.0)}",
+                        "$${"%.2f".format(if (pendingAction == "payment" && bottomTotalDisplay > 0.0) bottomTotalDisplay else (totalAmount.toDoubleOrNull() ?: 0.0))}",
                         fontSize = 40.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (pendingAction == "topup") Color(0xFF1562f0) else Color.Black,
                         modifier = Modifier.padding(bottom = 8.dp)
                     )
                     if (pendingAction == "payment") {
-                        val sub = paymentSubtotal?.toDoubleOrNull() ?: 0.0
-                        val taxP = paymentChargeTaxPercent ?: 0.0
-                        val taxAmt = sub * taxP / 100.0
-                        val tipAmt = paymentTip?.toDoubleOrNull() ?: 0.0
-                        val tipP = paymentChargeTipBps / 100.0
-                        val discP = paymentChargeTierDiscountPercent
-                        val discAmt = if (discP != null) sub * discP / 100.0 else null
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 8.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Text(
-                                "Details (request ${paymentCardCurrency ?: "CAD"})",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color(0xFF64748b)
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    "Tax (${String.format("%.2f", taxP)}%)",
-                                    fontSize = 12.sp,
-                                    color = Color(0xFF64748b)
-                                )
-                                Text(
-                                    "$${String.format("%.2f", taxAmt)}",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = Color.Black
-                                )
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                if (discP != null) {
-                                    Text(
-                                        "Tier discount ($discP%)",
-                                        fontSize = 12.sp,
-                                        color = Color(0xFF64748b)
-                                    )
-                                    Text(
-                                        "-$${String.format("%.2f", discAmt ?: 0.0)}",
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        color = Color(0xFF059669)
-                                    )
-                                } else {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            "Tier discount",
-                                            fontSize = 12.sp,
-                                            color = Color(0xFF64748b)
-                                        )
-                                        Text(
-                                            "Present card to apply",
-                                            fontSize = 10.sp,
-                                            color = Color(0xFF94a3b8)
-                                        )
-                                    }
-                                    Text(
-                                        "—",
-                                        fontSize = 12.sp,
-                                        color = Color(0xFF94a3b8)
-                                    )
-                                }
-                            }
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    "Tip (${String.format("%.2f", tipP)}%)",
-                                    fontSize = 12.sp,
-                                    color = Color(0xFF64748b)
-                                )
-                                Text(
-                                    "$${String.format("%.2f", tipAmt)}",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = Color.Black
-                                )
-                            }
-                        }
                         Spacer(modifier = Modifier.height(16.dp))
                     } else {
                         Spacer(modifier = Modifier.height(24.dp))
@@ -7570,6 +7587,7 @@ internal fun ScanMethodSelectionScreen(
 fun TipSelectionScreen(
     subtotal: String,
     selectedTipRate: Double,
+    chargeTaxPercent: Double? = null,
     onTipRateSelect: (Double) -> Unit,
     onBack: () -> Unit,
     onConfirmPay: () -> Unit,
@@ -7577,7 +7595,8 @@ fun TipSelectionScreen(
 ) {
     val numAmount = subtotal.toDoubleOrNull() ?: 0.0
     val tipValue = numAmount * selectedTipRate
-    val totalAmount = numAmount + tipValue
+    val taxP = chargeTaxPercent ?: 0.0
+    val totalAmount = chargeTotalInCurrency(numAmount, taxP, null, tipValue)
     Column(
         modifier = modifier
             .fillMaxSize()
