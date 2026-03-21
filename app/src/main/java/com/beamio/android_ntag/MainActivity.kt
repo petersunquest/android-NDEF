@@ -93,6 +93,8 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Store
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Nfc
+import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Percent
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
@@ -135,6 +137,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.SubcomposeLayout
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
@@ -330,8 +335,12 @@ class MainActivity : ComponentActivity() {
     private var paymentScreenRoutingSteps by mutableStateOf<List<RoutingStep>>(emptyList())
     private var paymentScreenSubtotal by mutableStateOf("0")
     private var paymentScreenTip by mutableStateOf("0")
-    /** Ledger TransactionMeta.discountRateBps：小费率 bps（如 1800 = 18%），与 nfcTipCurrencyAmount 一并 POST */
+    /** 小费率 bps（如 1800 = 18%），与 nfcTipCurrencyAmount 一并 POST；记账小费走 TX_TIP 行 */
     private var paymentScreenTipRateBps by mutableStateOf(0)
+    /** Charge 明细：税率（与终端 metadata / 基础设施 routing 一致） */
+    private var paymentChargeBreakdownTaxPercent by mutableStateOf<Double?>(null)
+    /** null = 尚未根据客户卡解析；0–100 为会员 tier 折扣率 */
+    private var paymentChargeBreakdownTierDiscountPercent by mutableStateOf<Int?>(null)
     private var paymentScreenPreBalance by mutableStateOf<String?>(null)
     private var paymentScreenPostBalance by mutableStateOf<String?>(null)
     private var paymentScreenCardCurrency by mutableStateOf<String?>(null)
@@ -367,7 +376,8 @@ class MainActivity : ComponentActivity() {
     private var selectedTipRate by mutableStateOf(0.0) // 0, 0.15, 0.18, 0.20
     private var showScanMethodScreen by mutableStateOf(false)
     private var scanMethodState by mutableStateOf("nfc") // "nfc" | "qr"
-    private var scanWaitingForNfc by mutableStateOf(false) // 按下 Continue 后留在本页等待 UID
+    /** NFC 模式下为 true 时显示中央扫描线动画并已 arm read/topup/payment；进入选方式页或切回 Tap Card 时自动置 true */
+    private var scanWaitingForNfc by mutableStateOf(false)
     private var nfcFetchingInfo by mutableStateOf(false) // 已获 UID，正在拉取信息，不跳新页
     private var nfcFetchError by mutableStateOf("") // 拉取失败时在 280.dp 框内显示
     private var pendingScanAction by mutableStateOf("read") // "read" | "payment" | "topup"
@@ -384,6 +394,8 @@ class MainActivity : ComponentActivity() {
     private var qrScanningActive by mutableStateOf(false) // 按下 Scan QR 后，在 280.dp 方框内显示相机
     /** Payment QR 解析失败时递增，用于重建 EmbeddedQrScanner、清除 lastText 去重，便于同一画面内继续扫同一码 */
     private var paymentQrDecodeResetKey by mutableStateOf(0)
+    /** Balance read + Scan QR：无效链接或需重试时递增，重建扫码视图 */
+    private var readQrDecodeResetKey by mutableStateOf(0)
     /** Charge + Scan QR：已扫到码，正在解析（关相机、中央 280dp 显示 loading） */
     private var paymentQrInterpreting by mutableStateOf(false)
     /** Charge + Scan QR：解析失败时在中央卡片展示（英文） */
@@ -414,6 +426,10 @@ class MainActivity : ComponentActivity() {
     /** RPC 拉取失败时在仪表盘对应金额旁显示黄色感叹号 */
     private var cardStatsChargeRpcWarning by mutableStateOf(false)
     private var cardStatsTopUpRpcWarning by mutableStateOf(false)
+
+    /** 基础设施卡 metadata：`tierRoutingDiscounts.taxRatePercent`；折扣为所有 tier 一行拼接（15s home daemon） */
+    private var dashboardInfraTaxPercent by mutableStateOf<Double?>(null)
+    private var dashboardInfraDiscountSummary by mutableStateOf<String?>(null)
 
     private val cardStatsVerifyLock = Any()
     @Volatile private var cardStatsVerifyThreadRunning = false
@@ -617,14 +633,20 @@ class MainActivity : ComponentActivity() {
                 val wallet = parseBeamioWalletFromUrl(content)
                 if (beamioTab == null && wallet == null) {
                     uidText = "Cannot parse URL. Please scan a beamio.app link"
+                    if (pendingScanAction == "read" && showScanMethodScreen) {
+                        nfcFetchError = "Cannot parse URL. Please scan a beamio.app link."
+                        readQrDecodeResetKey++
+                        qrScanningActive = false
+                    }
                     return
                 }
                 when (pendingScanAction) {
                     "read" -> {
+                        // 与 NFC 读卡一致：留在选方式页，中央显示 Loading；成功再进 Balance Loaded
                         qrScanningActive = false
                         readViaQr = true
-                        showScanMethodScreen = false
-                        showReadScreen = true
+                        showReadScreen = false
+                        showScanMethodScreen = true
                         readScreenUid = beamioTab ?: ""
                         readScreenWallet = wallet ?: ""
                         readScreenStatus = ReadStatus.Loading
@@ -632,6 +654,9 @@ class MainActivity : ComponentActivity() {
                         readScreenRawJson = null
                         readScreenError = ""
                         readArmed = false
+                        nfcFetchError = ""
+                        scanWaitingForNfc = false
+                        nfcFetchingInfo = true
                         if (beamioTab != null) {
                             fetchUidAssets(beamioTab)
                         } else {
@@ -748,6 +773,37 @@ class MainActivity : ComponentActivity() {
                         Thread { prefetchInfraCardMetadata() }.start()
                     }
                 }
+                /** Home：每 15s 拉取本终端在基础设施卡上的 `tierRoutingDiscounts`（税率 + tier 折扣摘要） */
+                LaunchedEffect(
+                    showWelcomePage,
+                    showOnboardingScreen,
+                    showTopupScreen,
+                    showReadScreen,
+                    showScanMethodScreen,
+                    showAmountInputScreen,
+                    showTipScreen,
+                    showPaymentScreen,
+                    showInitFlowScreen
+                ) {
+                    val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
+                        !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
+                    if (!onHome || !BeamioWeb3Wallet.isInitialized()) return@LaunchedEffect
+                    while (isActive) {
+                        val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+                        if (wallet.isNotEmpty()) {
+                            Thread {
+                                val parsed = fetchInfraRoutingForTerminalWalletSync(wallet)
+                                runOnUiThread {
+                                    if (parsed != null) {
+                                        dashboardInfraTaxPercent = parsed.first
+                                        dashboardInfraDiscountSummary = parsed.second
+                                    }
+                                }
+                            }.start()
+                        }
+                        delay(15_000L)
+                    }
+                }
                 LaunchedEffect(topupScreenStatus, topupQrSigningInProgress) {
                     if (!topupQrSigningInProgress) return@LaunchedEffect
                     if (topupScreenStatus is TopupStatus.Success) {
@@ -812,15 +868,30 @@ class MainActivity : ComponentActivity() {
                             scanMethodState = s
                             paymentQrParseError = ""
                             paymentQrInterpreting = false
-                            if (s == "nfc") qrScanningActive = false
+                            if (s == "nfc") {
+                                qrScanningActive = false
+                                nfcFetchingInfo = false
+                                nfcFetchError = ""
+                            }
+                            if (s == "qr") {
+                                scanWaitingForNfc = false
+                                nfcFetchingInfo = false
+                                nfcFetchError = ""
+                            }
+                            syncScanMethodEntryAndTabs()
                         },
-                        embeddedQrResetKey = if (pendingScanAction == "payment") paymentQrDecodeResetKey else 0,
+                        embeddedQrResetKey = when (pendingScanAction) {
+                            "payment" -> paymentQrDecodeResetKey
+                            "read" -> readQrDecodeResetKey
+                            else -> 0
+                        },
+                        onRetryAfterCentralFetchError = { retryCentralFetchAfterError() },
                         paymentQrInterpreting = paymentQrInterpreting,
                         paymentQrParseError = paymentQrParseError,
                         onRetryPaymentQrScan = {
                             paymentQrParseError = ""
                             paymentQrDecodeResetKey++
-                            if (scanMethodState == "qr") qrScanningActive = true
+                            if (scanMethodState == "qr") startEmbeddedQrScanning()
                         },
                         onRetryPaymentAfterError = { retryChargeAfterScanMethodError() },
                         pendingAction = pendingScanAction,
@@ -846,6 +917,9 @@ class MainActivity : ComponentActivity() {
                         paymentCardName = if (pendingScanAction == "payment") paymentScreenCardName else null,
                         paymentTierName = if (pendingScanAction == "payment") paymentScreenTierName else null,
                         paymentCardType = if (pendingScanAction == "payment") paymentScreenCardType else null,
+                        paymentChargeTaxPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTaxPercent else null,
+                        paymentChargeTierDiscountPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTierDiscountPercent else null,
+                        paymentChargeTipBps = if (pendingScanAction == "payment") paymentScreenTipRateBps else 0,
                         onPaymentDone = {
                             showScanMethodScreen = false
                             showTipScreen = false
@@ -860,13 +934,7 @@ class MainActivity : ComponentActivity() {
                         onProceed = { proceedFromScanMethod() },
                         onProceedNfcStay = { armForNfcScan() },
                         onProceedWithQr = if (pendingScanAction == "read" || pendingScanAction == "topup" || pendingScanAction == "payment") {
-                            {
-                                if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                                    qrScanningActive = true
-                                } else {
-                                    cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-                                }
-                            }
+                            { startEmbeddedQrScanning() }
                         } else null,
                         qrScanningActive = qrScanningActive,
                         onQrScanResult = { result -> handleQrScanResult(result) },
@@ -979,6 +1047,8 @@ class MainActivity : ComponentActivity() {
                         tierName = paymentScreenTierName,
                         cardType = paymentScreenCardType,
                         settlementViaQr = paymentViaQr,
+                        chargeTaxPercent = paymentChargeBreakdownTaxPercent,
+                        chargeTierDiscountPercent = paymentChargeBreakdownTierDiscountPercent,
                         onBack = { closePaymentScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1015,6 +1085,8 @@ class MainActivity : ComponentActivity() {
                             cm?.setPrimaryClip(ClipData.newPlainText("url", readUrlText))
                         },
                         contentAboveCharge = { WelcomePanelNoAA(modifier = Modifier.fillMaxWidth(), compact = true) },
+                        infraRoutingTaxPercent = dashboardInfraTaxPercent,
+                        infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
                         modifier = Modifier.fillMaxSize()
                     )
                     else -> NdefScreen(
@@ -1028,6 +1100,8 @@ class MainActivity : ComponentActivity() {
                         topUpAmount = cardTopUpAmount,
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
+                        infraRoutingTaxPercent = dashboardInfraTaxPercent,
+                        infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
                         onCopyWalletClick = {
                             if (BeamioWeb3Wallet.isInitialized()) {
                                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -1079,6 +1153,7 @@ class MainActivity : ComponentActivity() {
         pendingScanAction = "read"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+        syncScanMethodEntryAndTabs()
     }
 
     private fun closeReadScreen() {
@@ -1094,6 +1169,7 @@ class MainActivity : ComponentActivity() {
         pendingScanAction = "topup"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+        syncScanMethodEntryAndTabs()
     }
 
     private fun closeTopupScreen() {
@@ -1146,6 +1222,8 @@ class MainActivity : ComponentActivity() {
         paymentScreenSubtotal = "0"
         paymentScreenTip = "0"
         paymentScreenTipRateBps = 0
+        paymentChargeBreakdownTaxPercent = null
+        paymentChargeBreakdownTierDiscountPercent = null
         paymentScreenPreBalance = null
         paymentScreenPostBalance = null
         paymentScreenCardCurrency = null
@@ -1232,9 +1310,12 @@ class MainActivity : ComponentActivity() {
         paymentScreenTip = tip ?: "0"
         paymentScreenTipRateBps = tipRateBps.coerceIn(0, 10000)
         paymentScreenPayee = BeamioWeb3Wallet.getAddress()
+        paymentChargeBreakdownTaxPercent = dashboardInfraTaxPercent
+        paymentChargeBreakdownTierDiscountPercent = null
         pendingScanAction = "payment"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+        syncScanMethodEntryAndTabs()
     }
 
     /** Charge 在选方式页 Smart Routing 失败后：NFC 回到等待贴卡；QR 留在 Scan QR 并打开相机扫码 */
@@ -1261,20 +1342,96 @@ class MainActivity : ComponentActivity() {
             paymentScreenTierName = null
             paymentScreenCardType = null
             paymentScreenMemberNo = null
+            paymentChargeBreakdownTierDiscountPercent = null
             scanMethodState = "qr"
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                qrScanningActive = true
-            } else {
-                cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
-            }
+            startEmbeddedQrScanning()
         } else {
             qrScanningActive = false
             scanMethodState = "nfc"
+            paymentChargeBreakdownTierDiscountPercent = null
             armForNfcScan()
         }
     }
 
-    /** NFC 模式下：按下 Continue 后留在本页，显示 loading，等待贴卡获得 UID */
+    private fun startEmbeddedQrScanning() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            qrScanningActive = true
+        } else {
+            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    /** NFC 自动 arm：贴卡拉取中、支付路由中、充值执行中等不重复 arm，避免打断进行中的流程 */
+    private fun shouldDeferAutoNfcArm(): Boolean {
+        if (nfcFetchingInfo) return true
+        if (pendingScanAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) return true
+        if (topupQrExecuteError.isNotEmpty()) return true
+        if (pendingScanAction == "payment") {
+            when (paymentScreenStatus) {
+                is PaymentStatus.Routing,
+                is PaymentStatus.Submitting,
+                is PaymentStatus.Refreshing,
+                is PaymentStatus.Success,
+                is PaymentStatus.Error -> return true
+                else -> { }
+            }
+        }
+        return false
+    }
+
+    /** QR 自动开相机：解析中/支付路由中等不抢焦点 */
+    private fun shouldDeferAutoQrCamera(): Boolean {
+        if (pendingScanAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) return true
+        if (topupQrExecuteError.isNotEmpty()) return true
+        if (pendingScanAction == "payment") {
+            if (paymentQrParseError.isNotEmpty()) return true
+            if (paymentQrInterpreting) return true
+            when (paymentScreenStatus) {
+                is PaymentStatus.Routing,
+                is PaymentStatus.Submitting,
+                is PaymentStatus.Refreshing,
+                is PaymentStatus.Success,
+                is PaymentStatus.Error -> return true
+                else -> { }
+            }
+        }
+        return false
+    }
+
+    /** 进入选方式页或切换 Tap Card / Scan QR：无需点中央即可 NFC 动画+监听或打开扫码相机 */
+    private fun syncScanMethodEntryAndTabs() {
+        if (!showScanMethodScreen) return
+        when (scanMethodState) {
+            "nfc" -> {
+                if (shouldDeferAutoNfcArm()) return
+                qrScanningActive = false
+                armForNfcScan()
+            }
+            "qr" -> {
+                if (shouldDeferAutoQrCamera()) return
+                scanWaitingForNfc = false
+                startEmbeddedQrScanning()
+            }
+        }
+    }
+
+    /** 中央区域拉取失败（NFC/QR 读余额等）后点击重试：读余额 + QR 时重新开相机，其余与 NFC arm 一致 */
+    private fun retryCentralFetchAfterError() {
+        when (pendingScanAction) {
+            "read" -> {
+                if (scanMethodState == "qr") {
+                    nfcFetchError = ""
+                    readQrDecodeResetKey++
+                    startEmbeddedQrScanning()
+                } else {
+                    armForNfcScan()
+                }
+            }
+            else -> armForNfcScan()
+        }
+    }
+
+    /** NFC 模式下：留在本页，显示扫描动画，等待贴卡获得 UID */
     private fun armForNfcScan() {
         scanWaitingForNfc = true
         nfcFetchError = ""
@@ -2012,7 +2169,20 @@ class MainActivity : ComponentActivity() {
                     ?.let { "M-%s".format(it.padStart(6, '0')) }
                     ?: ""
                 val paymentCard = assets.cards?.firstOrNull()
+                val payeeWallet = BeamioWeb3Wallet.getAddress()
+                val routingDetails = fetchTierRoutingDetailsForTerminalWalletSync(payeeWallet)
+                val subtotalPay = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                val taxPctResolved = routingDetails?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
+                val tierDiscPct = pickTierDiscountPercentFromAssets(assets, routingDetails?.discountByTierKey ?: emptyMap())
+                val taxAmtCad = subtotalPay * taxPctResolved / 100.0
+                val discAmtCad = subtotalPay * tierDiscPct / 100.0
+                val taxFiat6Str = kotlin.math.round(taxAmtCad * 1_000_000.0).toLong().toString()
+                val discFiat6Str = kotlin.math.round(discAmtCad * 1_000_000.0).toLong().toString()
+                val taxBpsResolved = kotlin.math.round(taxPctResolved * 100.0).toInt().coerceIn(0, 10000)
+                val discBpsResolved = (tierDiscPct * 100).coerceIn(0, 10000)
                 runOnUiThread {
+                    paymentChargeBreakdownTaxPercent = taxPctResolved
+                    paymentChargeBreakdownTierDiscountPercent = tierDiscPct
                     paymentScreenMemberNo = paymentMemberNo.ifEmpty { null }
                     paymentScreenCardBackground = paymentCard?.cardBackground
                     paymentScreenCardImage = paymentCard?.cardImage
@@ -2066,7 +2236,11 @@ class MainActivity : ComponentActivity() {
                     nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
                     nfcTipCurrencyAmount = paymentScreenTip,
                     nfcTipRateBps = paymentScreenTipRateBps,
-                    nfcRequestCurrency = "CAD"
+                    nfcRequestCurrency = "CAD",
+                    nfcTaxAmountFiat6 = taxFiat6Str,
+                    nfcTaxRateBps = taxBpsResolved,
+                    nfcDiscountAmountFiat6 = discFiat6Str,
+                    nfcDiscountRateBps = discBpsResolved
                 )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
@@ -2531,7 +2705,11 @@ class MainActivity : ComponentActivity() {
         nfcSubtotalCurrencyAmount: String? = null,
         nfcTipCurrencyAmount: String? = null,
         nfcTipRateBps: Int = 0,
-        nfcRequestCurrency: String = "CAD"
+        nfcRequestCurrency: String = "CAD",
+        nfcTaxAmountFiat6: String? = null,
+        nfcTaxRateBps: Int? = null,
+        nfcDiscountAmountFiat6: String? = null,
+        nfcDiscountRateBps: Int? = null
     ): PayByNfcResult {
         val amountBig = amountUsdc6.toLongOrNull() ?: 0L
         if (amountBig <= 0) return PayByNfcResult(false, null, "Invalid amountUsdc6")
@@ -2658,7 +2836,11 @@ class MainActivity : ComponentActivity() {
             nfcSubtotalCurrencyAmount,
             nfcTipCurrencyAmount,
             nfcTipRateBps,
-            nfcRequestCurrency
+            nfcRequestCurrency,
+            nfcTaxAmountFiat6,
+            nfcTaxRateBps,
+            nfcDiscountAmountFiat6,
+            nfcDiscountRateBps
         )
     }
 
@@ -2705,7 +2887,11 @@ class MainActivity : ComponentActivity() {
         nfcSubtotalCurrencyAmount: String? = null,
         nfcTipCurrencyAmount: String? = null,
         nfcTipRateBps: Int = 0,
-        nfcRequestCurrency: String = "CAD"
+        nfcRequestCurrency: String = "CAD",
+        nfcTaxAmountFiat6: String? = null,
+        nfcTaxRateBps: Int? = null,
+        nfcDiscountAmountFiat6: String? = null,
+        nfcDiscountRateBps: Int? = null
     ): PayByNfcResult {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/payByNfcUidSignContainer")
@@ -2729,6 +2915,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 put("nfcRequestCurrency", nfcRequestCurrency.trim().ifEmpty { "CAD" })
+                nfcTaxAmountFiat6?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcTaxAmountFiat6", it) }
+                nfcTaxRateBps?.takeIf { it in 0..10000 }?.let { put("nfcTaxRateBps", it) }
+                nfcDiscountAmountFiat6?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcDiscountAmountFiat6", it) }
+                nfcDiscountRateBps?.takeIf { it in 0..10000 }?.let { put("nfcDiscountRateBps", it) }
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -2790,21 +2980,36 @@ class MainActivity : ComponentActivity() {
                 val parsed = parseUidAssetsJson(json)
                 val displayError = if (parsed.ok) null else (parsed.error ?: "Query failed")
                 runOnUiThread {
+                    val fromScan = nfcFetchingInfo
                     if (parsed.ok) {
                         readScreenAssets = parsed
                         readScreenRawJson = json
                         readScreenStatus = ReadStatus.Success
                         readScreenError = ""
+                        if (fromScan) {
+                            nfcFetchingInfo = false
+                            showScanMethodScreen = false
+                            showReadScreen = true
+                        }
                     } else {
                         readScreenStatus = ReadStatus.Error
                         readScreenError = displayError ?: "Query failed"
+                        if (fromScan) {
+                            nfcFetchingInfo = false
+                            nfcFetchError = displayError ?: "Query failed"
+                        }
                     }
                 }
             } catch (e: Exception) {
                 Log.e("MainActivity", "fetchWalletAssets", e)
                 runOnUiThread {
+                    val fromScan = nfcFetchingInfo
                     readScreenStatus = ReadStatus.Error
                     readScreenError = e.message ?: "Network request failed"
+                    if (fromScan) {
+                        nfcFetchingInfo = false
+                        nfcFetchError = e.message ?: "Network request failed"
+                    }
                 }
             }
         }.start()
@@ -2895,8 +3100,8 @@ class MainActivity : ComponentActivity() {
         return Pair(profile, adminProfile)
     }
 
-    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 默认 BEAMIO_USER_CARD_ASSET_ADDRESS。 */
-    private fun fetchGetCardAdminInfoSync(wallet: String): String? {
+    /** GET /api/getCardAdminInfo 完整 JSON（含 admins / metadatas，与 biz 部署的 tierRouting 同源） */
+    private fun fetchGetCardAdminInfoJsonSync(wallet: String): org.json.JSONObject? {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/getCardAdminInfo?cardAddress=${java.net.URLEncoder.encode(BEAMIO_USER_CARD_ASSET_ADDRESS, "UTF-8")}&wallet=${java.net.URLEncoder.encode(wallet, "UTF-8")}")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2908,14 +3113,186 @@ class MainActivity : ComponentActivity() {
             conn.disconnect()
             if (code in 200..299) {
                 val root = org.json.JSONObject(json)
-                if (root.optBoolean("ok", false)) {
-                    root.optString("upperAdmin").takeIf { it.isNotEmpty() && it != "null" }
-                        ?: root.optString("owner").takeIf { it.isNotEmpty() && it != "null" }
-                } else null
+                if (root.optBoolean("ok", false)) root else null
             } else null
         } catch (_: Exception) {
             null
         }
+    }
+
+    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 默认 BEAMIO_USER_CARD_ASSET_ADDRESS。 */
+    private fun fetchGetCardAdminInfoSync(wallet: String): String? {
+        val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
+        return root.optString("upperAdmin").takeIf { it.isNotEmpty() && it != "null" }
+            ?: root.optString("owner").takeIf { it.isNotEmpty() && it != "null" }
+    }
+
+    /**
+     * 解析本终端 EOA 在 `getAdminListWithMetadata` 中对应条目的 metadata，读取 `tierRoutingDiscounts`（与 biz Sign & Deploy 一致）。
+     * @return Pair(taxPercent, discountSummary)；仅网络/解析失败时返回 null（不覆盖 UI 旧值）
+     */
+    private fun fetchInfraRoutingForTerminalWalletSync(wallet: String): Pair<Double, String>? {
+        val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
+        val admins = root.optJSONArray("admins") ?: return null
+        val metadatas = root.optJSONArray("metadatas") ?: return null
+        val wNorm = wallet.trim().lowercase()
+        var idx = -1
+        for (i in 0 until admins.length()) {
+            if (admins.optString(i, "").trim().lowercase() == wNorm) {
+                idx = i
+                break
+            }
+        }
+        if (idx < 0) return Pair(0.0, "Not on admin list")
+        val metaStr = metadatas.optString(idx, "").trim()
+        if (metaStr.isEmpty()) return Pair(0.0, "No routing metadata")
+        val parsed = parseTierRoutingDiscountsFromTerminalMetadata(metaStr, BEAMIO_USER_CARD_ASSET_ADDRESS)
+        return parsed ?: Pair(0.0, "No valid routing")
+    }
+
+    private fun parseTierRoutingDiscountsFromTerminalMetadata(metaJson: String, expectedInfrastructureCard: String): Pair<Double, String>? {
+        return try {
+            val root = org.json.JSONObject(metaJson)
+            val tr = root.optJSONObject("tierRoutingDiscounts") ?: return Pair(0.0, "No tier routing block")
+            if (tr.has("schemaVersion") && !tr.isNull("schemaVersion")) {
+                val sv = when (val v = tr.get("schemaVersion")) {
+                    is Number -> v.toInt()
+                    is String -> v.toIntOrNull() ?: return null
+                    else -> return null
+                }
+                if (sv != 1) return null
+            }
+            val infra = tr.optString("infrastructureCard", "").trim()
+            if (infra.isEmpty()) return null
+            val infraLc = infra.lowercase()
+            val expLc = expectedInfrastructureCard.trim().lowercase()
+            if (infraLc != expLc) return null
+
+            var tax = 0.0
+            when (val t = tr.opt("taxRatePercent")) {
+                is Number -> tax = t.toDouble()
+                is String -> tax = t.toDoubleOrNull() ?: 0.0
+            }
+            tax = (kotlin.math.round(tax.coerceIn(0.0, 100.0) * 100.0) / 100.0)
+
+            val tiers = tr.optJSONArray("tiers") ?: org.json.JSONArray()
+            val discParts = ArrayList<Int>(tiers.length())
+            for (i in 0 until tiers.length()) {
+                val row = tiers.optJSONObject(i) ?: continue
+                val d = when (val dp = row.opt("discountPercent")) {
+                    is Number -> dp.toInt().coerceIn(0, 100)
+                    is String -> dp.toIntOrNull()?.coerceIn(0, 100) ?: continue
+                    else -> continue
+                }
+                discParts.add(d)
+            }
+            val discLabel = if (discParts.isEmpty()) "—" else discParts.joinToString(" · ") { "$it%" }
+            Pair(tax, discLabel)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private data class TierRoutingDetails(val taxPercent: Double, val discountByTierKey: Map<String, Int>)
+
+    /** 与 biz `tierRoutingDiscounts.tiers` 一致：chain-tier-{index} / tierId -> discountPercent */
+    private fun parseTierRoutingDetailsFromTerminalMetadata(metaJson: String, expectedInfrastructureCard: String): TierRoutingDetails? {
+        return try {
+            val root = org.json.JSONObject(metaJson)
+            val tr = root.optJSONObject("tierRoutingDiscounts") ?: return null
+            if (tr.has("schemaVersion") && !tr.isNull("schemaVersion")) {
+                val sv = when (val v = tr.get("schemaVersion")) {
+                    is Number -> v.toInt()
+                    is String -> v.toIntOrNull() ?: return null
+                    else -> return null
+                }
+                if (sv != 1) return null
+            }
+            val infra = tr.optString("infrastructureCard", "").trim()
+            if (infra.isEmpty()) return null
+            if (infra.lowercase() != expectedInfrastructureCard.trim().lowercase()) return null
+
+            var tax = 0.0
+            when (val t = tr.opt("taxRatePercent")) {
+                is Number -> tax = t.toDouble()
+                is String -> tax = t.toDoubleOrNull() ?: 0.0
+            }
+            tax = (kotlin.math.round(tax.coerceIn(0.0, 100.0) * 100.0) / 100.0)
+
+            val map = mutableMapOf<String, Int>()
+            val tiers = tr.optJSONArray("tiers") ?: org.json.JSONArray()
+            for (i in 0 until tiers.length()) {
+                val row = tiers.optJSONObject(i) ?: continue
+                val d = when (val dp = row.opt("discountPercent")) {
+                    is Number -> dp.toInt().coerceIn(0, 100)
+                    is String -> dp.toIntOrNull()?.coerceIn(0, 100) ?: continue
+                    else -> continue
+                }
+                val idx = when (val v = row.opt("chainTierIndex")) {
+                    is Number -> v.toInt()
+                    is String -> v.toIntOrNull()
+                    else -> null
+                }
+                val tid = row.optString("tierId", "").trim()
+                if (idx != null) map["chain-tier-$idx".lowercase()] = d
+                if (tid.isNotEmpty()) map[tid.lowercase()] = d
+            }
+            TierRoutingDetails(tax, map)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun fetchTierRoutingDetailsForTerminalWalletSync(wallet: String): TierRoutingDetails? {
+        val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
+        val admins = root.optJSONArray("admins") ?: return null
+        val metadatas = root.optJSONArray("metadatas") ?: return null
+        val wNorm = wallet.trim().lowercase()
+        var idx = -1
+        for (i in 0 until admins.length()) {
+            if (admins.optString(i, "").trim().lowercase() == wNorm) {
+                idx = i
+                break
+            }
+        }
+        if (idx < 0) return null
+        val metaStr = metadatas.optString(idx, "").trim()
+        if (metaStr.isEmpty()) return null
+        return parseTierRoutingDetailsFromTerminalMetadata(metaStr, BEAMIO_USER_CARD_ASSET_ADDRESS)
+    }
+
+    /** 按客户 NFT `tier` 字段匹配 routing 表（取最大折扣率） */
+    private fun pickTierDiscountPercentFromAssets(assets: UIDAssets, tierKeyToDiscount: Map<String, Int>): Int {
+        if (tierKeyToDiscount.isEmpty()) return 0
+        val keys = mutableSetOf<String>()
+        assets.cards?.forEach { c ->
+            c.nfts.forEach { n ->
+                val t = n.tier.trim()
+                if (t.isNotEmpty()) {
+                    keys.add(t)
+                    keys.add(t.lowercase())
+                }
+            }
+        }
+        assets.nfts?.forEach { n ->
+            val t = n.tier.trim()
+            if (t.isNotEmpty()) {
+                keys.add(t)
+                keys.add(t.lowercase())
+            }
+        }
+        var best = 0
+        for (k in keys) {
+            tierKeyToDiscount[k]?.let { best = kotlin.math.max(best, it) }
+            tierKeyToDiscount[k.lowercase()]?.let { best = kotlin.math.max(best, it) }
+        }
+        for (k in keys) {
+            val idx = k.toIntOrNull()
+            if (idx != null) {
+                tierKeyToDiscount["chain-tier-$idx".lowercase()]?.let { best = kotlin.math.max(best, it) }
+            }
+        }
+        return best.coerceIn(0, 100)
     }
 
     /** GET /api/search-users?keyward=... - 解析 results[0] 为 TerminalProfile */
@@ -5120,6 +5497,12 @@ private fun PaymentSuccessContent(
     tierName: String? = null,
     cardType: String? = null,
     settlementViaQr: Boolean = false,
+    /** ScanMethod 页顶栏 overlay 占位，避免 Approved 标题被 Back 栏遮住 */
+    extraTopInset: Dp = 0.dp,
+    /** 与底部 Total 明细一致：税率 % */
+    chargeTaxPercent: Double? = null,
+    /** 与底部 Total 明细一致：等级折扣 % */
+    chargeTierDiscountPercent: Int? = null,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -5141,11 +5524,11 @@ private fun PaymentSuccessContent(
             .verticalScroll(rememberScrollState())
             .background(Color(0xFFf5f5f7))
     ) {
-        // Header: Approved + amount（无顶部 icon）
+        // Header: Approved + amount（无顶部 icon）；Scan 流程下 extraTopInset 与顶栏 overlay 对齐
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 24.dp, bottom = 12.dp),
+                .padding(top = 24.dp + extraTopInset, bottom = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
@@ -5297,6 +5680,55 @@ private fun PaymentSuccessContent(
                                 if (sPrefix.isNotEmpty()) Text(sPrefix, fontSize = 11.sp, color = Color.Black)
                                 Text(sAmt, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
                                 if (sSuffix.isNotEmpty()) Text(sSuffix, fontSize = 11.sp, color = Color.Black)
+                            }
+                        }
+                        val taxP = chargeTaxPercent ?: 0.0
+                        val taxAmt = subtotalNum * taxP / 100.0
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "Tax (${String.format("%.2f", taxP)}%)",
+                                fontSize = 15.sp,
+                                color = Color(0xFF86868b)
+                            )
+                            val (txPrefix, txStr, txSuffix) = formatBalanceWithCurrencyProtocol(taxAmt, currency)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                if (txPrefix.isNotEmpty()) Text(txPrefix, fontSize = 11.sp, color = Color.Black)
+                                Text(txStr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
+                                if (txSuffix.isNotEmpty()) Text(txSuffix, fontSize = 11.sp, color = Color.Black)
+                            }
+                        }
+                        val discP = chargeTierDiscountPercent
+                        val discAmt = if (discP != null) subtotalNum * discP / 100.0 else null
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (discP != null && discP > 0) {
+                                Text(
+                                    "Tier discount ($discP%)",
+                                    fontSize = 15.sp,
+                                    color = Color(0xFF86868b)
+                                )
+                                val (dPrefix, dStr, dSuffix) = formatBalanceWithCurrencyProtocol(discAmt ?: 0.0, currency)
+                                Row(verticalAlignment = Alignment.Bottom) {
+                                    Text("-", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF059669))
+                                    if (dPrefix.isNotEmpty()) Text(dPrefix, fontSize = 11.sp, color = Color(0xFF059669))
+                                    Text(dStr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF059669))
+                                    if (dSuffix.isNotEmpty()) Text(dSuffix, fontSize = 11.sp, color = Color(0xFF059669))
+                                }
+                            } else {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Tier discount", fontSize = 15.sp, color = Color(0xFF86868b))
+                                    Text("Not applied", fontSize = 11.sp, color = Color(0xFF94a3b8))
+                                }
+                                Text("—", fontSize = 15.sp, color = Color(0xFF94a3b8))
                             }
                         }
                         if (tipNum != null && tipNum > 0) {
@@ -5557,6 +5989,8 @@ internal fun PaymentScreen(
     tierName: String? = null,
     cardType: String? = null,
     settlementViaQr: Boolean = false,
+    chargeTaxPercent: Double? = null,
+    chargeTierDiscountPercent: Int? = null,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -5611,6 +6045,9 @@ internal fun PaymentScreen(
                 tierName = tierName,
                 cardType = cardType,
                 settlementViaQr = settlementViaQr,
+                extraTopInset = 0.dp,
+                chargeTaxPercent = chargeTaxPercent,
+                chargeTierDiscountPercent = chargeTierDiscountPercent,
                 onDone = onBack
             )
             is PaymentStatus.Error -> {
@@ -5880,6 +6317,102 @@ private fun HomeDashboardStatLoadingPlaceholder(
 }
 
 @Composable
+private fun HomeDashboardTaxAndTierRoutingRow(
+    taxPercent: Double?,
+    discountSummary: String?,
+    modifier: Modifier = Modifier
+) {
+    SubcomposeLayout(modifier = modifier.fillMaxWidth()) { constraints ->
+        val spacingPx = 8.dp.roundToPx()
+        val taxMeasurable = subcompose("tax") {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(Color(0xFFFFC107).copy(alpha = 0.22f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.Percent,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFFFFC107)
+                    )
+                }
+                Text(
+                    taxPercent?.let { v ->
+                        String.format(java.util.Locale.US, "%.2f%%", v)
+                    } ?: "—",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White.copy(alpha = 0.95f),
+                    maxLines = 1
+                )
+            }
+        }.first()
+        val taxPlaceable = taxMeasurable.measure(
+            Constraints(
+                minWidth = 0,
+                maxWidth = constraints.maxWidth,
+                minHeight = 0,
+                maxHeight = constraints.maxHeight
+            )
+        )
+        val tierMaxW = (constraints.maxWidth - taxPlaceable.width - spacingPx).coerceAtLeast(0)
+        val tierMeasurable = subcompose("tier") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(Color(0xFF1562f0).copy(alpha = 0.22f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.Layers,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = Color(0xFF1562f0)
+                    )
+                }
+                Text(
+                    discountSummary ?: "—",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White.copy(alpha = 0.95f),
+                    maxLines = 1,
+                    softWrap = false,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .basicMarquee()
+                )
+            }
+        }.first()
+        val tierPlaceable = tierMeasurable.measure(
+            Constraints(
+                minWidth = 0,
+                maxWidth = tierMaxW,
+                minHeight = 0,
+                maxHeight = constraints.maxHeight
+            )
+        )
+        val h = maxOf(taxPlaceable.height, tierPlaceable.height)
+        layout(constraints.maxWidth, h) {
+            taxPlaceable.placeRelative(0, (h - taxPlaceable.height) / 2)
+            tierPlaceable.placeRelative(taxPlaceable.width + spacingPx, (h - tierPlaceable.height) / 2)
+        }
+    }
+}
+
+@Composable
 fun NdefScreen(
     uidText: String,
     readUrlText: String,
@@ -5891,6 +6424,10 @@ fun NdefScreen(
     topUpAmount: Double? = null,
     chargeStatsRpcWarning: Boolean = false,
     topUpStatsRpcWarning: Boolean = false,
+    /** From on-chain admin metadata `tierRoutingDiscounts.taxRatePercent`; null until first successful 15s sync */
+    infraRoutingTaxPercent: Double? = null,
+    /** One line: all tier `discountPercent` in JSON order, e.g. `5% · 10% · 18%` */
+    infraRoutingDiscountSummary: String? = null,
     onCopyWalletClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
@@ -6074,6 +6611,11 @@ fun NdefScreen(
                             }
                         }
                     }
+                    HomeDashboardTaxAndTierRoutingRow(
+                        taxPercent = infraRoutingTaxPercent,
+                        discountSummary = infraRoutingDiscountSummary,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
                     // Bottom row: ID + SECURED (compact)
                     Row(
                         modifier = Modifier
@@ -6264,7 +6806,7 @@ internal fun ScanMethodSelectionScreen(
     nfcFetchingInfo: Boolean = false,
     nfcFetchError: String = "",
     qrScanningActive: Boolean = false,
-    /** 仅 payment：解析失败时递增以重建扫码视图，去掉同一段 payload 的 lastText 去重 */
+    /** payment / read：解析失败或需重试时递增以重建 EmbeddedQrScanner */
     embeddedQrResetKey: Int = 0,
     paymentQrInterpreting: Boolean = false,
     paymentQrParseError: String = "",
@@ -6299,9 +6841,14 @@ internal fun ScanMethodSelectionScreen(
     paymentCardName: String? = null,
     paymentTierName: String? = null,
     paymentCardType: String? = null,
+    paymentChargeTaxPercent: Double? = null,
+    paymentChargeTierDiscountPercent: Int? = null,
+    paymentChargeTipBps: Int = 0,
     onPaymentDone: () -> Unit = {},
     onProceed: () -> Unit,
     onProceedNfcStay: (() -> Unit)? = null,
+    /** 中央拉取失败（如读余额）后点击重试；null 时用 onProceedNfcStay */
+    onRetryAfterCentralFetchError: (() -> Unit)? = null,
     onProceedWithQr: (() -> Unit)? = null,
     onQrScanResult: (String) -> Unit = {},
     onCancel: () -> Unit,
@@ -6315,6 +6862,11 @@ internal fun ScanMethodSelectionScreen(
     )
     val showPaymentSuccess = pendingAction == "payment" && paymentStatus is PaymentStatus.Success
     val showPaymentError = pendingAction == "payment" && paymentStatus is PaymentStatus.Error
+    /** 贴卡动画/扫码进行中仍可切换 Tap Card ↔ Scan QR */
+    val showMethodToggle = !showPaymentSuccess && !showPaymentRouting && !showPaymentError &&
+        !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty() &&
+        !(pendingAction == "payment" && paymentQrParseError.isNotEmpty()) &&
+        !(pendingAction == "payment" && paymentQrInterpreting)
 
     Box(
         modifier = modifier
@@ -6351,6 +6903,9 @@ internal fun ScanMethodSelectionScreen(
                         tierName = paymentTierName,
                         cardType = paymentCardType,
                         settlementViaQr = scanMethod == "qr",
+                        extraTopInset = BACK_BUTTON_TOP_BAR_HEIGHT,
+                        chargeTaxPercent = paymentChargeTaxPercent,
+                        chargeTierDiscountPercent = paymentChargeTierDiscountPercent,
                         onDone = onPaymentDone,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -6697,12 +7252,12 @@ internal fun ScanMethodSelectionScreen(
                         }
                     }
                 } else if (nfcFetchError.isNotEmpty()) {
-                    // 拉取失败：在 scanSize 框内显示错误，点击可重试（与 Tap Card 同结构，独立居中）
+                    // 拉取失败：在 scanSize 框内显示错误，点击可重试（读余额+QR 时重新开相机）
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .wrapContentHeight()
-                            .clickable { onProceedNfcStay?.invoke() }
+                            .clickable { (onRetryAfterCentralFetchError ?: onProceedNfcStay)?.invoke() }
                     ) {
                         Card(
                             modifier = Modifier
@@ -6784,7 +7339,7 @@ internal fun ScanMethodSelectionScreen(
                             }
                         }
                     } else {
-                        // Tap Card（payment/read/topup 统一）：正方形区域整块为触发区
+                        // NFC 已改为进入即 arm；此分支仅作极端回退（非 waiting 且非上述状态）
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -6793,10 +7348,7 @@ internal fun ScanMethodSelectionScreen(
                             Card(
                                 modifier = Modifier
                                     .size(scanSize)
-                                    .align(Alignment.Center)
-                                    .clickable(enabled = !scanWaitingForNfc && !nfcFetchingInfo && !topupNfcExecuteInProgress && !topupQrSigningInProgress) {
-                                        onProceedNfcStay?.invoke()
-                                    },
+                                    .align(Alignment.Center),
                                 shape = RoundedCornerShape(32.dp),
                                 colors = CardDefaults.cardColors(containerColor = Color.White),
                                 border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
@@ -6827,10 +7379,7 @@ internal fun ScanMethodSelectionScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(
-                    if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess && !showPaymentRouting && !showPaymentError && !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty())
-                        120.dp
-                    else
-                        BACK_BUTTON_TOP_BAR_HEIGHT
+                    if (showMethodToggle) 120.dp else BACK_BUTTON_TOP_BAR_HEIGHT
                 )
                 .background(Color(0xFFf5f5f7))
                 .align(Alignment.TopCenter)
@@ -6844,7 +7393,7 @@ internal fun ScanMethodSelectionScreen(
                     .align(Alignment.TopStart)
                     .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
             )
-            if (!scanWaitingForNfc && !nfcFetchingInfo && !qrScanningActive && !showPaymentSuccess && !showPaymentRouting && !showPaymentError && !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty()) {
+            if (showMethodToggle) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -6916,8 +7465,101 @@ internal fun ScanMethodSelectionScreen(
                         fontSize = 40.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (pendingAction == "topup") Color(0xFF1562f0) else Color.Black,
-                        modifier = Modifier.padding(bottom = 32.dp)
+                        modifier = Modifier.padding(bottom = 8.dp)
                     )
+                    if (pendingAction == "payment") {
+                        val sub = paymentSubtotal?.toDoubleOrNull() ?: 0.0
+                        val taxP = paymentChargeTaxPercent ?: 0.0
+                        val taxAmt = sub * taxP / 100.0
+                        val tipAmt = paymentTip?.toDoubleOrNull() ?: 0.0
+                        val tipP = paymentChargeTipBps / 100.0
+                        val discP = paymentChargeTierDiscountPercent
+                        val discAmt = if (discP != null) sub * discP / 100.0 else null
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(
+                                "Details (request ${paymentCardCurrency ?: "CAD"})",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFF64748b)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    "Tax (${String.format("%.2f", taxP)}%)",
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF64748b)
+                                )
+                                Text(
+                                    "$${String.format("%.2f", taxAmt)}",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = Color.Black
+                                )
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                if (discP != null) {
+                                    Text(
+                                        "Tier discount ($discP%)",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF64748b)
+                                    )
+                                    Text(
+                                        "-$${String.format("%.2f", discAmt ?: 0.0)}",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color(0xFF059669)
+                                    )
+                                } else {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Tier discount",
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF64748b)
+                                        )
+                                        Text(
+                                            "Present card to apply",
+                                            fontSize = 10.sp,
+                                            color = Color(0xFF94a3b8)
+                                        )
+                                    }
+                                    Text(
+                                        "—",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF94a3b8)
+                                    )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    "Tip (${String.format("%.2f", tipP)}%)",
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF64748b)
+                                )
+                                Text(
+                                    "$${String.format("%.2f", tipAmt)}",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = Color.Black
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(16.dp))
+                    } else {
+                        Spacer(modifier = Modifier.height(24.dp))
+                    }
                 }
             }
         }
