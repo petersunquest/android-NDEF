@@ -330,6 +330,8 @@ class MainActivity : ComponentActivity() {
     private var paymentScreenRoutingSteps by mutableStateOf<List<RoutingStep>>(emptyList())
     private var paymentScreenSubtotal by mutableStateOf("0")
     private var paymentScreenTip by mutableStateOf("0")
+    /** Ledger TransactionMeta.discountRateBps：小费率 bps（如 1800 = 18%），与 nfcTipCurrencyAmount 一并 POST */
+    private var paymentScreenTipRateBps by mutableStateOf(0)
     private var paymentScreenPreBalance by mutableStateOf<String?>(null)
     private var paymentScreenPostBalance by mutableStateOf<String?>(null)
     private var paymentScreenCardCurrency by mutableStateOf<String?>(null)
@@ -948,12 +950,13 @@ class MainActivity : ComponentActivity() {
                             val subtotal = tipScreenSubtotal.toDoubleOrNull() ?: 0.0
                             val tip = subtotal * selectedTipRate
                             val total = subtotal + tip
+                            val tipBps = kotlin.math.round(selectedTipRate * 10000.0).toInt().coerceIn(0, 10000)
                             scanMethodBackTipSubtotal = tipScreenSubtotal
                             scanMethodBackTipRate = selectedTipRate
                             showTipScreen = false
                             tipScreenSubtotal = "0"
                             selectedTipRate = 0.0
-                            startPayment("%.2f".format(total), "%.2f".format(subtotal), "%.2f".format(tip))
+                            startPayment("%.2f".format(total), "%.2f".format(subtotal), "%.2f".format(tip), tipBps)
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1142,6 +1145,7 @@ class MainActivity : ComponentActivity() {
         paymentScreenRoutingSteps = emptyList()
         paymentScreenSubtotal = "0"
         paymentScreenTip = "0"
+        paymentScreenTipRateBps = 0
         paymentScreenPreBalance = null
         paymentScreenPostBalance = null
         paymentScreenCardCurrency = null
@@ -1219,13 +1223,14 @@ class MainActivity : ComponentActivity() {
         readScreenError = ""
     }
 
-    private fun startPayment(amount: String, subtotal: String? = null, tip: String? = null) {
+    private fun startPayment(amount: String, subtotal: String? = null, tip: String? = null, tipRateBps: Int = 0) {
         if (nfcAdapter == null) return
         if (nfcAdapter?.isEnabled != true) return
         resetPaymentScreenState()
         paymentScreenAmount = amount
         paymentScreenSubtotal = subtotal ?: amount
         paymentScreenTip = tip ?: "0"
+        paymentScreenTipRateBps = tipRateBps.coerceIn(0, 10000)
         paymentScreenPayee = BeamioWeb3Wallet.getAddress()
         pendingScanAction = "payment"
         scanMethodState = "nfc"
@@ -2051,7 +2056,18 @@ class MainActivity : ComponentActivity() {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = payByNfcUidWithContainer(effectiveUid, amountUsdc6, payee, assets, oracle, sunParams)
+                val result = payByNfcUidWithContainer(
+                    effectiveUid,
+                    amountUsdc6,
+                    payee,
+                    assets,
+                    oracle,
+                    sunParams,
+                    nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
+                    nfcTipCurrencyAmount = paymentScreenTip,
+                    nfcTipRateBps = paymentScreenTipRateBps,
+                    nfcRequestCurrency = "CAD"
+                )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 if (!result.success) {
@@ -2505,7 +2521,18 @@ class MainActivity : ComponentActivity() {
     }
 
     /** 新流程：Android 自行 Smart Routing 构建 container，服务端仅签名并 relay。CCSA + 基础设施卡均可扣款。NFC 格式(14 位 hex uid)时需传 sunParams(e,c,m) 做 SUN 校验。 */
-    private fun payByNfcUidWithContainer(uid: String, amountUsdc6: String, payee: String, assets: UIDAssets, oracle: OracleRates, sunParams: SunParams? = null): PayByNfcResult {
+    private fun payByNfcUidWithContainer(
+        uid: String,
+        amountUsdc6: String,
+        payee: String,
+        assets: UIDAssets,
+        oracle: OracleRates,
+        sunParams: SunParams? = null,
+        nfcSubtotalCurrencyAmount: String? = null,
+        nfcTipCurrencyAmount: String? = null,
+        nfcTipRateBps: Int = 0,
+        nfcRequestCurrency: String = "CAD"
+    ): PayByNfcResult {
         val amountBig = amountUsdc6.toLongOrNull() ?: 0L
         if (amountBig <= 0) return PayByNfcResult(false, null, "Invalid amountUsdc6")
         val prepare = payByNfcUidPrepare(uid, payee, amountUsdc6, sunParams)
@@ -2623,7 +2650,16 @@ class MainActivity : ComponentActivity() {
             put("nonce", nonce)
             put("deadline", deadline)
         }
-        return payByNfcUidSignContainer(uid, containerPayload, amountUsdc6, sunParams)
+        return payByNfcUidSignContainer(
+            uid,
+            containerPayload,
+            amountUsdc6,
+            sunParams,
+            nfcSubtotalCurrencyAmount,
+            nfcTipCurrencyAmount,
+            nfcTipRateBps,
+            nfcRequestCurrency
+        )
     }
 
     private fun payByNfcUidPrepare(uid: String, payee: String, amountUsdc6: String, sunParams: SunParams? = null): Map<String, Any?> {
@@ -2661,7 +2697,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun payByNfcUidSignContainer(uid: String, containerPayload: org.json.JSONObject, amountUsdc6: String, sunParams: SunParams? = null): PayByNfcResult {
+    private fun payByNfcUidSignContainer(
+        uid: String,
+        containerPayload: org.json.JSONObject,
+        amountUsdc6: String,
+        sunParams: SunParams? = null,
+        nfcSubtotalCurrencyAmount: String? = null,
+        nfcTipCurrencyAmount: String? = null,
+        nfcTipRateBps: Int = 0,
+        nfcRequestCurrency: String = "CAD"
+    ): PayByNfcResult {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/payByNfcUidSignContainer")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2675,6 +2720,15 @@ class MainActivity : ComponentActivity() {
                 put("containerPayload", containerPayload)
                 put("amountUsdc6", amountUsdc6)
                 sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+                nfcSubtotalCurrencyAmount?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcSubtotalCurrencyAmount", it) }
+                nfcTipCurrencyAmount?.trim()?.takeIf { it.isNotEmpty() }?.let { tip ->
+                    val tipNum = tip.toDoubleOrNull() ?: 0.0
+                    if (tipNum > 0) {
+                        put("nfcTipCurrencyAmount", tip)
+                        if (nfcTipRateBps > 0) put("nfcTipRateBps", nfcTipRateBps)
+                    }
+                }
+                put("nfcRequestCurrency", nfcRequestCurrency.trim().ifEmpty { "CAD" })
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
