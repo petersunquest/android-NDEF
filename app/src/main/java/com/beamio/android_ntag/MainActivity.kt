@@ -283,6 +283,9 @@ internal fun filterPaymentRoutingStepsForDisplay(steps: List<RoutingStep>): List
 /**
  * Charge total in request/card currency (no USDC conversion here).
  * total = requestAmount + (taxPercent/100)*requestAmount - (discountPercent/100)*requestAmount + tipAmount
+ *
+ * [tipAmount] should be the absolute tip in the same currency, typically
+ * `(requestAmount * (1 - tierDiscount%/100)) * tipRate` — use [chargeTipAmountAfterTierDiscountBps].
  */
 private fun chargeTotalInCurrency(
     requestAmount: Double,
@@ -294,6 +297,31 @@ private fun chargeTotalInCurrency(
     val disc = requestAmount * ((tierDiscountPercent ?: 0).toDouble() / 100.0)
     return requestAmount + tax - disc + tipAmount
 }
+
+/**
+ * Tip = (request − discount on request) × tip rate = request × (1 − tierDiscount%/100) × tipRate.
+ * [tierDiscountPercent] is the applied tier % on the request (same as Smart Routing).
+ */
+private fun chargeTipAmountAfterTierDiscount(
+    requestAmount: Double,
+    tierDiscountPercent: Int?,
+    tipRateFraction: Double
+): Double {
+    val discPct = (tierDiscountPercent ?: 0).coerceIn(0, 100).toDouble()
+    val tipBase = requestAmount * (1.0 - discPct / 100.0)
+    return tipBase * tipRateFraction.coerceIn(0.0, 1.0)
+}
+
+private fun chargeTipAmountAfterTierDiscountBps(
+    requestAmount: Double,
+    tierDiscountPercent: Int?,
+    tipRateBps: Int
+): Double =
+    chargeTipAmountAfterTierDiscount(
+        requestAmount,
+        tierDiscountPercent,
+        tipRateBps.coerceIn(0, 10000) / 10000.0
+    )
 
 class MainActivity : ComponentActivity() {
     private companion object {
@@ -1035,7 +1063,8 @@ class MainActivity : ComponentActivity() {
                         },
                         onConfirmPay = {
                             val subtotal = tipScreenSubtotal.toDoubleOrNull() ?: 0.0
-                            val tip = subtotal * selectedTipRate
+                            // 预览时尚无客户卡 tier：折扣按 0；实扣在 executePayment/executeQr 按真实 tier 重算 tip
+                            val tip = chargeTipAmountAfterTierDiscount(subtotal, null, selectedTipRate)
                             val taxP = dashboardInfraTaxPercent ?: 0.0
                             val total = chargeTotalInCurrency(subtotal, taxP, null, tip)
                             val tipBps = kotlin.math.round(selectedTipRate * 10000.0).toInt().coerceIn(0, 10000)
@@ -2174,7 +2203,8 @@ class MainActivity : ComponentActivity() {
                 val discFiat6Str = kotlin.math.round(discAmtCad * 1_000_000.0).toLong().toString()
                 val taxBpsResolved = kotlin.math.round(taxPctResolved * 100.0).toInt().coerceIn(0, 10000)
                 val discBpsResolved = (tierDiscPct * 100).coerceIn(0, 10000)
-                val tipPay = paymentScreenTip.toDoubleOrNull() ?: 0.0
+                val tipPay = chargeTipAmountAfterTierDiscountBps(subtotalPay, tierDiscPct, paymentScreenTipRateBps)
+                val tipStrForNfc = "%.2f".format(tipPay)
                 val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrency = chargeTotalInCurrency(subtotalPay, taxPctResolved, tierDiscPct, tipPay)
                 val amountUsdc6 = currencyToUsdc6(totalCurrency, payCurrency, oracle)
@@ -2191,6 +2221,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     paymentChargeBreakdownTaxPercent = taxPctResolved
                     paymentChargeBreakdownTierDiscountPercent = tierDiscPct
+                    paymentScreenTip = tipStrForNfc
                     paymentScreenAmount = "%.2f".format(totalCurrency)
                     paymentScreenCardCurrency = payCurrency
                     paymentScreenMemberNo = paymentMemberNo.ifEmpty { null }
@@ -2243,7 +2274,7 @@ class MainActivity : ComponentActivity() {
                     oracle,
                     sunParams,
                     nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
-                    nfcTipCurrencyAmount = paymentScreenTip,
+                    nfcTipCurrencyAmount = tipStrForNfc,
                     nfcTipRateBps = paymentScreenTipRateBps,
                     nfcRequestCurrency = payCurrency,
                     nfcTaxAmountFiat6 = taxFiat6Str,
@@ -2355,8 +2386,8 @@ class MainActivity : ComponentActivity() {
                 val routingDetailsQr = fetchTierRoutingDetailsForTerminalWalletSync(payeeWalletTerminal)
                 val taxPctQr = routingDetailsQr?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
                 val tierDiscQr = pickTierDiscountPercentFromAssets(assets, routingDetailsQr?.discountByTierKey ?: emptyMap())
-                val tipQr = paymentScreenTip.toDoubleOrNull() ?: 0.0
                 val requestQr = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                val tipQr = chargeTipAmountAfterTierDiscountBps(requestQr, tierDiscQr, paymentScreenTipRateBps)
                 val taxAmtCadQr = requestQr * taxPctQr / 100.0
                 val discAmtCadQr = requestQr * tierDiscQr / 100.0
                 val taxFiat6StrQr = kotlin.math.round(taxAmtCadQr * 1_000_000.0).toLong().toString()
@@ -2511,6 +2542,7 @@ class MainActivity : ComponentActivity() {
                     paymentScreenTierName = qrPaymentCard?.tierName
                     paymentScreenCardType = qrPaymentCard?.cardType
                     paymentScreenPayee = toAddr
+                    paymentScreenTip = "%.2f".format(tipQr)
                     paymentScreenAmount = "%.2f".format(totalCurrencyQr)
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
                     paymentScreenCardCurrency = payCurrencyQr
@@ -2520,7 +2552,7 @@ class MainActivity : ComponentActivity() {
                 val currencyAmountStr = "%.2f".format(totalCurrencyQr)
                 // 与 payByNfcUidWithContainer 一致：小计/小费用屏幕原始字符串，税/折扣 fiat6+bps 与 NFC 相同算法
                 val subtotalStrForBill = paymentScreenSubtotal.trim().ifEmpty { "%.2f".format(requestQr) }
-                val tipStrForBill = paymentScreenTip.trim().ifEmpty { "0" }
+                val tipStrForBill = "%.2f".format(tipQr)
                 val qrChargeBill = OpenContainerChargeBillFields(
                     subtotal = subtotalStrForBill,
                     tip = tipStrForBill,
@@ -7589,17 +7621,17 @@ internal fun ScanMethodSelectionScreen(
             }
         }
 
-        // Bottom overlay: Total amount (when applicable)
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFFf5f5f7))
-                .align(Alignment.BottomCenter)
-                .padding(24.dp)
-        ) {
-            if (pendingAction != "read" && !showPaymentSuccess &&
-                (pendingAction != "payment" && totalAmount.isNotBlank() ||
-                    pendingAction == "payment" && (bottomTotalDisplay > 0.0 || totalAmount.isNotBlank()))
+        // Bottom overlay: Total amount（仅在有内容时绘制；Approved 时不可留空 Column+background，否则会挡住 PaymentSuccessContent 底栏）
+        val showBottomTotalOverlay = pendingAction != "read" && !showPaymentSuccess &&
+            (pendingAction != "payment" && totalAmount.isNotBlank() ||
+                pendingAction == "payment" && (bottomTotalDisplay > 0.0 || totalAmount.isNotBlank()))
+        if (showBottomTotalOverlay) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFf5f5f7))
+                    .align(Alignment.BottomCenter)
+                    .padding(24.dp)
             ) {
                 Column(
                     modifier = Modifier.fillMaxWidth(),
@@ -7634,15 +7666,17 @@ fun TipSelectionScreen(
     subtotal: String,
     selectedTipRate: Double,
     chargeTaxPercent: Double? = null,
+    /** 选小费页通常尚无客户卡：传 null；若将来有预览折扣可传入与 Smart Routing 一致的 tier % */
+    chargeTierDiscountPercent: Int? = null,
     onTipRateSelect: (Double) -> Unit,
     onBack: () -> Unit,
     onConfirmPay: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val numAmount = subtotal.toDoubleOrNull() ?: 0.0
-    val tipValue = numAmount * selectedTipRate
+    val tipValue = chargeTipAmountAfterTierDiscount(numAmount, chargeTierDiscountPercent, selectedTipRate)
     val taxP = chargeTaxPercent ?: 0.0
-    val totalAmount = chargeTotalInCurrency(numAmount, taxP, null, tipValue)
+    val totalAmount = chargeTotalInCurrency(numAmount, taxP, chargeTierDiscountPercent, tipValue)
     Column(
         modifier = modifier
             .fillMaxSize()
