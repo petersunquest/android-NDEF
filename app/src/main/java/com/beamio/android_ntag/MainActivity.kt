@@ -1982,8 +1982,17 @@ class MainActivity : ComponentActivity() {
 
     private fun executeWalletTopupInternal(wallet: String, amount: String, prepare: NfcTopupPrepareResult) {
         try {
-                // 1. Topup 之前先拉取余额，对齐后端 400/404/500 返回码
-                val preAssets = fetchWalletAssetsSync(wallet)
+                // 1. Pull balance first; if EOA has no AA yet, ensure AA then retry once (QR / beamioTag topup).
+                var preAssets = fetchWalletAssetsSync(wallet)
+                if (preAssets == null || !preAssets.ok) {
+                    Log.d(
+                        "Topup",
+                        "[Topup Debug] getWalletAssets first try failed wallet=$wallet err=${preAssets?.error} — ensureAAForEOA"
+                    )
+                    if (ensureAaForEoaSync(wallet)) {
+                        preAssets = fetchWalletAssetsSync(wallet)
+                    }
+                }
                 if (preAssets == null || !preAssets.ok) {
                     runOnUiThread { applyTopupQrScanScreenError(preAssets?.error ?: "Query failed") }
                     return
@@ -3344,6 +3353,43 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }.start()
+    }
+
+    /**
+     * GET /api/ensureAAForEOA — Master queues createAccountFor when EOA has no deployed AA.
+     * Used after getWalletAssets fails (e.g. 404) so QR topup can proceed once AA exists.
+     */
+    private fun ensureAaForEoaSync(eoa: String): Boolean {
+        val trimmed = eoa.trim()
+        if (trimmed.isEmpty() || !trimmed.startsWith("0x", ignoreCase = true)) return false
+        return try {
+            val url = java.net.URL(
+                "$BEAMIO_API/api/ensureAAForEOA?eoa=${java.net.URLEncoder.encode(trimmed, "UTF-8")}"
+            )
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 30000
+            conn.readTimeout = 120000
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.use { it.bufferedReader().readText() }
+                .orEmpty()
+            conn.disconnect()
+            val root = parseBeamioApiJsonObject(resp, code)
+            if (root == null || code !in 200..299) {
+                Log.w("Topup", "ensureAaForEoaSync failed HTTP=$code")
+                return false
+            }
+            val aa = root.optString("aa")
+            val ok = aa.isNotEmpty()
+            if (ok) Log.d("Topup", "ensureAaForEoaSync OK aa=$aa")
+            else Log.w("Topup", "ensureAaForEoaSync: no aa in JSON body")
+            ok
+        } catch (e: Exception) {
+            Log.e("MainActivity", "ensureAaForEoaSync", e)
+            false
+        }
     }
 
     /** @param forPostPayment 若为 true，请求体带 for=postPaymentBalance，便于服务端日志区分扣款后拉取 */
