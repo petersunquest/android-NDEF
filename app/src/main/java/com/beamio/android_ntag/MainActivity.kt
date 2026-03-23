@@ -128,6 +128,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.Crossfade
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import androidx.compose.ui.Modifier
@@ -3122,6 +3123,26 @@ class MainActivity : ComponentActivity() {
         val redeemOnChain: Boolean = false
     )
 
+    /** API may return HTML error pages (e.g. 502 from proxy); avoid JSONObject crashing on `<!DOCTYPE...`. */
+    private fun parseBeamioApiJsonObject(raw: String?, httpCode: Int): org.json.JSONObject? {
+        val t = raw?.trim().orEmpty()
+        if (t.isEmpty()) {
+            Log.w("MainActivity", "Empty API body (HTTP $httpCode)")
+            return null
+        }
+        val first = t.firstOrNull { !it.isWhitespace() }
+        if (first != '{' && first != '[') {
+            Log.w("MainActivity", "Non-JSON API body (HTTP $httpCode): ${t.take(240)}")
+            return null
+        }
+        return try {
+            org.json.JSONObject(t)
+        } catch (e: org.json.JSONException) {
+            Log.w("MainActivity", "JSON parse error (HTTP $httpCode): ${e.message}; snippet=${t.take(280)}")
+            null
+        }
+    }
+
     /** POST /api/nfcLinkApp：SUN 已由 Cluster 预检；返回 deepLinkUrl 供展示 QR */
     private fun postNfcLinkApp(sun: SunParams): NfcLinkAppResult {
         return try {
@@ -3129,6 +3150,7 @@ class MainActivity : ComponentActivity() {
             val conn = url.openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json")
             conn.doOutput = true
             conn.connectTimeout = 30000
             conn.readTimeout = 120000
@@ -3141,9 +3163,19 @@ class MainActivity : ComponentActivity() {
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
-            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
             conn.disconnect()
-            val root = org.json.JSONObject(resp)
+            val root = parseBeamioApiJsonObject(resp, code)
+            if (root == null) {
+                val httpOk = code in 200..299
+                return NfcLinkAppResult(
+                    success = false,
+                    deepLinkUrl = null,
+                    error = if (httpOk) "Invalid response from server." else "Request failed (HTTP $code).",
+                    errorCode = null,
+                    redeemOnChain = false
+                )
+            }
             val okBody = root.optBoolean("success", false)
             val deep = root.optString("deepLinkUrl").takeIf { it.isNotEmpty() }
             val err = root.optString("error").takeIf { it.isNotEmpty() }
@@ -3173,6 +3205,7 @@ class MainActivity : ComponentActivity() {
             val conn = url.openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json")
             conn.doOutput = true
             conn.connectTimeout = 30000
             conn.readTimeout = 120000
@@ -3184,9 +3217,10 @@ class MainActivity : ComponentActivity() {
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
-            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
             conn.disconnect()
-            val root = org.json.JSONObject(resp)
+            val root = parseBeamioApiJsonObject(resp, code)
+                ?: return NfcLinkAppCancelResult(false, if (code in 200..299) "Invalid response from server." else "Request failed (HTTP $code).")
             val ok = code in 200..299 && root.optBoolean("success", false)
             val err = root.optString("error").takeIf { it.isNotEmpty() }
             NfcLinkAppCancelResult(ok, err)
@@ -7362,7 +7396,9 @@ internal fun ScanMethodSelectionScreen(
         BoxWithConstraints(
             modifier = Modifier.fillMaxSize()
         ) {
-            val scanSize = minOf(280.dp, maxHeight - 64.dp).coerceIn(160.dp, 280.dp)
+            val bcMaxWidth = maxWidth
+            val bcMaxHeight = maxHeight
+            val scanSize = minOf(280.dp, bcMaxHeight - 64.dp).coerceIn(160.dp, 280.dp)
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
@@ -7539,60 +7575,112 @@ internal fun ScanMethodSelectionScreen(
                         }
                     }
                 } else if (pendingAction == "linkApp" && linkAppDeepLinkUrl.isNotEmpty()) {
+                    var linkUrlCopied by remember(linkAppDeepLinkUrl) { mutableStateOf(false) }
+                    LaunchedEffect(linkUrlCopied) {
+                        if (!linkUrlCopied) return@LaunchedEffect
+                        delay(2000)
+                        linkUrlCopied = false
+                    }
+                    val linkPillShape = RoundedCornerShape(999.dp)
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .wrapContentHeight()
                     ) {
-                        Card(
-                            modifier = Modifier
-                                .size(scanSize)
-                                .align(Alignment.Center),
-                            shape = RoundedCornerShape(32.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White),
-                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .verticalScroll(rememberScrollState())
-                                    .padding(16.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally
+                            Card(
+                                modifier = Modifier.size(scanSize),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
                             ) {
-                                Text(
-                                    "Link ready",
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = Color.Black
-                                )
-                                Text(
-                                    "Customer opens Beamio app with this link",
-                                    fontSize = 12.sp,
-                                    color = Color(0xFF86868b),
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
-                                )
-                                linkAppQrBitmap?.let { bmp ->
-                                    Image(
-                                        bitmap = bmp.asImageBitmap(),
-                                        contentDescription = "Link app QR",
-                                        modifier = Modifier
-                                            .size(200.dp)
-                                            .padding(vertical = 8.dp)
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        "Link ready",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.Black
+                                    )
+                                    Text(
+                                        "Customer opens Beamio app with this link",
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF86868b),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
+                                    )
+                                    linkAppQrBitmap?.let { bmp ->
+                                        Image(
+                                            bitmap = bmp.asImageBitmap(),
+                                            contentDescription = "Link app QR",
+                                            modifier = Modifier
+                                                .size(198.dp)
+                                                .padding(vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier
+                                    .width(scanSize)
+                                    .clip(linkPillShape)
+                                    .background(Color.White, linkPillShape)
+                                    .border(1.dp, Color.Black.copy(alpha = 0.12f), linkPillShape)
+                                    .clickable {
+                                        onCopyLinkAppUrl()
+                                        linkUrlCopied = true
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Link URL",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFF86868b)
+                                    )
+                                    Text(
+                                        text = linkAppDeepLinkUrl,
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF1562f0),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(top = 2.dp)
                                     )
                                 }
-                                Text(
-                                    linkAppDeepLinkUrl,
-                                    fontSize = 10.sp,
-                                    color = Color(0xFF1562f0),
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.padding(vertical = 8.dp)
-                                )
-                                Button(
-                                    onClick = onCopyLinkAppUrl,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text("Copy link")
+                                Crossfade(
+                                    targetState = linkUrlCopied,
+                                    label = "linkUrlCopyIcon"
+                                ) { copied ->
+                                    if (copied) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = "Copied",
+                                            tint = Color(0xFF22c55e),
+                                            modifier = Modifier
+                                                .padding(start = 8.dp)
+                                                .size(22.dp)
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Filled.ContentCopy,
+                                            contentDescription = "Copy link",
+                                            tint = Color(0xFF1562f0),
+                                            modifier = Modifier
+                                                .padding(start = 8.dp)
+                                                .size(22.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
