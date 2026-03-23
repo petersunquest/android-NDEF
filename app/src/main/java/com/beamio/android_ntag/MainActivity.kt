@@ -31,6 +31,11 @@ import android.view.View
 import android.graphics.pdf.PdfDocument
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -45,6 +50,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -105,6 +111,7 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.automirrored.filled.Label
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -124,6 +131,7 @@ import androidx.compose.animation.core.tween
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.Alignment
@@ -135,6 +143,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
@@ -153,7 +162,6 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.tooling.preview.Preview
 import coil.compose.AsyncImage
 import com.beamio.android_ntag.ui.theme.AndroidNTAGTheme
-import com.google.zxing.BarcodeFormat
 import com.journeyapps.barcodescanner.BarcodeCallback
 import com.journeyapps.barcodescanner.BarcodeResult
 import com.journeyapps.barcodescanner.DecoratedBarcodeView
@@ -284,8 +292,8 @@ internal fun filterPaymentRoutingStepsForDisplay(steps: List<RoutingStep>): List
  * Charge total in request/card currency (no USDC conversion here).
  * total = requestAmount + (taxPercent/100)*requestAmount - (discountPercent/100)*requestAmount + tipAmount
  *
- * [tipAmount] should be the absolute tip in the same currency, typically
- * `(requestAmount * (1 - tierDiscount%/100)) * tipRate` — use [chargeTipAmountAfterTierDiscountBps].
+ * [tipAmount] is the absolute tip in the same currency; tip is computed on **full request** (pre-discount):
+ * `requestAmount * tipRate` — use [chargeTipFromRequestAndBps].
  */
 private fun chargeTotalInCurrency(
     requestAmount: Double,
@@ -298,30 +306,13 @@ private fun chargeTotalInCurrency(
     return requestAmount + tax - disc + tipAmount
 }
 
-/**
- * Tip = (request − discount on request) × tip rate = request × (1 − tierDiscount%/100) × tipRate.
- * [tierDiscountPercent] is the applied tier % on the request (same as Smart Routing).
- */
-private fun chargeTipAmountAfterTierDiscount(
-    requestAmount: Double,
-    tierDiscountPercent: Int?,
-    tipRateFraction: Double
-): Double {
-    val discPct = (tierDiscountPercent ?: 0).coerceIn(0, 100).toDouble()
-    val tipBase = requestAmount * (1.0 - discPct / 100.0)
-    return tipBase * tipRateFraction.coerceIn(0.0, 1.0)
-}
+/** Tip on full request (before tier discount): tip = requestAmount × tipRate (0..1). */
+private fun chargeTipFromRequestAndRate(requestAmount: Double, tipRateFraction: Double): Double =
+    requestAmount * tipRateFraction.coerceIn(0.0, 1.0)
 
-private fun chargeTipAmountAfterTierDiscountBps(
-    requestAmount: Double,
-    tierDiscountPercent: Int?,
-    tipRateBps: Int
-): Double =
-    chargeTipAmountAfterTierDiscount(
-        requestAmount,
-        tierDiscountPercent,
-        tipRateBps.coerceIn(0, 10000) / 10000.0
-    )
+/** Tip on full request: tip = requestAmount × (tipRateBps / 10000). */
+private fun chargeTipFromRequestAndBps(requestAmount: Double, tipRateBps: Int): Double =
+    requestAmount * (tipRateBps.coerceIn(0, 10000) / 10000.0)
 
 class MainActivity : ComponentActivity() {
     private companion object {
@@ -396,6 +387,8 @@ class MainActivity : ComponentActivity() {
     private var paymentScreenTierName by mutableStateOf<String?>(null)
     private var paymentScreenCardType by mutableStateOf<String?>(null)
     private var paymentScreenMemberNo by mutableStateOf<String?>(null)
+    /** Charge 选小费页填写的桌号，随成功页 / 打印收据展示 */
+    private var paymentScreenTableNumber by mutableStateOf("")
     private var paymentArmed by mutableStateOf(false)
     private var paymentViaQr by mutableStateOf(false)
     private val cardMetadataTierCache = mutableMapOf<String, List<MetadataTier>>()
@@ -410,6 +403,12 @@ class MainActivity : ComponentActivity() {
     private var topupAmount by mutableStateOf("")
     private var paymentAmount by mutableStateOf("")
     private var readArmed by mutableStateOf(false)
+    private var linkAppArmed by mutableStateOf(false)
+    /** Link App 成功后展示的深链（含 nftRedeemcode 等 query） */
+    private var linkAppDeepLinkUrl by mutableStateOf("")
+    /** 409 NFC_LINK_APP_CARD_LOCKED：保留本次 SUN，供 Cancel link lock 调用 /api/nfcLinkAppCancel */
+    private var linkAppLastSunForCancel: SunParams? by mutableStateOf(null)
+    private var linkAppCancelInProgress by mutableStateOf(false)
     private var initArmed by mutableStateOf(false)
     private var initTemplateArmed by mutableStateOf(false)
     private var showWelcomePage by mutableStateOf(false)
@@ -420,13 +419,14 @@ class MainActivity : ComponentActivity() {
     private var showTipScreen by mutableStateOf(false)
     private var tipScreenSubtotal by mutableStateOf("0")
     private var selectedTipRate by mutableStateOf(0.0) // 0, 0.15, 0.18, 0.20
+    private var chargeTableNumber by mutableStateOf("")
     private var showScanMethodScreen by mutableStateOf(false)
     private var scanMethodState by mutableStateOf("nfc") // "nfc" | "qr"
     /** NFC 模式下为 true 时显示中央扫描线动画并已 arm read/topup/payment；进入选方式页或切回 Tap Card 时自动置 true */
     private var scanWaitingForNfc by mutableStateOf(false)
     private var nfcFetchingInfo by mutableStateOf(false) // 已获 UID，正在拉取信息，不跳新页
     private var nfcFetchError by mutableStateOf("") // 拉取失败时在 280.dp 框内显示
-    private var pendingScanAction by mutableStateOf("read") // "read" | "payment" | "topup"
+    private var pendingScanAction by mutableStateOf("read") // "read" | "payment" | "topup" | "linkApp"
     private var scanMethodBackTipSubtotal by mutableStateOf("0")
     private var scanMethodBackTipRate by mutableStateOf(0.0)
     private var showInitFlowScreen by mutableStateOf(false)
@@ -684,6 +684,10 @@ class MainActivity : ComponentActivity() {
                         readQrDecodeResetKey++
                         qrScanningActive = false
                     }
+                    if (pendingScanAction == "linkApp" && showScanMethodScreen) {
+                        nfcFetchError = "Use NFC to scan the customer card."
+                        qrScanningActive = false
+                    }
                     return
                 }
                 when (pendingScanAction) {
@@ -708,6 +712,10 @@ class MainActivity : ComponentActivity() {
                         } else {
                             fetchWalletAssets(wallet!!)
                         }
+                    }
+                    "linkApp" -> {
+                        qrScanningActive = false
+                        uidText = "Use NFC to scan the customer card"
                     }
                     "topup" -> {
                         if (beamioTab == null && wallet == null) {
@@ -859,6 +867,9 @@ class MainActivity : ComponentActivity() {
                         showTopupScreen = true
                     }
                 }
+                val linkAppQrBitmap = androidx.compose.runtime.remember(linkAppDeepLinkUrl) {
+                    if (linkAppDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(linkAppDeepLinkUrl)
+                }
                 when {
                     showWelcomePage -> WelcomePage(
                         versionName = BuildConfig.VERSION_NAME ?: "1.0",
@@ -905,6 +916,18 @@ class MainActivity : ComponentActivity() {
                         scanWaitingForNfc = scanWaitingForNfc,
                         nfcFetchingInfo = nfcFetchingInfo,
                         nfcFetchError = nfcFetchError,
+                        hideMethodToggle = pendingScanAction == "linkApp",
+                        linkAppDeepLinkUrl = linkAppDeepLinkUrl,
+                        linkAppQrBitmap = linkAppQrBitmap,
+                        onCopyLinkAppUrl = {
+                            if (linkAppDeepLinkUrl.isNotEmpty()) {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("beamio-link-app", linkAppDeepLinkUrl))
+                            }
+                        },
+                        linkAppLockedShowCancel = pendingScanAction == "linkApp" && linkAppLastSunForCancel != null && nfcFetchError.isNotEmpty(),
+                        linkAppCancelInProgress = linkAppCancelInProgress,
+                        onLinkAppCancelLock = { runLinkAppCancelLock() },
                         topupQrSigningInProgress = topupQrSigningInProgress,
                         topupNfcExecuteInProgress = topupNfcExecuteInProgress,
                         topupExecuteUidDisplay = topupScreenUid,
@@ -966,6 +989,7 @@ class MainActivity : ComponentActivity() {
                         paymentChargeTaxPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTaxPercent else null,
                         paymentChargeTierDiscountPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTierDiscountPercent else null,
                         paymentChargeTipBps = if (pendingScanAction == "payment") paymentScreenTipRateBps else 0,
+                        paymentTableNumber = if (pendingScanAction == "payment") paymentScreenTableNumber else "",
                         onPaymentDone = {
                             showScanMethodScreen = false
                             showTipScreen = false
@@ -975,6 +999,7 @@ class MainActivity : ComponentActivity() {
                             nfcFetchingInfo = false
                             nfcFetchError = ""
                             paymentArmed = false
+                            chargeTableNumber = ""
                             resetPaymentScreenState()
                         },
                         onProceed = { proceedFromScanMethod() },
@@ -993,6 +1018,7 @@ class MainActivity : ComponentActivity() {
                             topupQrSigningInProgress = false
                             topupQrExecuteError = ""
                             readArmed = false
+                            linkAppArmed = false
                             topupArmed = false
                             paymentArmed = false
                             showScanMethodScreen = false
@@ -1001,6 +1027,11 @@ class MainActivity : ComponentActivity() {
                             when (pendingScanAction) {
                                 "payment" -> resetPaymentScreenState()
                                 "topup" -> resetTopupScreenState()
+                                "linkApp" -> {
+                                    linkAppDeepLinkUrl = ""
+                                    linkAppLastSunForCancel = null
+                                    linkAppCancelInProgress = false
+                                }
                                 else -> resetReadScreenState()
                             }
                         },
@@ -1054,7 +1085,8 @@ class MainActivity : ComponentActivity() {
                     showTipScreen -> TipSelectionScreen(
                         subtotal = tipScreenSubtotal,
                         selectedTipRate = selectedTipRate,
-                        chargeTaxPercent = dashboardInfraTaxPercent,
+                        tableNumber = chargeTableNumber,
+                        onTableNumberChange = { chargeTableNumber = it },
                         onTipRateSelect = { r -> selectedTipRate = r },
                         onBack = {
                             showTipScreen = false
@@ -1064,7 +1096,7 @@ class MainActivity : ComponentActivity() {
                         onConfirmPay = {
                             val subtotal = tipScreenSubtotal.toDoubleOrNull() ?: 0.0
                             // 预览时尚无客户卡 tier：折扣按 0；实扣在 executePayment/executeQr 按真实 tier 重算 tip
-                            val tip = chargeTipAmountAfterTierDiscount(subtotal, null, selectedTipRate)
+                            val tip = chargeTipFromRequestAndRate(subtotal, selectedTipRate)
                             val taxP = dashboardInfraTaxPercent ?: 0.0
                             val total = chargeTotalInCurrency(subtotal, taxP, null, tip)
                             val tipBps = kotlin.math.round(selectedTipRate * 10000.0).toInt().coerceIn(0, 10000)
@@ -1098,6 +1130,7 @@ class MainActivity : ComponentActivity() {
                         settlementViaQr = paymentViaQr,
                         chargeTaxPercent = paymentChargeBreakdownTaxPercent,
                         chargeTierDiscountPercent = paymentChargeBreakdownTierDiscountPercent,
+                        tableNumber = paymentScreenTableNumber.takeIf { it.isNotBlank() },
                         onBack = { closePaymentScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1118,6 +1151,7 @@ class MainActivity : ComponentActivity() {
                                 cm?.setPrimaryClip(ClipData.newPlainText("wallet", BeamioWeb3Wallet.getAddress()))
                             }
                         },
+                        onLinkAppClick = { startLinkAppFlow() },
                         onReadClick = { startReadUid() },
                         onTopupClick = {
                             amountInput = "0"
@@ -1157,6 +1191,7 @@ class MainActivity : ComponentActivity() {
                                 cm?.setPrimaryClip(ClipData.newPlainText("wallet", BeamioWeb3Wallet.getAddress()))
                             }
                         },
+                        onLinkAppClick = { startLinkAppFlow() },
                         onReadClick = { startReadUid() },
                         onTopupClick = {
                             amountInput = "0"
@@ -1200,6 +1235,25 @@ class MainActivity : ComponentActivity() {
         }
         resetReadScreenState()
         pendingScanAction = "read"
+        scanMethodState = "nfc"
+        showScanMethodScreen = true
+        syncScanMethodEntryAndTabs()
+    }
+
+    private fun startLinkAppFlow() {
+        if (nfcAdapter == null) {
+            uidText = "Device does not support NFC"
+            return
+        }
+        if (nfcAdapter?.isEnabled != true) {
+            uidText = "Please enable NFC first"
+            return
+        }
+        linkAppDeepLinkUrl = ""
+        nfcFetchError = ""
+        linkAppLastSunForCancel = null
+        linkAppCancelInProgress = false
+        pendingScanAction = "linkApp"
         scanMethodState = "nfc"
         showScanMethodScreen = true
         syncScanMethodEntryAndTabs()
@@ -1282,6 +1336,7 @@ class MainActivity : ComponentActivity() {
         paymentScreenTierName = null
         paymentScreenCardType = null
         paymentScreenMemberNo = null
+        paymentScreenTableNumber = ""
         paymentQrInterpreting = false
         paymentQrParseError = ""
     }
@@ -1361,6 +1416,7 @@ class MainActivity : ComponentActivity() {
         paymentScreenPayee = BeamioWeb3Wallet.getAddress()
         paymentChargeBreakdownTaxPercent = dashboardInfraTaxPercent
         paymentChargeBreakdownTierDiscountPercent = null
+        paymentScreenTableNumber = chargeTableNumber.trim()
         pendingScanAction = "payment"
         scanMethodState = "nfc"
         showScanMethodScreen = true
@@ -1428,6 +1484,7 @@ class MainActivity : ComponentActivity() {
     /** NFC 自动 arm：贴卡拉取中、支付路由中、充值执行中等不重复 arm，避免打断进行中的流程 */
     private fun shouldDeferAutoNfcArm(): Boolean {
         if (nfcFetchingInfo) return true
+        if (pendingScanAction == "linkApp" && linkAppDeepLinkUrl.isNotEmpty()) return true
         if (pendingScanAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) return true
         if (topupQrExecuteError.isNotEmpty()) return true
         if (pendingScanAction == "payment") {
@@ -1491,6 +1548,12 @@ class MainActivity : ComponentActivity() {
                     armForNfcScan()
                 }
             }
+            "linkApp" -> {
+                linkAppDeepLinkUrl = ""
+                nfcFetchError = ""
+                linkAppLastSunForCancel = null
+                armForNfcScan()
+            }
             else -> armForNfcScan()
         }
     }
@@ -1532,6 +1595,17 @@ class MainActivity : ComponentActivity() {
                 readArmed = false
                 initArmed = false
                 paymentArmed = false
+            }
+            "linkApp" -> {
+                linkAppDeepLinkUrl = ""
+                linkAppLastSunForCancel = null
+                linkAppCancelInProgress = false
+                linkAppArmed = true
+                readArmed = false
+                initArmed = false
+                initTemplateArmed = false
+                paymentArmed = false
+                topupArmed = false
             }
             "payment" -> {
                 paymentScreenUid = ""
@@ -1622,6 +1696,7 @@ class MainActivity : ComponentActivity() {
         paymentArmed = false
         showTipScreen = false
         showScanMethodScreen = false
+        chargeTableNumber = ""
         resetPaymentScreenState()
         // Done → 返回 home (NdefScreen)
     }
@@ -2203,7 +2278,7 @@ class MainActivity : ComponentActivity() {
                 val discFiat6Str = kotlin.math.round(discAmtCad * 1_000_000.0).toLong().toString()
                 val taxBpsResolved = kotlin.math.round(taxPctResolved * 100.0).toInt().coerceIn(0, 10000)
                 val discBpsResolved = (tierDiscPct * 100).coerceIn(0, 10000)
-                val tipPay = chargeTipAmountAfterTierDiscountBps(subtotalPay, tierDiscPct, paymentScreenTipRateBps)
+                val tipPay = chargeTipFromRequestAndBps(subtotalPay, paymentScreenTipRateBps)
                 val tipStrForNfc = "%.2f".format(tipPay)
                 val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrency = chargeTotalInCurrency(subtotalPay, taxPctResolved, tierDiscPct, tipPay)
@@ -2387,7 +2462,7 @@ class MainActivity : ComponentActivity() {
                 val taxPctQr = routingDetailsQr?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
                 val tierDiscQr = pickTierDiscountPercentFromAssets(assets, routingDetailsQr?.discountByTierKey ?: emptyMap())
                 val requestQr = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
-                val tipQr = chargeTipAmountAfterTierDiscountBps(requestQr, tierDiscQr, paymentScreenTipRateBps)
+                val tipQr = chargeTipFromRequestAndBps(requestQr, paymentScreenTipRateBps)
                 val taxAmtCadQr = requestQr * taxPctQr / 100.0
                 val discAmtCadQr = requestQr * tierDiscQr / 100.0
                 val taxFiat6StrQr = kotlin.math.round(taxAmtCadQr * 1_000_000.0).toLong().toString()
@@ -3036,6 +3111,125 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e("MainActivity", "payByNfcUidSignContainer", e)
             PayByNfcResult(false, null, e.message ?: "Sign failed")
+        }
+    }
+
+    private data class NfcLinkAppResult(
+        val success: Boolean,
+        val deepLinkUrl: String?,
+        val error: String?,
+        val errorCode: String? = null,
+        val redeemOnChain: Boolean = false
+    )
+
+    /** POST /api/nfcLinkApp：SUN 已由 Cluster 预检；返回 deepLinkUrl 供展示 QR */
+    private fun postNfcLinkApp(sun: SunParams): NfcLinkAppResult {
+        return try {
+            val url = java.net.URL("$BEAMIO_API/api/nfcLinkApp")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 30000
+            conn.readTimeout = 120000
+            val body = org.json.JSONObject().apply {
+                put("uid", sun.uid)
+                put("e", sun.e)
+                put("c", sun.c)
+                put("m", sun.m)
+                put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
+            }.toString()
+            conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            val root = org.json.JSONObject(resp)
+            val okBody = root.optBoolean("success", false)
+            val deep = root.optString("deepLinkUrl").takeIf { it.isNotEmpty() }
+            val err = root.optString("error").takeIf { it.isNotEmpty() }
+            val errCode = root.optString("errorCode").takeIf { it.isNotEmpty() }
+            val redeemOn = root.optBoolean("redeemOnChain", false)
+            val httpOk = code in 200..299
+            val ok = httpOk && okBody && deep != null
+            NfcLinkAppResult(
+                success = ok,
+                deepLinkUrl = deep,
+                error = err ?: if (!httpOk || !okBody) "Request failed (HTTP $code)" else null,
+                errorCode = errCode,
+                redeemOnChain = redeemOn
+            )
+        } catch (e: Exception) {
+            Log.e("MainActivity", "postNfcLinkApp", e)
+            NfcLinkAppResult(false, null, e.message ?: "Network error")
+        }
+    }
+
+    private data class NfcLinkAppCancelResult(val success: Boolean, val error: String?)
+
+    /** POST /api/nfcLinkAppCancel：取消进行中 Link（链上 cancelRedeem + 释放 DB） */
+    private fun postNfcLinkAppCancel(sun: SunParams): NfcLinkAppCancelResult {
+        return try {
+            val url = java.net.URL("$BEAMIO_API/api/nfcLinkAppCancel")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 30000
+            conn.readTimeout = 120000
+            val body = org.json.JSONObject().apply {
+                put("uid", sun.uid)
+                put("e", sun.e)
+                put("c", sun.c)
+                put("m", sun.m)
+            }.toString()
+            conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            val root = org.json.JSONObject(resp)
+            val ok = code in 200..299 && root.optBoolean("success", false)
+            val err = root.optString("error").takeIf { it.isNotEmpty() }
+            NfcLinkAppCancelResult(ok, err)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "postNfcLinkAppCancel", e)
+            NfcLinkAppCancelResult(false, e.message ?: "Network error")
+        }
+    }
+
+    private fun runLinkAppCancelLock() {
+        val sun = linkAppLastSunForCancel ?: return
+        if (linkAppCancelInProgress) return
+        linkAppCancelInProgress = true
+        Thread {
+            val cr = postNfcLinkAppCancel(sun)
+            runOnUiThread {
+                linkAppCancelInProgress = false
+                if (cr.success) {
+                    nfcFetchError = ""
+                    linkAppLastSunForCancel = null
+                    showScanMethodScreen = true
+                    syncScanMethodEntryAndTabs()
+                } else {
+                    nfcFetchError = cr.error ?: "Cancel link lock failed"
+                }
+            }
+        }.start()
+    }
+
+    private fun encodeLinkAppQrBitmap(text: String, sizePx: Int = 480): Bitmap? {
+        return try {
+            val hints = mapOf(EncodeHintType.MARGIN to 1)
+            val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
+            val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.RGB_565)
+            for (x in 0 until sizePx) {
+                for (y in 0 until sizePx) {
+                    bmp.setPixel(x, y, if (matrix.get(x, y)) AndroidColor.BLACK else AndroidColor.WHITE)
+                }
+            }
+            bmp
+        } catch (e: Exception) {
+            Log.e("MainActivity", "encodeLinkAppQrBitmap", e)
+            null
         }
     }
 
@@ -4009,8 +4203,37 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        if (!readArmed && !initArmed && !initTemplateArmed && !topupArmed && !paymentArmed) {
+        if (!readArmed && !linkAppArmed && !initArmed && !initTemplateArmed && !topupArmed && !paymentArmed) {
             uidText = "System read intercepted. Please tap read/init/topup/payment first"
+            return
+        }
+
+        if (linkAppArmed) {
+            linkAppArmed = false
+            val sunParams = readSunParamsFromNdef(tag)
+            if (sunParams == null) {
+                scanWaitingForNfc = false
+                nfcFetchingInfo = false
+                nfcFetchError = "Card does not support SUN. Cannot link app."
+                return
+            }
+            scanWaitingForNfc = false
+            nfcFetchingInfo = true
+            nfcFetchError = ""
+            Thread {
+                val r = postNfcLinkApp(sunParams)
+                runOnUiThread {
+                    nfcFetchingInfo = false
+                    if (r.success && !r.deepLinkUrl.isNullOrEmpty()) {
+                        linkAppDeepLinkUrl = r.deepLinkUrl!!
+                        linkAppLastSunForCancel = null
+                    } else {
+                        nfcFetchError = r.error ?: "Link App failed"
+                        linkAppLastSunForCancel =
+                            if (r.errorCode == "NFC_LINK_APP_CARD_LOCKED") sunParams else null
+                    }
+                }
+            }.start()
             return
         }
 
@@ -4954,7 +5177,8 @@ private fun printChargeReceipt(
     payee: String,
     txHash: String,
     dateString: String,
-    timeString: String
+    timeString: String,
+    tableNumber: String? = null
 ) {
     val currency = cardCurrency ?: "CAD"
     val shortAddr = if (payee.length > 10) "${payee.take(6)}...${payee.takeLast(4)}" else payee
@@ -4970,6 +5194,9 @@ private fun printChargeReceipt(
         if (tip != null && tip.toDoubleOrNull()?.let { it > 0 } == true) {
             lines.add("Tip: ${formatForReceipt(tip, currency)}")
         }
+    }
+    if (!tableNumber.isNullOrBlank()) {
+        lines.add("Table number: ${tableNumber.trim()}")
     }
     lines.addAll(listOf("", "Date: $dateString, $timeString", "Account ID: $shortAddr", "TX Hash: $shortTxHash", "", "Settlement: NTAG 424 DNA"))
     printReceiptPdf(context, "Payment Receipt", lines)
@@ -5630,6 +5857,7 @@ private fun PaymentSuccessContent(
     chargeTaxPercent: Double? = null,
     /** 与底部 Total 明细一致：等级折扣 % */
     chargeTierDiscountPercent: Int? = null,
+    tableNumber: String? = null,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -5931,6 +6159,16 @@ private fun PaymentSuccessContent(
                         Text("Date", fontSize = 13.sp, color = Color(0xFF86868b))
                         Text("$dateString, $timeString", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
                     }
+                    if (!tableNumber.isNullOrBlank()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Table number", fontSize = 13.sp, color = Color(0xFF86868b))
+                            Text(tableNumber.trim(), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
+                        }
+                    }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -5984,7 +6222,21 @@ private fun PaymentSuccessContent(
                 verticalArrangement = Arrangement.spacedBy(if (vCompactH) 6.dp else 8.dp)
             ) {
             OutlinedButton(
-                onClick = { printChargeReceipt(context, amount, subtotal, tip, postBalance, cardCurrency, payee, txHash, dateString, timeString) },
+                onClick = {
+                    printChargeReceipt(
+                        context,
+                        amount,
+                        subtotal,
+                        tip,
+                        postBalance,
+                        cardCurrency,
+                        payee,
+                        txHash,
+                        dateString,
+                        timeString,
+                        tableNumber
+                    )
+                },
                 modifier = approvedActionButtonModifier,
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
                 border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
@@ -6156,6 +6408,7 @@ internal fun PaymentScreen(
     settlementViaQr: Boolean = false,
     chargeTaxPercent: Double? = null,
     chargeTierDiscountPercent: Int? = null,
+    tableNumber: String? = null,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -6213,6 +6466,7 @@ internal fun PaymentScreen(
                 extraTopInset = 0.dp,
                 chargeTaxPercent = chargeTaxPercent,
                 chargeTierDiscountPercent = chargeTierDiscountPercent,
+                tableNumber = tableNumber,
                 onDone = onBack
             )
             is PaymentStatus.Error -> {
@@ -6595,6 +6849,7 @@ fun NdefScreen(
     /** One line: all tier `discountPercent` in JSON order, e.g. `5% · 10% · 18%` */
     infraRoutingDiscountSummary: String? = null,
     onCopyWalletClick: () -> Unit,
+    onLinkAppClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
     onPaymentClick: () -> Unit,
@@ -6830,6 +7085,44 @@ fun NdefScreen(
                 }
             }
 
+            // Link App (same white card + row layout as Charge / Top-Up / Check Balance)
+            Card(
+                onClick = onLinkAppClick,
+                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .background(Color(0xFF7C3AED).copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Filled.Link, null, Modifier.size(20.dp), tint = Color(0xFF7C3AED))
+                            }
+                            Column {
+                                Text("Link App", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                                Text("Scan customer card to link", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                            }
+                        }
+                        Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
+                    }
+                }
+            }
+
             // Charge
             Card(
                 onClick = onPaymentClick,
@@ -7010,6 +7303,7 @@ internal fun ScanMethodSelectionScreen(
     paymentChargeTaxPercent: Double? = null,
     paymentChargeTierDiscountPercent: Int? = null,
     paymentChargeTipBps: Int = 0,
+    paymentTableNumber: String = "",
     onPaymentDone: () -> Unit = {},
     onProceed: () -> Unit,
     onProceedNfcStay: (() -> Unit)? = null,
@@ -7018,6 +7312,15 @@ internal fun ScanMethodSelectionScreen(
     onProceedWithQr: (() -> Unit)? = null,
     onQrScanResult: (String) -> Unit = {},
     onCancel: () -> Unit,
+    /** Link App：仅 NFC，隐藏 Tap Card / Scan QR */
+    hideMethodToggle: Boolean = false,
+    linkAppDeepLinkUrl: String = "",
+    linkAppQrBitmap: Bitmap? = null,
+    onCopyLinkAppUrl: () -> Unit = {},
+    /** 卡已锁定（409）：展示 Cancel link lock */
+    linkAppLockedShowCancel: Boolean = false,
+    linkAppCancelInProgress: Boolean = false,
+    onLinkAppCancelLock: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val showPaymentRouting = pendingAction == "payment" && (
@@ -7033,6 +7336,7 @@ internal fun ScanMethodSelectionScreen(
         !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty() &&
         !(pendingAction == "payment" && paymentQrParseError.isNotEmpty()) &&
         !(pendingAction == "payment" && paymentQrInterpreting)
+    val effectiveShowMethodToggle = showMethodToggle && !hideMethodToggle
 
     /** Charge：底部 Total = request + tax%*request - tier%*request + tip（与链上记账一致）；勿仅用 totalAmount 字符串以免漏税 */
     val bottomTotalDisplay = if (pendingAction == "payment") {
@@ -7086,6 +7390,7 @@ internal fun ScanMethodSelectionScreen(
                         extraTopInset = BACK_BUTTON_TOP_BAR_HEIGHT,
                         chargeTaxPercent = paymentChargeTaxPercent,
                         chargeTierDiscountPercent = paymentChargeTierDiscountPercent,
+                        tableNumber = paymentTableNumber.trim().takeIf { it.isNotEmpty() },
                         onDone = onPaymentDone,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -7230,6 +7535,65 @@ internal fun ScanMethodSelectionScreen(
                                         .align(Alignment.BottomCenter)
                                         .padding(bottom = 8.dp)
                                 )
+                            }
+                        }
+                    }
+                } else if (pendingAction == "linkApp" && linkAppDeepLinkUrl.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Card(
+                            modifier = Modifier
+                                .size(scanSize)
+                                .align(Alignment.Center),
+                            shape = RoundedCornerShape(32.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    "Link ready",
+                                    fontSize = 16.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.Black
+                                )
+                                Text(
+                                    "Customer opens Beamio app with this link",
+                                    fontSize = 12.sp,
+                                    color = Color(0xFF86868b),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+                                )
+                                linkAppQrBitmap?.let { bmp ->
+                                    Image(
+                                        bitmap = bmp.asImageBitmap(),
+                                        contentDescription = "Link app QR",
+                                        modifier = Modifier
+                                            .size(200.dp)
+                                            .padding(vertical = 8.dp)
+                                    )
+                                }
+                                Text(
+                                    linkAppDeepLinkUrl,
+                                    fontSize = 10.sp,
+                                    color = Color(0xFF1562f0),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.padding(vertical = 8.dp)
+                                )
+                                Button(
+                                    onClick = onCopyLinkAppUrl,
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Copy link")
+                                }
                             }
                         }
                     }
@@ -7432,41 +7796,97 @@ internal fun ScanMethodSelectionScreen(
                         }
                     }
                 } else if (nfcFetchError.isNotEmpty()) {
-                    // 拉取失败：在 scanSize 框内显示错误，点击可重试（读余额+QR 时重新开相机）
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .wrapContentHeight()
-                            .clickable { (onRetryAfterCentralFetchError ?: onProceedNfcStay)?.invoke() }
-                    ) {
-                        Card(
+                    // 拉取失败：在 scanSize 框内显示错误；Link App 已锁定时提供 Cancel link lock
+                    if (linkAppLockedShowCancel) {
+                        Box(
                             modifier = Modifier
-                                .size(scanSize)
-                                .align(Alignment.Center),
-                            shape = RoundedCornerShape(32.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color.White),
-                            border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                                .fillMaxWidth()
+                                .wrapContentHeight()
                         ) {
-                            Box(
+                            Card(
                                 modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(16.dp)
+                                    .size(scanSize)
+                                    .align(Alignment.Center),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
                             ) {
-                                Text(
-                                    nfcFetchError,
-                                    fontSize = 14.sp,
-                                    color = Color(0xFFef4444),
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.align(Alignment.Center)
-                                )
-                                Text(
-                                    "Tap to retry",
-                                    fontSize = 15.sp,
-                                    color = Color(0xFF86868b),
+                                Column(
                                     modifier = Modifier
-                                        .align(Alignment.BottomCenter)
-                                        .padding(bottom = 8.dp)
-                                )
+                                        .fillMaxSize()
+                                        .padding(16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        nfcFetchError,
+                                        fontSize = 14.sp,
+                                        color = Color(0xFFef4444),
+                                        textAlign = TextAlign.Center
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    if (linkAppCancelInProgress) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(36.dp),
+                                            color = Color(0xFF1562f0)
+                                        )
+                                    } else {
+                                        Button(
+                                            onClick = onLinkAppCancelLock,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Cancel link lock")
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        "Tap outside this card to scan again",
+                                        fontSize = 12.sp,
+                                        color = Color(0xFF86868b),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier
+                                            .clickable { (onRetryAfterCentralFetchError ?: onProceedNfcStay)?.invoke() }
+                                            .padding(top = 4.dp)
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .wrapContentHeight()
+                                .clickable { (onRetryAfterCentralFetchError ?: onProceedNfcStay)?.invoke() }
+                        ) {
+                            Card(
+                                modifier = Modifier
+                                    .size(scanSize)
+                                    .align(Alignment.Center),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(16.dp)
+                                ) {
+                                    Text(
+                                        nfcFetchError,
+                                        fontSize = 14.sp,
+                                        color = Color(0xFFef4444),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.align(Alignment.Center)
+                                    )
+                                    Text(
+                                        "Tap to retry",
+                                        fontSize = 15.sp,
+                                        color = Color(0xFF86868b),
+                                        modifier = Modifier
+                                            .align(Alignment.BottomCenter)
+                                            .padding(bottom = 8.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -7559,7 +7979,7 @@ internal fun ScanMethodSelectionScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(
-                    if (showMethodToggle) 120.dp else BACK_BUTTON_TOP_BAR_HEIGHT
+                    if (effectiveShowMethodToggle) 120.dp else BACK_BUTTON_TOP_BAR_HEIGHT
                 )
                 .background(Color(0xFFf5f5f7))
                 .align(Alignment.TopCenter)
@@ -7573,7 +7993,7 @@ internal fun ScanMethodSelectionScreen(
                     .align(Alignment.TopStart)
                     .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
             )
-            if (showMethodToggle) {
+            if (effectiveShowMethodToggle) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -7622,7 +8042,7 @@ internal fun ScanMethodSelectionScreen(
         }
 
         // Bottom overlay: Total amount（仅在有内容时绘制；Approved 时不可留空 Column+background，否则会挡住 PaymentSuccessContent 底栏）
-        val showBottomTotalOverlay = pendingAction != "read" && !showPaymentSuccess &&
+        val showBottomTotalOverlay = pendingAction != "read" && pendingAction != "linkApp" && !showPaymentSuccess &&
             (pendingAction != "payment" && totalAmount.isNotBlank() ||
                 pendingAction == "payment" && (bottomTotalDisplay > 0.0 || totalAmount.isNotBlank()))
         if (showBottomTotalOverlay) {
@@ -7665,18 +8085,14 @@ internal fun ScanMethodSelectionScreen(
 fun TipSelectionScreen(
     subtotal: String,
     selectedTipRate: Double,
-    chargeTaxPercent: Double? = null,
-    /** 选小费页通常尚无客户卡：传 null；若将来有预览折扣可传入与 Smart Routing 一致的 tier % */
-    chargeTierDiscountPercent: Int? = null,
+    tableNumber: String,
+    onTableNumberChange: (String) -> Unit,
     onTipRateSelect: (Double) -> Unit,
     onBack: () -> Unit,
     onConfirmPay: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val numAmount = subtotal.toDoubleOrNull() ?: 0.0
-    val tipValue = chargeTipAmountAfterTierDiscount(numAmount, chargeTierDiscountPercent, selectedTipRate)
-    val taxP = chargeTaxPercent ?: 0.0
-    val totalAmount = chargeTotalInCurrency(numAmount, taxP, chargeTierDiscountPercent, tipValue)
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -7736,6 +8152,25 @@ fun TipSelectionScreen(
                 Text("$${"%.2f".format(numAmount)}", fontSize = 48.sp, fontWeight = FontWeight.Light, color = Color.Black)
             }
 
+            OutlinedTextField(
+                value = tableNumber,
+                onValueChange = { s -> onTableNumberChange(s.filter { it.isDigit() }) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 20.dp),
+                label = { Text("Table number") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done
+                ),
+                shape = RoundedCornerShape(16.dp),
+                colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = Color.White,
+                    unfocusedContainerColor = Color.White
+                )
+            )
+
             // Tip options: 2x2 grid - 15%, 18%, 20%, No Tip (compact padding for small screens)
             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 listOf(
@@ -7772,7 +8207,7 @@ fun TipSelectionScreen(
                                         color = if (isSelected) Color(0xFF1562f0) else Color.Black
                                     )
                                     Text(
-                                        if (rate == 0.0) "+$0.00" else "+$${"%.2f".format(numAmount * rate)}",
+                                        if (rate == 0.0) "+$0.00" else "+$${"%.2f".format(chargeTipFromRequestAndRate(numAmount, rate))}",
                                         fontSize = 15.sp,
                                         fontWeight = FontWeight.Medium,
                                         color = if (isSelected) Color(0xFF1562f0).copy(alpha = 0.8f) else Color(0xFF86868b),
@@ -7786,41 +8221,20 @@ fun TipSelectionScreen(
             }
         }
 
-        // Total Pay panel: fixed at bottom, always visible, ensures Confirm & Pay button is never clipped
-        Card(
+        Button(
+            onClick = onConfirmPay,
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 24.dp, top = 16.dp, end = 24.dp, bottom = 24.dp),
-            shape = RoundedCornerShape(32.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.Black)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(start = 24.dp, top = 16.dp, end = 24.dp, bottom = 24.dp)
+                .heightIn(min = 56.dp),
+            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White),
+            shape = RoundedCornerShape(16.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    Text("Total to Pay", fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                    Text("$${"%.2f".format(totalAmount)}", fontSize = 36.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                }
-                Button(
-                    onClick = onConfirmPay,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 56.dp)
-                        .padding(top = 20.dp),
-                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
-                ) {
-                    Text("Confirm & Pay", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(16.dp), tint = Color.Black)
-                }
-            }
+            Text("Confirm & Pay", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(modifier = Modifier.width(6.dp))
+            Icon(Icons.Filled.ChevronRight, null, Modifier.size(16.dp), tint = Color.White)
         }
     }
 }
@@ -8021,6 +8435,7 @@ fun GreetingPreview() {
             readParamText = "e=...\nc=000001 (counter=1)\nm=...",
             walletAddress = "0x1234567890abcdef1234567890abcdef12345678",
             onCopyWalletClick = {},
+            onLinkAppClick = {},
             onReadClick = {},
             onTopupClick = {},
             onPaymentClick = {},
