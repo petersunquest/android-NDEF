@@ -325,7 +325,7 @@ class MainActivity : ComponentActivity() {
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
         /** 基础设施卡（与 x402sdk chainAddresses.BEAMIO_USER_CARD_ASSET_ADDRESS 一致） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0x9cda8477c9f03b8759ac64e21941e578908fd750"
+        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xA756F2E27a332d6Be2d399dA543E3Ce4C8455F14"
         /** Base RPC，遵循 beamio-base-rpc */
         private const val BASE_RPC_URL = "https://base-rpc.conet.network"
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
