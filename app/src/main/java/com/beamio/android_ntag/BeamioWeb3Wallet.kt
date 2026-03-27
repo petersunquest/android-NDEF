@@ -13,7 +13,7 @@ import java.math.BigInteger
  */
 object BeamioWeb3Wallet {
     /** 必须与 x402sdk chainAddresses.BASE_CARD_FACTORY 一致，否则 EIP-712 digest 不同，服务端 recoverAddress 会得到错误 signer */
-    private const val BASE_CARD_FACTORY = "0xfB5E3F2AbFe24DC17970d78245BeF56aAE8cb71a"
+    private const val BASE_CARD_FACTORY = "0x2eb245646de404b2dce87e01c6282c131778bb05"
     private const val BASE_CHAIN_ID = 8453L
 
     private var keyPair: ECKeyPair? = null
