@@ -192,6 +192,8 @@ internal data class UIDAssets(
     val ok: Boolean,
     val address: String? = null,
     val aaAddress: String? = null,
+    /** 客户 Beamio 用户名（无 @）；来自 API `beamioTag` / `accountName` */
+    val beamioTag: String? = null,
     /** NFC 流程下服务端返回的 UID */
     val uid: String? = null,
     /** NFC 流程下服务端返回的 TagID（hex） */
@@ -324,10 +326,17 @@ class MainActivity : ComponentActivity() {
         const val BEAMIO_API = "https://beamio.app"
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-        /** 基础设施卡（与 x402sdk chainAddresses.BEAMIO_USER_CARD_ASSET_ADDRESS 一致） */
-        const val BEAMIO_USER_CARD_ASSET_ADDRESS = "0xA756F2E27a332d6Be2d399dA543E3Ce4C8455F14"
+        /**
+         * 默认基础设施卡地址（`/api/myPosAddress` 无登记或请求失败时回退）。
+         * 运行时以终端钱包拉取 `/api/myPosAddress` 得到的登记卡为准。
+         */
+        const val DEFAULT_BEAMIO_USER_CARD_ASSET_ADDRESS = "0xA756F2E27a332d6Be2d399dA543E3Ce4C8455F14"
         /** Base RPC，遵循 beamio-base-rpc */
         private const val BASE_RPC_URL = "https://base-rpc.conet.network"
+        /** `BeamioUserCard` / `BeamioUserCardBase`：`Tier[] public tiers` → `tiers(uint256)`（与 BeamioUserCardArtifact.json 一致） */
+        private const val SEL_TIERS_UINT256 = "0x039af9eb"
+        /** 链上 tiers 无 length getter，依次探测直至 revert */
+        private const val CHAIN_TIERS_MAX_PROBE = 48
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
@@ -393,6 +402,103 @@ class MainActivity : ComponentActivity() {
     private var paymentArmed by mutableStateOf(false)
     private var paymentViaQr by mutableStateOf(false)
     private val cardMetadataTierCache = mutableMapOf<String, List<MetadataTier>>()
+
+    /**
+     * 基础设施 BeamioUserCard 合约地址：首启后 GET `/api/myPosAddress?wallet=<终端EOA>` 解析；
+     * 与 DB 登记一致；失败或未登记时用 [DEFAULT_BEAMIO_USER_CARD_ASSET_ADDRESS]。
+     */
+    @Volatile
+    private var beamioUserCardAssetAddressRuntime: String = DEFAULT_BEAMIO_USER_CARD_ASSET_ADDRESS
+
+    @Volatile
+    private var myPosInfraCardFetchInFlight: Boolean = false
+
+    private fun infraCardAddress(): String = beamioUserCardAssetAddressRuntime
+
+    /**
+     * POS 与 Cluster：请求体带 `merchantInfraCard`（终端登记基础设施卡地址）。
+     * `merchantInfraOnly=true` 时服务端**只返回**该行 CashTrees/infrastructure（用于特殊场景）；客户「Check Balance / Balance Loaded」须为 **false**，
+     * 否则界面只剩基础设施模板一行、无 CCSA/会员 Pass（见 x402sdk `cardsScope: merchantInfraOnly`）。
+     */
+    private fun org.json.JSONObject.putMerchantInfraParams(merchantInfraOnly: Boolean) {
+        put("merchantInfraCard", infraCardAddress())
+        if (merchantInfraOnly) put("merchantInfraOnly", true)
+    }
+
+    /** Cluster DB：已登记终端返回 `cardAddress` / `myPosAddress`。 */
+    private fun fetchMyPosInfraCardAddressSync(wallet: String): String? {
+        val trimmed = wallet.trim()
+        if (trimmed.isEmpty() || !trimmed.startsWith("0x", ignoreCase = true)) return null
+        return try {
+            val enc = java.net.URLEncoder.encode(trimmed, "UTF-8")
+            val url = java.net.URL("$BEAMIO_API/api/myPosAddress?wallet=$enc")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 12000
+            conn.readTimeout = 12000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.use { it.bufferedReader().readText() }
+                .orEmpty()
+            conn.disconnect()
+            if (code !in 200..299) {
+                Log.d("MyPosAddress", "HTTP $code body=${body.take(200)}")
+                return null
+            }
+            val root = parseBeamioApiJsonObject(body, code) ?: return null
+            if (!root.optBoolean("ok", false)) return null
+            val addr = root.optString("cardAddress").takeIf { it.isNotEmpty() }
+                ?: root.optString("myPosAddress").takeIf { it.isNotEmpty() }
+            addr
+        } catch (e: Exception) {
+            Log.w("MyPosAddress", "fetch failed", e)
+            null
+        }
+    }
+
+    /**
+     * 在 topup / Charge / getCardAdminInfo / getUIDAssets 等依赖「终端登记基础设施卡」的请求前调用。
+     * [ensureMyPosInfraCardAddressLoaded] 为异步，若用户在首屏立即操作，runtime 可能仍为 [DEFAULT_BEAMIO_USER_CARD_ASSET_ADDRESS]，
+     * 导致 merchantInfraCard、cardAddress 与 DB 不一致，查错合约 → cards 为空或 admin 元数据不匹配。
+     */
+    private fun refreshMerchantInfraCardFromDbSync(): String {
+        if (!BeamioWeb3Wallet.isInitialized()) return infraCardAddress()
+        val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+        if (w.isEmpty()) return infraCardAddress()
+        val resolved = fetchMyPosInfraCardAddressSync(w)
+        if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
+            beamioUserCardAssetAddressRuntime = resolved
+            Log.d("MyPosAddress", "[infra] sync before API use: $resolved")
+        }
+        return infraCardAddress()
+    }
+
+    private fun ensureMyPosInfraCardAddressLoaded() {
+        if (!BeamioWeb3Wallet.isInitialized()) return
+        val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+        if (w.isEmpty()) return
+        if (myPosInfraCardFetchInFlight) return
+        myPosInfraCardFetchInFlight = true
+        Thread {
+            try {
+                val resolved = fetchMyPosInfraCardAddressSync(w)
+                runOnUiThread {
+                    if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
+                        beamioUserCardAssetAddressRuntime = resolved
+                        cardMetadataTierCache.clear()
+                        val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
+                            !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
+                        if (onHome) {
+                            Thread { prefetchInfraCardMetadata() }.start()
+                        }
+                    }
+                }
+            } finally {
+                myPosInfraCardFetchInFlight = false
+            }
+        }.start()
+    }
 
     private var uidText by mutableStateOf("Not read")
     private var readCheckText by mutableStateOf("Init status not detected")
@@ -709,9 +815,9 @@ class MainActivity : ComponentActivity() {
                         scanWaitingForNfc = false
                         nfcFetchingInfo = true
                         if (beamioTab != null) {
-                            fetchUidAssets(beamioTab)
+                            fetchUidAssets(beamioTab, sunParams = null, merchantInfraOnly = false)
                         } else {
-                            fetchWalletAssets(wallet!!)
+                            fetchWalletAssets(wallet!!, merchantInfraOnly = false)
                         }
                     }
                     "linkApp" -> {
@@ -775,6 +881,7 @@ class MainActivity : ComponentActivity() {
             showWelcomePage = true
         }
         nfcAdapter = NfcAdapter.getDefaultAdapter(this)
+        ensureMyPosInfraCardAddressLoaded()
         enableEdgeToEdge()
         // 隐藏底部系统导航栏，用户从底部上滑可临时显示
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -788,7 +895,7 @@ class MainActivity : ComponentActivity() {
                     if (!showOnboardingScreen && BeamioWeb3Wallet.isInitialized() && hasAAAccount == null) {
                         Thread {
                             try {
-                                val assets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress())
+                                val assets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress(), merchantInfraOnly = false)
                                 runOnUiThread {
                                     hasAAAccount = !assets?.aaAddress.isNullOrEmpty()
                                 }
@@ -809,6 +916,7 @@ class MainActivity : ComponentActivity() {
                         Thread {
                             val wallet = BeamioWeb3Wallet.getAddress()
                             if (wallet.isNullOrEmpty()) return@Thread
+                            refreshMerchantInfraCardFromDbSync()
                             val (profile, admin) = fetchTerminalProfileSync(wallet)
                             val (charge, topUp) = fetchCardStatsSync(wallet)
                             runOnUiThread {
@@ -886,6 +994,7 @@ class MainActivity : ComponentActivity() {
                             BeamioWeb3Wallet.init(privateKeyHex)
                             hasAAAccount = null
                             showOnboardingScreen = false
+                            ensureMyPosInfraCardAddressLoaded()
                         },
                         onBackToWelcome = {
                             showOnboardingScreen = false
@@ -1724,6 +1833,7 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid fromScanMethodFlow=$fromScanMethodFlow")
+                refreshMerchantInfraCardFromDbSync()
                 val sunParams = readSunParamsFromNdef(tag)
                 // NFC 格式（14 位 hex uid）必须提供 SUN 参数，不符合 SUN 或无法推导 tagID 的不予受理
                 val isNfcUid = uid.length == 14 && uid.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
@@ -1741,7 +1851,7 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
                 // 1. Topup 之前先拉取余额，对齐后端返回码（避免 UID/QR 混淆时解析 HTML 报错）
-                val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
+                val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams, merchantInfraOnly = false)
                 if (preAssets == null || !preAssets.ok) {
                     val errMsg = preAssets?.error ?: "Query failed"
                     runOnUiThread {
@@ -1755,20 +1865,9 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                val amountCad = amount.toDoubleOrNull() ?: 0.0
-                if (!hasMembershipNft(preAssets) && amountCad < 50.0) {
-                    val errMsg = "Top-up not allowed without membership card. Please purchase a card first."
-                    runOnUiThread {
-                        topupNfcExecuteInProgress = false
-                        topupScreenStatus = TopupStatus.Error
-                        topupScreenError = errMsg
-                        if (fromScanMethodFlow) {
-                            nfcFetchingInfo = false
-                            nfcFetchError = errMsg
-                        }
-                    }
-                    return@Thread
-                }
+
+                // Admin mint 路径由服务端 nfcTopupPrepare 支持首发/普通充值（MemberCard: 不再在 prepare 层阻断无会员卡用户）；
+                // 不得以 getUIDAssets 的 cards/nfts 为空做本地拦截（客户尚无点数/卡行未展开时易误判）。
 
                 val prepare = nfcTopupPrepare(uid, amount, sunParams)
                 if (prepare.error != null) {
@@ -1828,7 +1927,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenStatus = TopupStatus.Loading
                         Thread {
                             Thread.sleep(3000)
-                            val postAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams)
+                            val postAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams, merchantInfraOnly = false)
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
@@ -1913,7 +2012,7 @@ class MainActivity : ComponentActivity() {
             sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             put("amount", amount)
             put("currency", "CAD")
-            put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
+            put("cardAddress", infraCardAddress())
             // 显式声明 Android 走 admin topup（mintPointsByAdmin）路径，不走 USDC 购买工作流
             put("workflow", "adminTopup")
             put("topupMode", "admin")
@@ -1944,6 +2043,7 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 Log.d("Topup", "[Topup Debug] executeTopupWithBeamioTag entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | beamioTag=$beamioTag")
+                refreshMerchantInfraCardFromDbSync()
                 val prepare = nfcTopupPrepareWithBeamioTag(beamioTag, amount)
                 if (prepare.error != null) {
                     runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
@@ -1967,6 +2067,7 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 Log.d("Topup", "[Topup Debug] executeWalletTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | customerWallet=$wallet")
+                refreshMerchantInfraCardFromDbSync()
                 val prepare = nfcTopupPrepareWithWallet(wallet, amount)
                 if (prepare.error != null) {
                     runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
@@ -1982,28 +2083,25 @@ class MainActivity : ComponentActivity() {
 
     private fun executeWalletTopupInternal(wallet: String, amount: String, prepare: NfcTopupPrepareResult) {
         try {
+                refreshMerchantInfraCardFromDbSync()
                 // 1. Pull balance first; if EOA has no AA yet, ensure AA then retry once (QR / beamioTag topup).
-                var preAssets = fetchWalletAssetsSync(wallet)
+                var preAssets = fetchWalletAssetsSync(wallet, merchantInfraOnly = false)
                 if (preAssets == null || !preAssets.ok) {
                     Log.d(
                         "Topup",
                         "[Topup Debug] getWalletAssets first try failed wallet=$wallet err=${preAssets?.error} — ensureAAForEOA"
                     )
                     if (ensureAaForEoaSync(wallet)) {
-                        preAssets = fetchWalletAssetsSync(wallet)
+                        preAssets = fetchWalletAssetsSync(wallet, merchantInfraOnly = false)
                     }
                 }
                 if (preAssets == null || !preAssets.ok) {
                     runOnUiThread { applyTopupQrScanScreenError(preAssets?.error ?: "Query failed") }
                     return
                 }
-                val amountCad = amount.toDoubleOrNull() ?: 0.0
-                if (!hasMembershipNft(preAssets) && amountCad < 50.0) {
-                    runOnUiThread {
-                        applyTopupQrScanScreenError("Top-up not allowed without membership card. Please purchase a card first.")
-                    }
-                    return
-                }
+
+                // 同上：不与服务端 admin topup 规则重复做「无会员卡」本地拦截。
+
                 // 多卡时使用 topup 所使用的卡的余额与货币，而非首卡/CCSA
                 val cardAddr = prepare.cardAddr!!
                 val topupCard = preAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
@@ -2041,7 +2139,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenStatus = TopupStatus.Loading
                         Thread {
                             Thread.sleep(3000)
-                            val postAssets = fetchWalletAssetsSync(wallet)
+                            val postAssets = fetchWalletAssetsSync(wallet, merchantInfraOnly = false)
                             runOnUiThread {
                                 if (postAssets != null && postAssets.ok) {
                                     val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
@@ -2203,18 +2301,6 @@ class MainActivity : ComponentActivity() {
         return (usdcAmount * 1_000_000).toLong().toString()
     }
 
-    /** 与 BeamioERC1155Logic.ISSUED_NFT_START_ID 对齐：membership SBT ids [100, 100000000000) */
-    private val ISSUED_NFT_START_ID = 100_000_000_000L
-
-    /** 检查用户是否拥有会员卡 NFT（tokenId > 0 且 < ISSUED_NFT_START_ID） */
-    private fun hasMembershipNft(assets: UIDAssets): Boolean {
-        val allNfts = (assets.cards?.flatMap { it.nfts } ?: emptyList()) + (assets.nfts ?: emptyList())
-        return allNfts.any { nft ->
-            val id = nft.tokenId.toLongOrNull() ?: 0L
-            id > 0 && id < ISSUED_NFT_START_ID
-        }
-    }
-
     /** 从 UIDAssets 计算总余额（CAD） */
     private fun totalBalanceCadFromAssets(assets: UIDAssets, oracle: OracleRates): Double {
         val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
@@ -2240,6 +2326,7 @@ class MainActivity : ComponentActivity() {
     private fun executePayment(tag: Tag, uid: String, payee: String) {
         Thread {
             try {
+                refreshMerchantInfraCardFromDbSync()
                 val sunParams = readSunParamsFromNdef(tag)
                 val effectiveUid = sunParams?.uid ?: uid
                 val requestEarly = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
@@ -2262,7 +2349,7 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
                 steps = updateStep(steps, "membership", StepStatus.success, "NFC card payment")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
-                val assets = fetchUidAssetsSync(effectiveUid, sunParams)
+                val assets = fetchUidAssetsSync(effectiveUid, sunParams, merchantInfraOnly = false)
                 if (assets == null || !assets.ok) {
                     steps = updateStep(steps, "analyzingAssets", StepStatus.error, assets?.error ?: "Card not registered")
                     runOnUiThread {
@@ -2393,7 +2480,7 @@ class MainActivity : ComponentActivity() {
                     }
                     Thread {
                         Thread.sleep(3000)
-                        val postAssets = fetchUidAssetsSync(effectiveUid, sunParams)
+                        val postAssets = fetchUidAssetsSync(effectiveUid, sunParams, merchantInfraOnly = false)
                         val stepsAfter = updateStep(
                             steps,
                             "refreshBalance",
@@ -2428,6 +2515,7 @@ class MainActivity : ComponentActivity() {
     private fun executeQrPayment(payload: org.json.JSONObject) {
         Thread {
             try {
+                refreshMerchantInfraCardFromDbSync()
                 runOnUiThread {
                     nfcFetchingInfo = true
                     paymentScreenStatus = PaymentStatus.Routing
@@ -2457,7 +2545,7 @@ class MainActivity : ComponentActivity() {
                 // openRelayed：签名不绑定 to/items，maxAmount=0 表示无限制，金额与收款方由商户填写。不在此处校验 maxAmount，链上会校验。
                 steps = updateStep(steps, "detectingUser", StepStatus.success, "Dynamic QR detected")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
-                val assets = fetchWalletAssetsSync(account)
+                val assets = fetchWalletAssetsSync(account, merchantInfraOnly = false)
                 if (assets == null || !assets.ok) {
                     runOnUiThread {
                         nfcFetchingInfo = false
@@ -2492,18 +2580,18 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
-                val hasCardholder = (assets.cards?.any { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) } == true) ||
+                val hasCardholder = (assets.cards?.any { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) } == true) ||
                     (assets.points6?.toLongOrNull() ?: 0L) > 0
                 val effectiveUsdc6 = enteredUsdc6
                 steps = updateStep(steps, "membership", StepStatus.success, if (hasCardholder) "Cardholder" else "No membership")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
                 // QR Charge：与 NFC payByNfcUidWithContainer 对齐——不按用户卡合约地址（如 CCSA 克隆 0x2032…）拆分 container；
-                // 可扣款余额仍来自 chargeableCards，但 ERC1155 扣款 asset 固定为 BEAMIO_USER_CARD_ASSET_ADDRESS。
+                // 可扣款余额仍来自 chargeableCards，但 ERC1155 扣款 asset 固定为当前基础设施卡（infraCardAddress）。
                 val unitPriceStr = assets.unitPriceUSDC6
                 val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
                 val cards = chargeableCards(assets)
-                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
-                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
+                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
+                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
                 val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
@@ -2573,7 +2661,7 @@ class MainActivity : ComponentActivity() {
                     composedItems.add(
                         mapOf(
                             "kind" to 1,
-                            "asset" to BEAMIO_USER_CARD_ASSET_ADDRESS,
+                            "asset" to infraCardAddress(),
                             "amount" to beamio1155PointsWei.toString(),
                             "tokenId" to "0",
                             "data" to "0x"
@@ -2588,7 +2676,7 @@ class MainActivity : ComponentActivity() {
                 val finalPayload = org.json.JSONObject(payload.toString())
                 finalPayload.put("items", itemsJson)
                 if (!finalPayload.has("maxAmount")) finalPayload.put("maxAmount", "0")
-                val merchantAssets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress())
+                val merchantAssets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress(), merchantInfraOnly = false)
                 val toAddr = merchantAssets?.aaAddress?.takeIf { it.isNotEmpty() } ?: payeeFromQr
                 if (toAddr.isEmpty()) {
                     runOnUiThread {
@@ -2659,7 +2747,7 @@ class MainActivity : ComponentActivity() {
                 val customerAccountForPostBalance = account  // 显式捕获客户 AA，避免闭包歧义
                 val preBalanceForCheck = totalBalanceCad
                 // 扣款来源卡地址：成功页显示该卡余额（非总资产），与用户预期一致
-                val deductedCardAddress = if (beamio1155PointsWei > 0) BEAMIO_USER_CARD_ASSET_ADDRESS else null
+                val deductedCardAddress = if (beamio1155PointsWei > 0) infraCardAddress() else null
                 if (!result.success) {
                     runOnUiThread {
                         paymentScreenRoutingSteps = steps
@@ -2681,7 +2769,7 @@ class MainActivity : ComponentActivity() {
                     Thread {
                         // 等待 5 秒确保链上确认（Base ~2s/block），避免拿到扣款前状态
                         Thread.sleep(5000)
-                        var postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
+                        var postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true, merchantInfraOnly = false)
                         var postCad = postAssets?.let { a ->
                             if (!a.ok) null else {
                                 val card = deductedCardAddress?.let { addr ->
@@ -2697,7 +2785,7 @@ class MainActivity : ComponentActivity() {
                         }
                         if (postCad != null && postCad >= preBalanceForCheck - 0.01 && totalCurrencyQr > 0.001) {
                             Thread.sleep(3000)
-                            postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true)
+                            postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true, merchantInfraOnly = false)
                             postCad = postAssets?.let { a ->
                                 if (!a.ok) null else {
                                     val card = deductedCardAddress?.let { addr ->
@@ -2795,7 +2883,7 @@ class MainActivity : ComponentActivity() {
                         put("nfcTipCurrencyAmount", b.tip.trim())
                         if (b.tipRateBps > 0) put("nfcTipRateBps", b.tipRateBps)
                     }
-                    put("merchantCardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
+                    put("merchantCardAddress", infraCardAddress())
                 }
             }
             val url = java.net.URL("$BEAMIO_API/api/AAtoEOA")
@@ -2848,7 +2936,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun fetchUidAssetsSync(uid: String, sunParams: SunParams? = null): UIDAssets? {
+    private fun fetchUidAssetsSync(uid: String, sunParams: SunParams? = null, merchantInfraOnly: Boolean = false): UIDAssets? {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/getUIDAssets")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -2860,6 +2948,7 @@ class MainActivity : ComponentActivity() {
             val body = org.json.JSONObject().apply {
                 put("uid", uid)
                 sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+                putMerchantInfraParams(merchantInfraOnly)
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -2877,8 +2966,8 @@ class MainActivity : ComponentActivity() {
     /** 可扣款卡：CCSA + 基础设施 (CashTrees) */
     private fun chargeableCards(assets: UIDAssets): List<CardItem> {
         return assets.cards?.filter {
-            it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) ||
-            it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true)
+            it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) ||
+            it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true)
         } ?: emptyList()
     }
 
@@ -2914,8 +3003,8 @@ class MainActivity : ComponentActivity() {
         val unitPriceUSDC6 = unitPriceStr.toLongOrNull() ?: 0L
         if (unitPriceUSDC6 <= 0) return PayByNfcResult(false, null, "Unit price 0")
         val cards = chargeableCards(assets)
-        val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
-        val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true) }
+        val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
+        val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
         val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
         val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
         val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
@@ -2983,7 +3072,7 @@ class MainActivity : ComponentActivity() {
         if (ccsaPointsWei > 0) {
             items.add(mapOf(
                 "kind" to 1,
-                "asset" to BEAMIO_USER_CARD_ASSET_ADDRESS,
+                "asset" to infraCardAddress(),
                 "amount" to ccsaPointsWei.toString(),
                 "tokenId" to "0",
                 "data" to "0x"
@@ -2992,7 +3081,7 @@ class MainActivity : ComponentActivity() {
         if (infraPointsWei > 0) {
             items.add(mapOf(
                 "kind" to 1,
-                "asset" to BEAMIO_USER_CARD_ASSET_ADDRESS,
+                "asset" to infraCardAddress(),
                 "amount" to infraPointsWei.toString(),
                 "tokenId" to "0",
                 "data" to "0x"
@@ -3168,7 +3257,7 @@ class MainActivity : ComponentActivity() {
                 put("e", sun.e)
                 put("c", sun.c)
                 put("m", sun.m)
-                put("cardAddress", BEAMIO_USER_CARD_ASSET_ADDRESS)
+                put("cardAddress", infraCardAddress())
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -3301,9 +3390,10 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun fetchWalletAssets(wallet: String) {
+    private fun fetchWalletAssets(wallet: String, merchantInfraOnly: Boolean = true) {
         Thread {
             try {
+                refreshMerchantInfraCardFromDbSync()
                 val apiUrl = java.net.URL("$BEAMIO_API/api/getWalletAssets")
                 val conn = apiUrl.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
@@ -3311,7 +3401,10 @@ class MainActivity : ComponentActivity() {
                 conn.doOutput = true
                 conn.connectTimeout = 15000
                 conn.readTimeout = 15000
-                val body = org.json.JSONObject().apply { put("wallet", wallet) }.toString()
+                val body = org.json.JSONObject().apply {
+                    put("wallet", wallet)
+                    putMerchantInfraParams(merchantInfraOnly)
+                }.toString()
                 conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
                 val code = conn.responseCode
                 val respBody = if (code in 200..299) conn.inputStream else conn.errorStream
@@ -3393,7 +3486,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /** @param forPostPayment 若为 true，请求体带 for=postPaymentBalance，便于服务端日志区分扣款后拉取 */
-    private fun fetchWalletAssetsSync(wallet: String, forPostPayment: Boolean = false): UIDAssets? {
+    private fun fetchWalletAssetsSync(wallet: String, forPostPayment: Boolean = false, merchantInfraOnly: Boolean = false): UIDAssets? {
         return try {
             val apiUrl = java.net.URL("$BEAMIO_API/api/getWalletAssets")
             val conn = apiUrl.openConnection() as java.net.HttpURLConnection
@@ -3405,6 +3498,7 @@ class MainActivity : ComponentActivity() {
             val body = org.json.JSONObject().apply {
                 put("wallet", wallet)
                 if (forPostPayment) put("for", "postPaymentBalance")
+                putMerchantInfraParams(merchantInfraOnly)
             }.toString()
             conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
@@ -3480,7 +3574,7 @@ class MainActivity : ComponentActivity() {
     /** GET /api/getCardAdminInfo 完整 JSON（含 admins / metadatas，与 biz 部署的 tierRouting 同源） */
     private fun fetchGetCardAdminInfoJsonSync(wallet: String): org.json.JSONObject? {
         return try {
-            val url = java.net.URL("$BEAMIO_API/api/getCardAdminInfo?cardAddress=${java.net.URLEncoder.encode(BEAMIO_USER_CARD_ASSET_ADDRESS, "UTF-8")}&wallet=${java.net.URLEncoder.encode(wallet, "UTF-8")}")
+            val url = java.net.URL("$BEAMIO_API/api/getCardAdminInfo?cardAddress=${java.net.URLEncoder.encode(infraCardAddress(), "UTF-8")}&wallet=${java.net.URLEncoder.encode(wallet, "UTF-8")}")
             val conn = url.openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "GET"
             conn.connectTimeout = 8000
@@ -3497,7 +3591,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 默认 BEAMIO_USER_CARD_ASSET_ADDRESS。 */
+    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 使用运行时基础设施卡。 */
     private fun fetchGetCardAdminInfoSync(wallet: String): String? {
         val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
         return root.optString("upperAdmin").takeIf { it.isNotEmpty() && it != "null" }
@@ -3506,12 +3600,15 @@ class MainActivity : ComponentActivity() {
 
     /**
      * 解析本终端 EOA 在 `getAdminListWithMetadata` 中对应条目的 metadata，读取 `tierRoutingDiscounts`（与 biz Sign & Deploy 一致）。
-     * @return Pair(taxPercent, discountSummary)；仅网络/解析失败时返回 null（不覆盖 UI 旧值）
+     * 与卡片 URI / DB 里的 `tiers[]` 不同：`tierRoutingDiscounts` 必须写在**链上 admin metadata**（或继承自上级的同字段）。
+     * @return Pair(taxPercent, discountSummary)；仅网络失败时返回 null（不覆盖 UI 旧值）
      */
     private fun fetchInfraRoutingForTerminalWalletSync(wallet: String): Pair<Double, String>? {
+        refreshMerchantInfraCardFromDbSync()
         val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
         val admins = root.optJSONArray("admins") ?: return null
         val metadatas = root.optJSONArray("metadatas") ?: return null
+        val parents = root.optJSONArray("parents")
         val wNorm = wallet.trim().lowercase()
         var idx = -1
         for (i in 0 until admins.length()) {
@@ -3521,16 +3618,104 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (idx < 0) return Pair(0.0, "Not on admin list")
-        val metaStr = metadatas.optString(idx, "").trim()
-        if (metaStr.isEmpty()) return Pair(0.0, "No routing metadata")
-        val parsed = parseTierRoutingDiscountsFromTerminalMetadata(metaStr, BEAMIO_USER_CARD_ASSET_ADDRESS)
-        return parsed ?: Pair(0.0, "No valid routing")
+
+        fun adminIndexForAddress(addr: String): Int {
+            val a = addr.trim().lowercase()
+            if (a.isEmpty() || a == "0x0000000000000000000000000000000000000000") return -1
+            for (i in 0 until admins.length()) {
+                if (admins.optString(i, "").trim().lowercase() == a) return i
+            }
+            return -1
+        }
+
+        fun parseAtRow(rowIdx: Int): Pair<Double, String>? {
+            if (rowIdx < 0 || rowIdx >= metadatas.length()) return null
+            val metaStr = metadatas.optString(rowIdx, "").trim()
+            if (metaStr.isEmpty()) return null
+            return parseTierRoutingDiscountsFromTerminalMetadata(metaStr, infraCardAddress())
+        }
+
+        // 1) 本终端一行
+        parseAtRow(idx)?.let { return it }
+
+        // 2) 沿 parents 向上查找（上级已 Deploy routing、子级 metadata 仍为空时）
+        var walk = idx
+        repeat(8) {
+            val pRaw = parents?.optString(walk, "").orEmpty().trim()
+            val pIdx = adminIndexForAddress(pRaw)
+            if (pIdx < 0) return@repeat
+            parseAtRow(pIdx)?.let { return it }
+            walk = pIdx
+        }
+
+        // 3) DB /api/cardMetadata：优先 tierRoutingDiscounts；否则用 metadata.tiers[].description 中的 N% 组装折扣（税率记 0）
+        fetchTierRoutingFromCardMetadataApi()?.let { return it }
+
+        val hadAnyMeta = metadatas.optString(idx, "").trim().isNotEmpty()
+        return Pair(0.0, if (hadAnyMeta) "No tier routing block" else "No routing metadata")
+    }
+
+    /** 从会员档文案中解析首个百分比，如 `10% discount` → 10 */
+    private fun parseDiscountPercentFromMembershipTierDescription(text: String): Int? {
+        if (text.isBlank()) return null
+        val m = Regex("""(\d+(?:\.\d+)?)\s*%""").find(text) ?: return null
+        val v = m.groupValues[1].toDoubleOrNull() ?: return null
+        return kotlin.math.round(v).toInt().coerceIn(0, 100)
+    }
+
+    /**
+     * 使用 `/api/cardMetadata` 返回的 `metadata.tiers`（非 `tierRoutingDiscounts`）按链上 `index` 排序组装 Home 折扣摘要。
+     * 仅展示用；税率由调用方置 0（与 Sign & Deploy 的 tax 无关）。
+     */
+    private fun parseMembershipTierDiscountSummaryFromMetadata(meta: org.json.JSONObject): String? {
+        val tiersArr = meta.optJSONArray("tiers") ?: return null
+        if (tiersArr.length() == 0) return null
+        data class IdxPct(val chainIndex: Int, val pct: Int)
+        val rows = mutableListOf<IdxPct>()
+        for (i in 0 until tiersArr.length()) {
+            val row = tiersArr.optJSONObject(i) ?: continue
+            val chainIndex = when (val v = row.opt("index")) {
+                is Number -> v.toInt()
+                is String -> v.toIntOrNull() ?: i
+                else -> i
+            }
+            val desc = row.optString("description", "").trim()
+            val pct = parseDiscountPercentFromMembershipTierDescription(desc) ?: continue
+            rows.add(IdxPct(chainIndex, pct))
+        }
+        if (rows.isEmpty()) return null
+        return rows.sortedBy { it.chainIndex }.joinToString(" · ") { "${it.pct}%" }
+    }
+
+    /**
+     * GET /api/cardMetadata（基础设施卡地址）：先 `tierRoutingDiscounts`；失败则 `metadata.tiers` + description 折扣；仍无则 null。
+     */
+    private fun fetchTierRoutingFromCardMetadataApi(): Pair<Double, String>? {
+        return try {
+            val enc = java.net.URLEncoder.encode(infraCardAddress(), "UTF-8")
+            val url = java.net.URL("$BEAMIO_API/api/cardMetadata?cardAddress=$enc")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            if (code !in 200..299) return null
+            val resp = org.json.JSONObject(body)
+            val meta = resp.optJSONObject("metadata") ?: return null
+            parseTierRoutingDiscountsFromTerminalMetadata(meta.toString(), infraCardAddress())
+                ?: parseMembershipTierDiscountSummaryFromMetadata(meta)?.let { summary -> Pair(0.0, summary) }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun parseTierRoutingDiscountsFromTerminalMetadata(metaJson: String, expectedInfrastructureCard: String): Pair<Double, String>? {
         return try {
             val root = org.json.JSONObject(metaJson)
-            val tr = root.optJSONObject("tierRoutingDiscounts") ?: return Pair(0.0, "No tier routing block")
+            val tr = root.optJSONObject("tierRoutingDiscounts") ?: return null
             if (tr.has("schemaVersion") && !tr.isNull("schemaVersion")) {
                 val sv = when (val v = tr.get("schemaVersion")) {
                     is Number -> v.toInt()
@@ -3621,9 +3806,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchTierRoutingDetailsForTerminalWalletSync(wallet: String): TierRoutingDetails? {
+        val metaStr = resolveAdminMetadataJsonForTerminalWithFallback(wallet) ?: return null
+        return parseTierRoutingDetailsFromTerminalMetadata(metaStr, infraCardAddress())
+            ?: fetchTierRoutingDetailsFromCardMetadataApi()
+    }
+
+    /** 终端自身 → 沿 parents 向上 → 与 [fetchInfraRoutingForTerminalWalletSync] 同源 */
+    private fun resolveAdminMetadataJsonForTerminalWithFallback(wallet: String): String? {
         val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
         val admins = root.optJSONArray("admins") ?: return null
         val metadatas = root.optJSONArray("metadatas") ?: return null
+        val parents = root.optJSONArray("parents")
         val wNorm = wallet.trim().lowercase()
         var idx = -1
         for (i in 0 until admins.length()) {
@@ -3633,9 +3826,53 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (idx < 0) return null
-        val metaStr = metadatas.optString(idx, "").trim()
-        if (metaStr.isEmpty()) return null
-        return parseTierRoutingDetailsFromTerminalMetadata(metaStr, BEAMIO_USER_CARD_ASSET_ADDRESS)
+
+        fun adminIndexForAddress(addr: String): Int {
+            val a = addr.trim().lowercase()
+            if (a.isEmpty() || a == "0x0000000000000000000000000000000000000000") return -1
+            for (i in 0 until admins.length()) {
+                if (admins.optString(i, "").trim().lowercase() == a) return i
+            }
+            return -1
+        }
+
+        fun rowHasTierRouting(rowIdx: Int): Boolean {
+            if (rowIdx < 0 || rowIdx >= metadatas.length()) return false
+            val s = metadatas.optString(rowIdx, "").trim()
+            if (s.isEmpty()) return false
+            return parseTierRoutingDiscountsFromTerminalMetadata(s, infraCardAddress()) != null
+        }
+
+        var walk = idx
+        repeat(8) {
+            if (rowHasTierRouting(walk)) return metadatas.optString(walk, "").trim()
+            val pRaw = parents?.optString(walk, "").orEmpty().trim()
+            val pIdx = adminIndexForAddress(pRaw)
+            if (pIdx < 0) return@repeat
+            walk = pIdx
+        }
+        return metadatas.optString(idx, "").trim().takeIf { it.isNotEmpty() }
+    }
+
+    private fun fetchTierRoutingDetailsFromCardMetadataApi(): TierRoutingDetails? {
+        return try {
+            val enc = java.net.URLEncoder.encode(infraCardAddress(), "UTF-8")
+            val url = java.net.URL("$BEAMIO_API/api/cardMetadata?cardAddress=$enc")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            if (code !in 200..299) return null
+            val resp = org.json.JSONObject(body)
+            val meta = resp.optJSONObject("metadata") ?: return null
+            parseTierRoutingDetailsFromTerminalMetadata(meta.toString(), infraCardAddress())
+        } catch (_: Exception) {
+            null
+        }
     }
 
     /** 按客户 NFT `tier` 字段匹配 routing 表（取最大折扣率） */
@@ -3814,7 +4051,7 @@ class MainActivity : ComponentActivity() {
         }
         return try {
             val data = buildGetAdminStatsFullCalldata(adminAddr)
-            val reqBody = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"$BEAMIO_USER_CARD_ASSET_ADDRESS","data":"$data"},"latest"],"id":1}"""
+            val reqBody = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"${infraCardAddress()}","data":"$data"},"latest"],"id":1}"""
             val conn = java.net.URL(BASE_RPC_URL).openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
@@ -3869,9 +4106,94 @@ class MainActivity : ComponentActivity() {
         return charge to topUp
     }
 
-    private fun fetchUidAssets(uid: String, sunParams: SunParams? = null) {
+    /** eth_call：成功返回 `result` 十六进制（含 0x）；错误 / revert / 空结果返回 null */
+    private fun jsonRpcEthCall(toAddress: String, dataHex: String): String? {
+        val to = run {
+            val t = toAddress.trim()
+            if (t.startsWith("0x", ignoreCase = true)) t.lowercase() else "0x${t.lowercase()}"
+        }
+        if (!looksLikeEthereumAddress(to)) return null
+        val data = if (dataHex.startsWith("0x", ignoreCase = true)) dataHex.lowercase() else "0x$dataHex".lowercase()
+        return try {
+            val reqBody = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"$to","data":"$data"},"latest"],"id":1}"""
+            val conn = java.net.URL(BASE_RPC_URL).openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            conn.outputStream.use { it.write(reqBody.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val json = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            if (code !in 200..299) return null
+            val root = org.json.JSONObject(json)
+            if (root.optJSONObject("error") != null) return null
+            val result = root.optString("result", "")
+            if (result.isEmpty() || result == "0x") null else result
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** `tiers(uint256 index)` calldata — 返回 (minUsdc6, attr, tierExpirySeconds) 各 32 字节 */
+    private fun buildTiersGetterCalldata(index: Long): String {
+        val idx = index.coerceAtLeast(0L)
+        val idxHex = java.lang.Long.toHexString(idx).lowercase().padStart(64, '0')
+        return SEL_TIERS_UINT256 + idxHex
+    }
+
+    private fun decodeTiersPublicGetterResult(hex: String): Triple<Long, Long, Long>? {
+        val raw = hex.removePrefix("0x")
+        if (raw.length < 192) return null
+        fun wordToLong(w: String): Long {
+            val bi = java.math.BigInteger(w, 16)
+            val maxBi = java.math.BigInteger.valueOf(Long.MAX_VALUE)
+            return if (bi > maxBi) Long.MAX_VALUE else bi.toLong()
+        }
+        val w0 = raw.substring(0, 64)
+        val w1 = raw.substring(64, 128)
+        val w2 = raw.substring(128, 192)
+        return Triple(wordToLong(w0), wordToLong(w1), wordToLong(w2))
+    }
+
+    /**
+     * 对任意 BeamioUserCard 地址链上读取 `tiers(i)`（无独立 tiersLength view，索引递增直至 revert）。
+     * 转成 [MetadataTier] 供 [enrichCardTierFromMetadata] 与 API metadata 相同的消费路径；不含 JSON 里的 name/image 时仅用占位英文说明。
+     */
+    private fun fetchChainTiersAsMetadataTiersSync(cardAddress: String): List<MetadataTier> {
+        val to = cardAddress.trim()
+        if (!looksLikeEthereumAddress(to)) return emptyList()
+        val out = mutableListOf<MetadataTier>()
+        for (i in 0 until CHAIN_TIERS_MAX_PROBE) {
+            val hex = jsonRpcEthCall(to, buildTiersGetterCalldata(i.toLong())) ?: break
+            val triple = decodeTiersPublicGetterResult(hex) ?: break
+            val (minUsdc6, attr, expSec) = triple
+            val desc = buildString {
+                append("attr=").append(attr)
+                append(", expirySeconds=")
+                append(if (expSec == 0L) "global" else expSec.toString())
+            }
+            out.add(
+                MetadataTier(
+                    minUsdc6 = minUsdc6.coerceAtLeast(0L),
+                    name = "Tier $i",
+                    description = desc,
+                    image = null,
+                    backgroundColor = null
+                )
+            )
+        }
+        if (out.isNotEmpty()) {
+            Log.d("ChainTiers", "card=${to.lowercase()} chainTierCount=${out.size}")
+        }
+        return out.sortedBy { it.minUsdc6 }
+    }
+
+    private fun fetchUidAssets(uid: String, sunParams: SunParams? = null, merchantInfraOnly: Boolean = false) {
         Thread {
             try {
+                refreshMerchantInfraCardFromDbSync()
                 val url = java.net.URL("$BEAMIO_API/api/getUIDAssets")
                 val conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
@@ -3882,6 +4204,7 @@ class MainActivity : ComponentActivity() {
                 val body = org.json.JSONObject().apply {
                     put("uid", uid)
                     sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+                    putMerchantInfraParams(merchantInfraOnly)
                 }.toString()
                 conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
                 val code = conn.responseCode
@@ -3954,15 +4277,16 @@ class MainActivity : ComponentActivity() {
         return parsed.sortedBy { it.minUsdc6 }
     }
 
-    /** Pre-fetch BEAMIO_USER_CARD_ASSET_ADDRESS metadata and tiers on Home enter. Cached globally; topup/charge success uses cache without re-fetch. */
+    /** Pre-fetch 基础设施卡 metadata 与 tiers（Home 进入时）。缓存全局；topup/charge 成功路径复用缓存。 */
     private fun prefetchInfraCardMetadata() {
-        fetchCardMetadataTiers(BEAMIO_USER_CARD_ASSET_ADDRESS)
+        fetchCardMetadataTiers(infraCardAddress())
     }
 
     private fun fetchCardMetadataTiers(cardAddress: String): List<MetadataTier> {
         val key = cardAddress.lowercase()
         cardMetadataTierCache[key]?.let { return it }
-        return try {
+        var apiTiers: List<MetadataTier> = emptyList()
+        try {
             val url = java.net.URL("$BEAMIO_API/api/cardMetadata?cardAddress=$cardAddress")
             val conn = url.openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "GET"
@@ -3971,13 +4295,16 @@ class MainActivity : ComponentActivity() {
             val code = conn.responseCode
             val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
             conn.disconnect()
-            val root = org.json.JSONObject(body)
-            val tiers = parseMetadataTiers(root.optJSONObject("metadata"))
-            cardMetadataTierCache[key] = tiers
-            tiers
+            if (code in 200..299) {
+                val root = org.json.JSONObject(body)
+                apiTiers = parseMetadataTiers(root.optJSONObject("metadata"))
+            }
         } catch (_: Exception) {
-            emptyList()
         }
+        val resolved = apiTiers.takeIf { it.isNotEmpty() }
+            ?: fetchChainTiersAsMetadataTiersSync(cardAddress)
+        cardMetadataTierCache[key] = resolved
+        return resolved
     }
 
     /** Fetch per-NFT tier metadata image from GET /api/metadata/0x{cardAddress}{tokenId}.json (same source as getUIDAssets). */
@@ -4006,7 +4333,7 @@ class MainActivity : ComponentActivity() {
     private fun enrichCardTierFromMetadata(card: CardItem): CardItem {
         val needTier = card.tierName.isNullOrBlank() || card.tierDescription.isNullOrBlank() || card.cardBackground.isNullOrBlank() || card.cardImage.isNullOrBlank()
         if (!needTier) return card
-        val isInfraCard = card.cardAddress.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true)
+        val isInfraCard = card.cardAddress.equals(infraCardAddress(), ignoreCase = true)
         var cardImage = card.cardImage
         // For infra card: use cached tiers only (pre-fetched on Home enter). No per-NFT fetch after topup/charge.
         if (cardImage.isNullOrBlank() && !isInfraCard) {
@@ -4095,8 +4422,8 @@ class MainActivity : ComponentActivity() {
                 if (legacyAddr != null && !legacyAddr.equals(DEPRECATED_CARD_ADDRESS, ignoreCase = true)) {
                     listOf(CardItem(
                         cardAddress = legacyAddr,
-                        cardName = if (legacyAddr.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true)) "CCSA CARD" else "Card",
-                        cardType = if (legacyAddr.equals(BEAMIO_USER_CARD_ASSET_ADDRESS, ignoreCase = true)) "ccsa" else "infrastructure",
+                        cardName = if (legacyAddr.equals(infraCardAddress(), ignoreCase = true)) "CCSA CARD" else "Card",
+                        cardType = if (legacyAddr.equals(infraCardAddress(), ignoreCase = true)) "ccsa" else "infrastructure",
                         points = root.optString("points", "0"),
                         points6 = root.optString("points6", "0"),
                         cardCurrency = root.optString("cardCurrency", "CAD"),
@@ -4110,6 +4437,10 @@ class MainActivity : ComponentActivity() {
             }
             val unitPriceUSDC6 = root.optString("unitPriceUSDC6").takeIf { it.isNotEmpty() }
             val beamioUserCard = root.optString("beamioUserCard").takeIf { it.isNotEmpty() }
+            val beamioTagVal = root.optString("beamioTag").takeIf { it.isNotEmpty() }
+                ?: root.optString("accountName").takeIf { it.isNotEmpty() }
+                ?: root.optString("username").takeIf { it.isNotEmpty() }
+            val beamioTagNormalized = beamioTagVal?.trim()?.removePrefix("@")?.trim()?.takeIf { it.isNotEmpty() }
             val uidVal = root.optString("uid").takeIf { it.isNotEmpty() }
             val tagIdHexVal = root.optString("tagIdHex").takeIf { it.isNotEmpty() }
             val counterHexVal = root.optString("counterHex").takeIf { it.isNotEmpty() }
@@ -4120,6 +4451,7 @@ class MainActivity : ComponentActivity() {
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    beamioTag = beamioTagNormalized,
                     uid = uidVal,
                     tagIdHex = tagIdHexVal,
                     counterHex = counterHexVal,
@@ -4142,6 +4474,7 @@ class MainActivity : ComponentActivity() {
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    beamioTag = beamioTagNormalized,
                     uid = uidVal,
                     tagIdHex = tagIdHexVal,
                     counterHex = counterHexVal,
@@ -4367,7 +4700,7 @@ class MainActivity : ComponentActivity() {
             readScreenAssets = null
             readScreenError = ""
             readArmed = false
-            fetchUidAssets(sunParams?.uid ?: uid, sunParams)
+            fetchUidAssets(sunParams?.uid ?: uid, sunParams, merchantInfraOnly = false)
         }
     }
 
@@ -5009,7 +5342,6 @@ private fun TopupSuccessContent(
                 .padding(horizontal = 20.dp)
                 .padding(bottom = 12.dp)
         ) {
-            val iconBgColor = Color(0xFF3C6A43)
             val accentGreen = Color(0xFF6ED088)
             val labelGrey = Color(0xFFBBBBBB)
             Card(
@@ -5017,54 +5349,69 @@ private fun TopupSuccessContent(
                 shape = RoundedCornerShape(24.dp),
                 colors = CardDefaults.cardColors(containerColor = cardBgColor)
             ) {
-                Box(
+                // 使用 Column + Row 顺序排版，避免 Box 顶栏与 BottomCenter 行在文字变多行时重叠（动态卡 metadata / 链上 tier 描述可能较长）
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 16.dp)
                 ) {
-                    if (cardImage != null && cardImage.isNotBlank()) {
-                        AsyncImage(
-                            model = cardImage,
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            alignment = Alignment.Center,
-                            modifier = Modifier
-                                .size(176.dp, 140.dp)
-                                .align(Alignment.TopStart)
-                        )
-                    }
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (cardImage == null || cardImage.isBlank()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        when {
+                            cardImage != null && cardImage.isNotBlank() -> {
+                                AsyncImage(
+                                    model = cardImage,
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    alignment = Alignment.Center,
+                                    modifier = Modifier.size(176.dp, 140.dp)
+                                )
+                            }
+                            else -> {
                                 Icon(Icons.Filled.Favorite, null, Modifier.size(44.dp), tint = accentGreen)
                             }
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .then(if (cardImage != null && cardImage.isNotBlank()) Modifier.padding(start = 176.dp) else Modifier),
-                                horizontalAlignment = Alignment.End
-                            ) {
+                        }
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(start = 12.dp),
+                            horizontalAlignment = Alignment.End
+                        ) {
+                            val titleTxt = tierName?.takeIf { it.isNotBlank() }
+                                ?.removeSuffix(" CARD")?.removeSuffix(" Card") ?: "Card"
+                            Text(
+                                titleTxt,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.End,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            val subtitle = tierDescription?.takeIf { it.isNotBlank() }
+                                ?.takeIf { !it.equals("Card", ignoreCase = true) } ?: ""
+                            if (subtitle.isNotBlank()) {
                                 Text(
-                                    tierName?.takeIf { it.isNotBlank() }?.removeSuffix(" CARD")?.removeSuffix(" Card") ?: "Card",
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
+                                    subtitle,
+                                    fontSize = 12.sp,
+                                    color = labelGrey,
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis,
+                                    textAlign = TextAlign.End,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 4.dp)
                                 )
-                                val subtitle = tierDescription?.takeIf { it.isNotBlank() }?.takeIf { !it.equals("Card", ignoreCase = true) } ?: ""
-                                if (subtitle.isNotBlank()) {
-                                    Text(subtitle, fontSize = 12.sp, color = labelGrey)
-                                }
                             }
                         }
                     }
+                    Spacer(modifier = Modifier.height(20.dp))
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter),
+                        modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.Bottom
                     ) {
@@ -5075,6 +5422,8 @@ private fun TopupSuccessContent(
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                                 fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                             )
                         }
@@ -5368,6 +5717,13 @@ private fun parseHexColor(hex: String?): Color? {
     }
 }
 
+/** `0x` + 40 hex：不在 Account 面板作为 uid 展示，避免与 EOA/AA 混淆 */
+private fun looksLikeEthereumAddress(value: String): Boolean {
+    val t = value.trim()
+    if (!t.startsWith("0x", ignoreCase = true) || t.length != 42) return false
+    return t.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+}
+
 /** Member # from one card: API `primaryMemberTokenId` (max `tiers[i].minUsdc6`) or legacy max tokenId. */
 private fun memberNoFromCardItem(card: CardItem?): String {
     if (card == null) return ""
@@ -5426,70 +5782,81 @@ private fun ReadBalancePassCard(
         shape = RoundedCornerShape(corner),
         colors = CardDefaults.cardColors(containerColor = bgColor)
     ) {
-        Box(
+        val gapHeaderToFooter = if (compact) 12.dp else 16.dp
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = padS, top = padT, end = padE, bottom = padB)
         ) {
-            if (card.cardImage != null && card.cardImage!!.isNotBlank()) {
-                AsyncImage(
-                    model = card.cardImage,
-                    contentDescription = card.cardName,
-                    contentScale = ContentScale.Crop,
-                    alignment = Alignment.Center,
-                    modifier = Modifier
-                        .size(imgW, imgH)
-                        .align(Alignment.TopStart)
-                )
-            }
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (card.cardImage == null || card.cardImage!!.isBlank()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Top
+            ) {
+                when {
+                    card.cardImage != null && card.cardImage!!.isNotBlank() -> {
+                        AsyncImage(
+                            model = card.cardImage,
+                            contentDescription = card.cardName,
+                            contentScale = ContentScale.Crop,
+                            alignment = Alignment.Center,
+                            modifier = Modifier.size(imgW, imgH)
+                        )
+                    }
+                    else -> {
                         Icon(Icons.Filled.Favorite, null, Modifier.size(iconSz), tint = accentGreen)
                     }
-                    Column(
-                        modifier = Modifier
-                            .weight(1f)
-                            .then(
-                                if (card.cardImage != null && card.cardImage!!.isNotBlank()) {
-                                    Modifier.padding(start = imgW + 6.dp)
-                                } else {
-                                    Modifier
-                                }
-                            ),
-                        horizontalAlignment = Alignment.End
-                    ) {
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(start = 6.dp),
+                    horizontalAlignment = Alignment.End
+                ) {
+                    Text(
+                        card.cardName.removeSuffix(" CARD").removeSuffix(" Card"),
+                        fontSize = titleFs,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    val subtitle = card.tierName
+                        ?: card.tierDescription?.takeIf { it.isNotBlank() }
+                        ?: card.cardType.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() }
+                        ?: ""
+                    if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
                         Text(
-                            card.cardName.removeSuffix(" CARD").removeSuffix(" Card"),
-                            fontSize = titleFs,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                            subtitle,
+                            fontSize = subFs,
+                            color = labelGrey,
+                            maxLines = if (compact) 3 else 4,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 2.dp)
                         )
-                        val subtitle = card.tierName ?: card.cardType.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
-                        if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
-                            Text(subtitle, fontSize = subFs, color = labelGrey)
-                        }
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(gapHeaderToFooter))
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .align(Alignment.BottomCenter),
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Bottom
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text("Member No.", fontSize = balLblFs, color = labelGrey)
                     Text(
                         memberNo.ifEmpty { "—" },
                         fontSize = memFs,
                         fontWeight = FontWeight.Bold,
                         color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                     )
                 }
@@ -5577,7 +5944,7 @@ internal fun ReadScreen(
                 var responseExpanded by remember(rawResponseJson) { mutableStateOf(false) }
                 var topupButtonEnabled by remember { mutableStateOf(true) }
                 // 每次进入 Balance Loaded（uid / 账户变化）重新计时 1 分钟
-                LaunchedEffect(uid, assets?.aaAddress, assets?.address) {
+                LaunchedEffect(uid, assets?.beamioTag, assets?.uid, assets?.tagIdHex, assets?.counter) {
                     topupButtonEnabled = true
                     delay(60_000L)
                     topupButtonEnabled = false
@@ -5652,12 +6019,12 @@ internal fun ReadScreen(
                                     .padding(horizontal = sidePad)
                                     .padding(bottom = gapSm)
                             ) {
-                                val eoaAddr = assets?.address?.takeIf { it.isNotEmpty() }
-                                val aaAddr = assets?.aaAddress?.takeIf { it.isNotEmpty() }
-                                val displayUid = assets?.uid?.takeIf { it.isNotEmpty() } ?: uid.takeIf { it.isNotEmpty() }
+                                val displayBeamioTag = assets?.beamioTag?.trim()?.removePrefix("@")?.trim()?.takeIf { it.isNotEmpty() }
+                                val rawUid = assets?.uid?.takeIf { it.isNotEmpty() } ?: uid.takeIf { it.isNotEmpty() }
+                                val uidForDisplay = rawUid?.takeIf { !looksLikeEthereumAddress(it) }
                                 val tagId = assets?.tagIdHex?.takeIf { it.isNotEmpty() }
                                 val counterVal = assets?.counter
-                                if (eoaAddr != null || aaAddr != null || displayUid != null || tagId != null || counterVal != null) {
+                                if (displayBeamioTag != null || uidForDisplay != null || tagId != null || counterVal != null) {
                                     Card(
                                         modifier = Modifier.fillMaxWidth(),
                                         shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
@@ -5690,19 +6057,30 @@ internal fun ReadScreen(
                                             }
                                             Row(
                                                 modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                displayUid?.let { uidVal ->
-                                                    HexCopyCapsule(
-                                                        value = uidVal,
-                                                        copyLabel = "uid",
-                                                        leadingIcon = {
-                                                            Icon(Icons.Filled.Fingerprint, null, Modifier.size(11.dp), tint = Color(0xFF1562f0))
-                                                        }
-                                                    )
+                                                Box(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .wrapContentHeight(),
+                                                    contentAlignment = Alignment.CenterStart
+                                                ) {
+                                                    when {
+                                                        displayBeamioTag != null -> BeamioTagCopyCapsule(
+                                                            beamioTag = displayBeamioTag,
+                                                            modifier = Modifier.fillMaxWidth()
+                                                        )
+                                                        uidForDisplay != null -> HexCopyCapsule(
+                                                            value = uidForDisplay,
+                                                            copyLabel = "uid",
+                                                            leadingIcon = {
+                                                                Icon(Icons.Filled.Fingerprint, null, Modifier.size(11.dp), tint = Color(0xFF1562f0))
+                                                            }
+                                                        )
+                                                        else -> { }
+                                                    }
                                                 }
-                                                Spacer(modifier = Modifier.weight(1f))
                                                 if (tagId != null) {
                                                     HexCopyCapsule(
                                                         value = tagId,
@@ -6031,69 +6409,83 @@ private fun PaymentSuccessContent(
                     val labelGrey = Color(0xFFBBBBBB)
                     val voucherInnerPad = if (vCompactH) 14.dp else 20.dp
                     val voucherInnerBottom = if (vCompactH) 12.dp else 16.dp
+                    val gapVoucherHeaderToFooter = if (vCompactH) 12.dp else 18.dp
                     Card(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(24.dp),
                         colors = CardDefaults.cardColors(containerColor = cardBgColor)
                     ) {
-                        Box(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(start = voucherInnerPad, top = voucherInnerPad, end = voucherInnerPad, bottom = voucherInnerBottom)
                         ) {
-                            if (cardImage != null && cardImage.isNotBlank()) {
-                                AsyncImage(
-                                    model = cardImage,
-                                    contentDescription = "Card",
-                                    contentScale = ContentScale.Crop,
-                                    alignment = Alignment.Center,
-                                    modifier = Modifier
-                                        .size(cardImgW, cardImgH)
-                                        .align(Alignment.TopStart)
-                                )
-                            }
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    if (cardImage == null || cardImage.isBlank()) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.Top
+                            ) {
+                                when {
+                                    cardImage != null && cardImage.isNotBlank() -> {
+                                        AsyncImage(
+                                            model = cardImage,
+                                            contentDescription = "Card",
+                                            contentScale = ContentScale.Crop,
+                                            alignment = Alignment.Center,
+                                            modifier = Modifier.size(cardImgW, cardImgH)
+                                        )
+                                    }
+                                    else -> {
                                         Icon(Icons.Filled.Favorite, null, Modifier.size(if (vCompactH) 36.dp else 44.dp), tint = accentGreen)
                                     }
-                                    Column(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .then(if (cardImage != null && cardImage.isNotBlank()) Modifier.padding(start = cardImgW) else Modifier),
-                                        horizontalAlignment = Alignment.End
-                                    ) {
+                                }
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(start = 10.dp),
+                                    horizontalAlignment = Alignment.End
+                                ) {
+                                    Text(
+                                        (cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        textAlign = TextAlign.End,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                    val subtitle = tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
+                                    if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
                                         Text(
-                                            (cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
-                                            fontSize = 16.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            color = Color.White
+                                            subtitle,
+                                            fontSize = 12.sp,
+                                            color = labelGrey,
+                                            maxLines = if (vCompactH) 3 else 4,
+                                            overflow = TextOverflow.Ellipsis,
+                                            textAlign = TextAlign.End,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 4.dp)
                                         )
-                                        val subtitle = tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
-                                        if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
-                                            Text(subtitle, fontSize = 12.sp, color = labelGrey)
-                                        }
                                     }
                                 }
                             }
+                            Spacer(modifier = Modifier.height(gapVoucherHeaderToFooter))
                             Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .align(Alignment.BottomCenter),
+                                modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.Bottom
                             ) {
-                                Column {
+                                Column(modifier = Modifier.weight(1f)) {
                                     Text("Member No.", fontSize = 11.sp, color = labelGrey)
                                     Text(
                                         displayMemberNo,
                                         fontSize = 15.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = Color.White,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
                                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
                                     )
                                 }
@@ -6619,6 +7011,62 @@ fun WelcomePanelNoAA(
                 )
             }
         }
+    }
+}
+
+/** Balance Loaded：展示 @beamioTag，点击复制纯 tag（无 @）；无 tag 时调用方勿渲染 */
+@Composable
+private fun BeamioTagCopyCapsule(
+    beamioTag: String,
+    modifier: Modifier = Modifier
+) {
+    val normalized = beamioTag.trim().removePrefix("@").trim()
+    if (normalized.isEmpty()) return
+    val context = LocalContext.current
+    var copied by remember(beamioTag) { mutableStateOf(false) }
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(2000)
+            copied = false
+        }
+    }
+    val display = "@$normalized"
+    val short = if (display.length >= 14) "${display.take(8)}…${display.takeLast(4)}" else display
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(Color.Black.copy(alpha = 0.06f))
+            .clickable {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                cm?.setPrimaryClip(ClipData.newPlainText("beamioTag", normalized))
+                copied = true
+            }
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Icon(
+            Icons.Filled.Store,
+            contentDescription = null,
+            modifier = Modifier.size(11.dp),
+            tint = Color(0xFF1562f0)
+        )
+        Text(
+            short,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+            color = Color.Black,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        Icon(
+            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+            contentDescription = "Copy beamio tag",
+            modifier = Modifier.size(12.dp),
+            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
+        )
     }
 }
 
