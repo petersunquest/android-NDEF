@@ -236,7 +236,9 @@ private data class MetadataTier(
     val name: String?,
     val description: String?,
     val image: String?,
-    val backgroundColor: String?
+    val backgroundColor: String?,
+    /** Card contract `tiers(i)` index or JSON `metadata.tiers[].index` — aligns with `_findBestValidMembership` / `primaryMemberTokenId`. */
+    val chainTierIndex: Int? = null
 )
 
 internal sealed class ReadStatus {
@@ -338,6 +340,10 @@ class MainActivity : ComponentActivity() {
         /** 链上 tiers 无 length getter，依次探测直至 revert */
         private const val CHAIN_TIERS_MAX_PROBE = 48
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
+        /** POS 为链上 owner 直属 admin 时，QR/NFC Charge 需附 chargeOwnerChildBurn；与链上 adminParent(eoa)==owner(card) 一致 */
+        private const val PREF_KEY_CHARGE_OWNER_CHILD_ELIGIBLE = "charge_owner_child_burn_eligible"
+        private const val PREF_KEY_CHARGE_OWNER_CHILD_CARD = "charge_owner_child_burn_card"
+        private const val PREF_KEY_CHARGE_OWNER_CHILD_WALLET = "charge_owner_child_burn_wallet"
         /** 已废弃的旧卡地址，从 endpoint 返回的资产中过滤掉 */
         private const val DEPRECATED_CARD_ADDRESS = "0xEcC5bDFF6716847e45363befD3506B1D539c02D5"
         /** 付款动态 QR 解析失败时的 Logcat 标签（adb logcat -s BeamioQrPayment） */
@@ -360,6 +366,8 @@ class MainActivity : ComponentActivity() {
     private var topupScreenTierName by mutableStateOf<String?>(null)
     private var topupScreenTierDescription by mutableStateOf<String?>(null)
     private var topupScreenMemberNo by mutableStateOf<String?>(null)
+    /** Top-up 成功页 Pass 与 Balance Loaded 对齐：保留整卡快照（含 nfts / primaryMemberTokenId） */
+    private var topupScreenPassCardSnapshot by mutableStateOf<CardItem?>(null)
     private var topupArmed by mutableStateOf(false)
     private var topupViaQr by mutableStateOf(false)
 
@@ -397,6 +405,8 @@ class MainActivity : ComponentActivity() {
     private var paymentScreenTierName by mutableStateOf<String?>(null)
     private var paymentScreenCardType by mutableStateOf<String?>(null)
     private var paymentScreenMemberNo by mutableStateOf<String?>(null)
+    /** Charge 成功页 Pass 与 Balance Loaded 对齐 */
+    private var paymentScreenPassCardSnapshot by mutableStateOf<CardItem?>(null)
     /** Charge 选小费页填写的桌号，随成功页 / 打印收据展示 */
     private var paymentScreenTableNumber by mutableStateOf("")
     private var paymentArmed by mutableStateOf(false)
@@ -846,6 +856,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenCardImage = null
                         topupScreenTierName = null
                         topupScreenTierDescription = null
+                        topupScreenPassCardSnapshot = null
                         topupArmed = false
                         if (beamioTab != null) {
                             executeTopupWithBeamioTag(beamioTab, topupScreenAmount)
@@ -1017,6 +1028,7 @@ class MainActivity : ComponentActivity() {
                         cardImage = topupScreenCardImage,
                         tierName = topupScreenTierName,
                         tierDescription = topupScreenTierDescription,
+                        passCardSnapshot = topupScreenPassCardSnapshot,
                         settlementViaQr = topupViaQr,
                         onBack = { closeTopupScreen() },
                         modifier = Modifier.fillMaxSize()
@@ -1096,6 +1108,7 @@ class MainActivity : ComponentActivity() {
                         paymentCardName = if (pendingScanAction == "payment") paymentScreenCardName else null,
                         paymentTierName = if (pendingScanAction == "payment") paymentScreenTierName else null,
                         paymentCardType = if (pendingScanAction == "payment") paymentScreenCardType else null,
+                        paymentPassCard = if (pendingScanAction == "payment") paymentScreenPassCardSnapshot else null,
                         paymentChargeTaxPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTaxPercent else null,
                         paymentChargeTierDiscountPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTierDiscountPercent else null,
                         paymentChargeTipBps = if (pendingScanAction == "payment") paymentScreenTipRateBps else 0,
@@ -1237,6 +1250,7 @@ class MainActivity : ComponentActivity() {
                         cardName = paymentScreenCardName,
                         tierName = paymentScreenTierName,
                         cardType = paymentScreenCardType,
+                        passCardSnapshot = paymentScreenPassCardSnapshot,
                         settlementViaQr = paymentViaQr,
                         chargeTaxPercent = paymentChargeBreakdownTaxPercent,
                         chargeTierDiscountPercent = paymentChargeBreakdownTierDiscountPercent,
@@ -1446,6 +1460,7 @@ class MainActivity : ComponentActivity() {
         paymentScreenTierName = null
         paymentScreenCardType = null
         paymentScreenMemberNo = null
+        paymentScreenPassCardSnapshot = null
         paymentScreenTableNumber = ""
         paymentQrInterpreting = false
         paymentQrParseError = ""
@@ -1502,6 +1517,7 @@ class MainActivity : ComponentActivity() {
         topupScreenTierName = null
         topupScreenTierDescription = null
         topupScreenMemberNo = null
+        topupScreenPassCardSnapshot = null
     }
 
     /** 重置读取相关状态 */
@@ -1572,6 +1588,7 @@ class MainActivity : ComponentActivity() {
             paymentScreenTierName = null
             paymentScreenCardType = null
             paymentScreenMemberNo = null
+            paymentScreenPassCardSnapshot = null
             paymentChargeBreakdownTierDiscountPercent = null
             scanMethodState = "qr"
             startEmbeddedQrScanning()
@@ -1579,6 +1596,7 @@ class MainActivity : ComponentActivity() {
             qrScanningActive = false
             scanMethodState = "nfc"
             paymentChargeBreakdownTierDiscountPercent = null
+            paymentScreenPassCardSnapshot = null
             armForNfcScan()
         }
     }
@@ -1701,6 +1719,7 @@ class MainActivity : ComponentActivity() {
                 topupScreenCardImage = null
                 topupScreenTierName = null
                 topupScreenTierDescription = null
+                topupScreenPassCardSnapshot = null
                 topupArmed = true
                 readArmed = false
                 initArmed = false
@@ -1732,6 +1751,7 @@ class MainActivity : ComponentActivity() {
                 paymentScreenCardName = null
                 paymentScreenTierName = null
                 paymentScreenCardType = null
+                paymentScreenPassCardSnapshot = null
                 paymentArmed = true
                 readArmed = false
                 initArmed = false
@@ -1758,6 +1778,7 @@ class MainActivity : ComponentActivity() {
             topupScreenCardImage = null
             topupScreenTierName = null
             topupScreenTierDescription = null
+            topupScreenPassCardSnapshot = null
             topupArmed = true
             readArmed = false
             initArmed = false
@@ -1793,6 +1814,13 @@ class MainActivity : ComponentActivity() {
                 paymentScreenPreBalance = null
                 paymentScreenPostBalance = null
                 paymentScreenCardCurrency = null
+                paymentScreenCardBackground = null
+                paymentScreenCardImage = null
+                paymentScreenCardName = null
+                paymentScreenTierName = null
+                paymentScreenCardType = null
+                paymentScreenMemberNo = null
+                paymentScreenPassCardSnapshot = null
                 paymentArmed = true
                 readArmed = false
                 initArmed = false
@@ -1897,6 +1925,7 @@ class MainActivity : ComponentActivity() {
                     topupScreenTierName = topupCard?.tierName
                     topupScreenTierDescription = topupCard?.tierDescription
                     topupScreenMemberNo = memberNo.ifEmpty { null }
+                    topupScreenPassCardSnapshot = topupCard
                 }
 
                 // panel ID address = 全局 POS 钱包，topup 签字必须使用此地址（BeamioWeb3Wallet 唯一真相来源）
@@ -1939,6 +1968,7 @@ class MainActivity : ComponentActivity() {
                                     topupScreenCardImage = postCard?.cardImage ?: topupScreenCardImage
                                     topupScreenTierName = postCard?.tierName ?: topupScreenTierName
                                     topupScreenTierDescription = postCard?.tierDescription ?: topupScreenTierDescription
+                                    if (postCard != null) topupScreenPassCardSnapshot = postCard
                                     topupScreenPostBalance = postCard?.points ?: postAssets.points ?: "—"
                                 } else {
                                     topupScreenPostBalance = "—"
@@ -2117,6 +2147,7 @@ class MainActivity : ComponentActivity() {
                     topupScreenTierName = topupCard?.tierName
                     topupScreenTierDescription = topupCard?.tierDescription
                     topupScreenMemberNo = memberNo.ifEmpty { null }
+                    topupScreenPassCardSnapshot = topupCard
                 }
 
                 // panel ID address = 全局 POS 钱包，topup 签字必须使用此地址（BeamioWeb3Wallet 唯一真相来源）
@@ -2151,6 +2182,7 @@ class MainActivity : ComponentActivity() {
                                     topupScreenCardImage = postCard?.cardImage ?: topupScreenCardImage
                                     topupScreenTierName = postCard?.tierName ?: topupScreenTierName
                                     topupScreenTierDescription = postCard?.tierDescription ?: topupScreenTierDescription
+                                    if (postCard != null) topupScreenPassCardSnapshot = postCard
                                     topupScreenPostBalance = postCard?.points ?: postAssets.points ?: "—"
                                 } else {
                                     topupScreenPostBalance = "—"
@@ -2402,6 +2434,7 @@ class MainActivity : ComponentActivity() {
                     paymentScreenCardName = paymentCard?.cardName
                     paymentScreenTierName = paymentCard?.tierName
                     paymentScreenCardType = paymentCard?.cardType
+                    paymentScreenPassCardSnapshot = paymentCard
                     paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading)
                 }
                 steps = updateStep(steps, "optimizingRoute", StepStatus.success, "Direct: NFC → Merchant")
@@ -2445,6 +2478,7 @@ class MainActivity : ComponentActivity() {
                     assets,
                     oracle,
                     sunParams,
+                    chargeTotalInPayCurrency = totalCurrency,
                     nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
                     nfcTipCurrencyAmount = tipStrForNfc,
                     nfcTipRateBps = paymentScreenTipRateBps,
@@ -2465,6 +2499,7 @@ class MainActivity : ComponentActivity() {
                         if (fromScan) { nfcFetchingInfo = false; nfcFetchError = result.error ?: "Payment failed" }
                     }
                 } else {
+                    val payPassSnapshotAddr = paymentCard?.cardAddress
                     steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
@@ -2491,6 +2526,9 @@ class MainActivity : ComponentActivity() {
                             paymentScreenRoutingSteps = stepsAfter
                             if (postAssets != null && postAssets.ok) {
                                 paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
+                                val refreshedPass = postAssets.cards?.firstOrNull { payPassSnapshotAddr != null && it.cardAddress.equals(payPassSnapshotAddr, ignoreCase = true) }
+                                    ?: postAssets.cards?.firstOrNull()
+                                if (refreshedPass != null) paymentScreenPassCardSnapshot = refreshedPass
                             } else {
                                 paymentScreenPostBalance = "—"
                             }
@@ -2609,48 +2647,20 @@ class MainActivity : ComponentActivity() {
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success,
                     if (ccsaValueUsdc6 >= effectiveUsdc6) "\$CCSA: (Sufficient)" else if (ccsaValueUsdc6 > 0) "\$CCSA: (Partial)" else "USDC sufficient")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
-                var remaining = effectiveUsdc6
-                var ccsaPointsWei = 0L
-                var infraPointsWei = 0L
-                if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) {
-                    val maxPointsFromAmount = (remaining * 1_000_000) / unitPriceUSDC6
-                    ccsaPointsWei = minOf(maxPointsFromAmount, ccsaPoints6)
-                    val ccsaValue = (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
-                    remaining -= ccsaValue
-                    // 与 NFC 一致：无 USDC 时若 CCSA 可向上取整覆盖全额，则收紧点数避免残留 USDC kind
-                    if (usdcBalance6.toLong() == 0L && remaining > 0 && ccsaPoints6 > ccsaPointsWei) {
-                        val ccsaPointsCeil = (effectiveUsdc6 * 1_000_000 + unitPriceUSDC6 - 1) / unitPriceUSDC6
-                        if (ccsaPointsCeil <= ccsaPoints6) {
-                            ccsaPointsWei = ccsaPointsCeil
-                            remaining = effectiveUsdc6 - (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
-                        }
-                    }
-                }
-                if (remaining > 0 && infraPoints6 > 0 && infraCards.isNotEmpty()) {
-                    val infraCard = infraCards.first()
-                    val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
-                    if (rate > 0) {
-                        val infraValueUsdc6Total = points6ToUsdc6(infraPoints6, infraCard.cardCurrency, oracle)
-                        val infraValueUsdc6Needed = minOf(remaining, infraValueUsdc6Total)
-                        infraPointsWei = kotlin.math.ceil(infraValueUsdc6Needed * rate).toLong().coerceIn(0L, infraPoints6)
-                        remaining = (remaining - points6ToUsdc6(infraPointsWei, infraCard.cardCurrency, oracle)).coerceAtLeast(0L)
-                        if (remaining > 0 && usdcBalance6.toLong() == 0L && infraPointsWei < infraPoints6) {
-                            val extraPoints = kotlin.math.ceil(remaining * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
-                            infraPointsWei += extraPoints
-                            remaining = 0L
-                        }
-                    }
-                }
-                var usdcWei = remaining.coerceAtLeast(0L)
-                if (usdcWei > 0 && usdcBalance6.toLong() == 0L && infraPoints6 > 0 && infraCards.isNotEmpty()) {
-                    val infraCard = infraCards.first()
-                    val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
-                    if (rate > 0 && infraPointsWei < infraPoints6) {
-                        val extraPoints = kotlin.math.ceil(usdcWei * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
-                        infraPointsWei += extraPoints
-                        usdcWei = 0L
-                    }
-                }
+                val qrSplit = computeChargeContainerSplit(
+                    effectiveUsdc6,
+                    totalCurrencyQr,
+                    payCurrencyQr,
+                    oracle,
+                    unitPriceUSDC6,
+                    ccsaPoints6,
+                    infraPoints6,
+                    infraCards.firstOrNull()?.cardCurrency,
+                    usdcBalance6.toLong(),
+                )
+                var ccsaPointsWei = qrSplit.ccsaPointsWei
+                var infraPointsWei = qrSplit.infraPointsWei
+                var usdcWei = qrSplit.usdcWei
                 val composedItems = mutableListOf<Map<String, Any>>()
                 if (usdcWei > 0) {
                     composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
@@ -2714,6 +2724,7 @@ class MainActivity : ComponentActivity() {
                     paymentScreenCardName = qrPaymentCard?.cardName
                     paymentScreenTierName = qrPaymentCard?.tierName
                     paymentScreenCardType = qrPaymentCard?.cardType
+                    paymentScreenPassCardSnapshot = qrPaymentCard
                     paymentScreenPayee = toAddr
                     paymentScreenTip = "%.2f".format(tipQr)
                     paymentScreenAmount = "%.2f".format(totalCurrencyQr)
@@ -2811,6 +2822,9 @@ class MainActivity : ComponentActivity() {
                             paymentScreenRoutingSteps = stepsAfter
                             if (postAssets != null && postAssets.ok && finalPostCad != null) {
                                 paymentScreenPostBalance = "%.2f".format(finalPostCad)
+                                val refreshedPass = postAssets.cards?.firstOrNull { deductedCardAddress != null && it.cardAddress.equals(deductedCardAddress, ignoreCase = true) }
+                                    ?: postAssets.cards?.firstOrNull()
+                                if (refreshedPass != null) paymentScreenPassCardSnapshot = refreshedPass
                             } else {
                                 paymentScreenPostBalance = "—"
                             }
@@ -2870,6 +2884,8 @@ class MainActivity : ComponentActivity() {
                         put("currencyAmount", "%.2f".format(amt / 1_000_000.0))
                     }
                 }
+                // 与 NFC Charge 一致：每笔 Open relay 带商户卡地址，供 Indexer 推导 topAdmin/subordinate（owner 直属下级时 topAdmin=owner EOA）
+                put("merchantCardAddress", infraCardAddress())
                 chargeBill?.let { b ->
                     // 与 payByNfcUidSignContainer JSON 规则一致（税/折扣/小费字段可选、bps 范围 0..10000）
                     b.subtotal.trim().takeIf { it.isNotEmpty() }?.let { put("nfcSubtotalCurrencyAmount", it) }
@@ -2883,9 +2899,11 @@ class MainActivity : ComponentActivity() {
                         put("nfcTipCurrencyAmount", b.tip.trim())
                         if (b.tipRateBps > 0) put("nfcTipRateBps", b.tipRateBps)
                     }
-                    put("merchantCardAddress", infraCardAddress())
                 }
             }
+            try {
+                attachChargeOwnerChildBurnToRequestBody(body, payload)
+            } catch (_: Exception) { /* optional: owner-child burn only when chain + infra items match */ }
             val url = java.net.URL("$BEAMIO_API/api/AAtoEOA")
             val conn = url.openConnection() as java.net.HttpURLConnection
             conn.requestMethod = "POST"
@@ -2971,6 +2989,90 @@ class MainActivity : ComponentActivity() {
         } ?: emptyList()
     }
 
+    private data class ChargeContainerSplit(
+        val ccsaPointsWei: Long,
+        val infraPointsWei: Long,
+        val usdcWei: Long,
+    )
+
+    /**
+     * Charge 路由：先 CCSA（按 unitPriceUSDC6），再基础设施点，最后 USDC。
+     * 当账单币种与基础设施卡 [infraCardCurrency] 一致时，基础设施点按「找零」直接用本币 fiat6（与 charge 合计同一套 round）
+     * 计算，避免总金额先换 USDC 再 ceil 换回点数产生的误差。
+     */
+    private fun computeChargeContainerSplit(
+        amountBig: Long,
+        chargeTotalInPayCurrency: Double,
+        payCurrency: String,
+        oracle: OracleRates,
+        unitPriceUSDC6: Long,
+        ccsaPoints6: Long,
+        infraPoints6: Long,
+        infraCardCurrency: String?,
+        usdcBalance6: Long,
+    ): ChargeContainerSplit {
+        if (amountBig <= 0L) return ChargeContainerSplit(0L, 0L, 0L)
+        var remaining = amountBig
+        var ccsaPointsWei = 0L
+        if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) {
+            val maxPointsFromAmount = (remaining * 1_000_000) / unitPriceUSDC6
+            ccsaPointsWei = minOf(maxPointsFromAmount, ccsaPoints6)
+            val ccsaValue = (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
+            remaining -= ccsaValue
+            if (usdcBalance6 == 0L && remaining > 0 && ccsaPoints6 > ccsaPointsWei) {
+                val ccsaPointsCeil = (amountBig * 1_000_000 + unitPriceUSDC6 - 1) / unitPriceUSDC6
+                if (ccsaPointsCeil <= ccsaPoints6) {
+                    ccsaPointsWei = ccsaPointsCeil
+                    remaining = amountBig - (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
+                }
+            }
+        }
+        val remainingAfterCcsa = remaining
+        val ccsaConsumedUsdc6 = amountBig - remainingAfterCcsa
+        var infraPointsWei = 0L
+        val payCur = payCurrency.trim().uppercase()
+        val infraCur = infraCardCurrency?.trim()?.uppercase()
+        var infraFromFiat = false
+        if (remainingAfterCcsa > 0 && infraPoints6 > 0 && infraCur != null) {
+            if (infraCur == payCur && chargeTotalInPayCurrency > 0) {
+                val R = getRateForCurrency(payCur, oracle)
+                if (R > 0) {
+                    val totalFiat6 = kotlin.math.round(chargeTotalInPayCurrency * 1_000_000.0).toLong()
+                    val remainingFiat6 =
+                        (totalFiat6 - kotlin.math.round(ccsaConsumedUsdc6 * R).toLong()).coerceAtLeast(0L)
+                    infraPointsWei = minOf(infraPoints6, remainingFiat6)
+                    val infraUsdc6Equiv = points6ToUsdc6(infraPointsWei, payCur, oracle)
+                    remaining = (remainingAfterCcsa - infraUsdc6Equiv).coerceAtLeast(0L)
+                    infraFromFiat = true
+                }
+            }
+            if (!infraFromFiat) {
+                val rate = getRateForCurrency(infraCur, oracle)
+                if (rate > 0) {
+                    val infraValueUsdc6Total = points6ToUsdc6(infraPoints6, infraCur, oracle)
+                    val infraValueUsdc6Needed = minOf(remainingAfterCcsa, infraValueUsdc6Total)
+                    infraPointsWei = kotlin.math.ceil(infraValueUsdc6Needed * rate).toLong().coerceIn(0L, infraPoints6)
+                    remaining = (remainingAfterCcsa - points6ToUsdc6(infraPointsWei, infraCur, oracle)).coerceAtLeast(0L)
+                    if (remaining > 0 && usdcBalance6 == 0L && infraPointsWei < infraPoints6) {
+                        val extraPoints = kotlin.math.ceil(remaining * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
+                        infraPointsWei += extraPoints
+                        remaining = 0L
+                    }
+                }
+            }
+        }
+        var usdcWei = remaining.coerceAtLeast(0L)
+        if (usdcWei > 0 && usdcBalance6 == 0L && infraPoints6 > 0 && infraPointsWei < infraPoints6) {
+            val rate = getRateForCurrency(infraCardCurrency?.trim()?.uppercase() ?: payCur, oracle)
+            if (rate > 0) {
+                val extraPoints = kotlin.math.ceil(usdcWei * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
+                infraPointsWei += extraPoints
+                usdcWei = 0L
+            }
+        }
+        return ChargeContainerSplit(ccsaPointsWei, infraPointsWei, usdcWei)
+    }
+
     /** 新流程：Android 自行 Smart Routing 构建 container，服务端仅签名并 relay。CCSA + 基础设施卡均可扣款。NFC 格式(14 位 hex uid)时需传 sunParams(e,c,m) 做 SUN 校验。 */
     private fun payByNfcUidWithContainer(
         uid: String,
@@ -2979,6 +3081,7 @@ class MainActivity : ComponentActivity() {
         assets: UIDAssets,
         oracle: OracleRates,
         sunParams: SunParams? = null,
+        chargeTotalInPayCurrency: Double,
         nfcSubtotalCurrencyAmount: String? = null,
         nfcTipCurrencyAmount: String? = null,
         nfcTipRateBps: Int = 0,
@@ -3015,50 +3118,20 @@ class MainActivity : ComponentActivity() {
             val shortfall6 = (amountBig - totalBalance6).coerceAtLeast(0L)
             return PayByNfcResult(false, null, "Insufficient balance (need ${String.format("%.2f", amountBig / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC, shortfall ${String.format("%.2f", shortfall6 / 1_000_000.0)} USDC)")
         }
-        var remaining = amountBig
-        var ccsaPointsWei = 0L
-        var infraPointsWei = 0L
-        if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) {
-            val maxPointsFromAmount = (remaining * 1_000_000) / unitPriceUSDC6
-            ccsaPointsWei = minOf(maxPointsFromAmount, ccsaPoints6)
-            val ccsaValue = (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
-            remaining -= ccsaValue
-            if (usdcBalance6.toLong() == 0L && remaining > 0 && ccsaPoints6 > ccsaPointsWei) {
-                val ccsaPointsCeil = (amountBig * 1_000_000 + unitPriceUSDC6 - 1) / unitPriceUSDC6
-                if (ccsaPointsCeil <= ccsaPoints6) {
-                    ccsaPointsWei = ccsaPointsCeil
-                    remaining = amountBig - (ccsaPointsWei * unitPriceUSDC6) / 1_000_000
-                }
-            }
-        }
-        if (remaining > 0 && infraPoints6 > 0 && infraCards.isNotEmpty()) {
-            val infraCard = infraCards.first()
-            val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
-            if (rate > 0) {
-                val infraValueUsdc6Total = points6ToUsdc6(infraPoints6, infraCard.cardCurrency, oracle)
-                val infraValueUsdc6Needed = minOf(remaining, infraValueUsdc6Total)
-                // 向上取整，避免 rounding 导致 remaining 残留
-                infraPointsWei = kotlin.math.ceil(infraValueUsdc6Needed * rate).toLong().coerceIn(0L, infraPoints6)
-                remaining = (remaining - points6ToUsdc6(infraPointsWei, infraCard.cardCurrency, oracle)).coerceAtLeast(0L)
-                // 无 USDC 余额时：将 rounding 残留吸收进 infra 点数，避免添加 kind 0 导致 Cluster 预检失败
-                if (remaining > 0 && usdcBalance6.toLong() == 0L && infraPointsWei < infraPoints6) {
-                    val extraPoints = kotlin.math.ceil(remaining * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
-                    infraPointsWei += extraPoints
-                    remaining = 0L
-                }
-            }
-        }
-        var usdcWei = remaining.coerceAtLeast(0L)
-        // 兜底：无 USDC 余额时，将任意残留（含 rounding）吸收进 infra，绝不添加 kind 0
-        if (usdcWei > 0 && usdcBalance6.toLong() == 0L && infraPoints6 > 0 && infraCards.isNotEmpty()) {
-            val infraCard = infraCards.first()
-            val rate = getRateForCurrency(infraCard.cardCurrency, oracle)
-            if (rate > 0 && infraPointsWei < infraPoints6) {
-                val extraPoints = kotlin.math.ceil(usdcWei * rate).toLong().coerceIn(0L, infraPoints6 - infraPointsWei)
-                infraPointsWei += extraPoints
-                usdcWei = 0L
-            }
-        }
+        val split = computeChargeContainerSplit(
+            amountBig,
+            chargeTotalInPayCurrency,
+            nfcRequestCurrency,
+            oracle,
+            unitPriceUSDC6,
+            ccsaPoints6,
+            infraPoints6,
+            infraCards.firstOrNull()?.cardCurrency,
+            usdcBalance6.toLong(),
+        )
+        var ccsaPointsWei = split.ccsaPointsWei
+        var infraPointsWei = split.infraPointsWei
+        var usdcWei = split.usdcWei
         val items = mutableListOf<Map<String, Any>>()
         if (usdcWei > 0) {
             items.add(mapOf(
@@ -3196,8 +3269,12 @@ class MainActivity : ComponentActivity() {
                 nfcTaxRateBps?.takeIf { it in 0..10000 }?.let { put("nfcTaxRateBps", it) }
                 nfcDiscountAmountFiat6?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcDiscountAmountFiat6", it) }
                 nfcDiscountRateBps?.takeIf { it in 0..10000 }?.let { put("nfcDiscountRateBps", it) }
-            }.toString()
-            conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
+            }
+            try {
+                attachChargeOwnerChildBurnToRequestBody(body, containerPayload)
+            } catch (_: Exception) { /* skip burn attachment */ }
+            val bodyStr = body.toString()
+            conn.outputStream.use { os -> os.write(bodyStr.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
             conn.disconnect()
@@ -3565,10 +3642,109 @@ class MainActivity : ComponentActivity() {
 
     /** 拉取终端 profile 与上层 admin profile。参照 biz.tsx：cardOwner → searchUsername → BeamioCapsule。从 BeamioUserCard 卡合约获取 admin 列表，upperAdmin/owner → search-users → adminProfile。 */
     private fun fetchTerminalProfileSync(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
+        refreshMerchantInfraCardFromDbSync()
         val profile = fetchSearchUsersSync(wallet)
         val upperAdmin = fetchGetCardAdminInfoSync(wallet)
         val adminProfile = if (upperAdmin != null) fetchSearchUsersSync(upperAdmin) else null
+        syncChargeOwnerChildBurnEligibilityCache(wallet)
         return Pair(profile, adminProfile)
+    }
+
+    /**
+     * 链上同步：基础设施卡上 adminParent(终端EOA) == owner(card) 时记 true（与服务器 burn 预检一致）。
+     * 在拉取上层 admin / 全局 profile 后调用，供 QR Charge 必附离线焚烧签字。
+     */
+    private fun syncChargeOwnerChildBurnEligibilityCache(wallet: String) {
+        try {
+            if (!BeamioWeb3Wallet.isInitialized()) return
+            val w = wallet.trim()
+            if (!looksLikeEthereumAddress(w)) return
+            val walletNorm = if (w.startsWith("0x", true)) w else "0x$w"
+            val card = infraCardAddress().trim()
+            if (!looksLikeEthereumAddress(card)) return
+            val ownerHex = jsonRpcEthCall(card, "0x8da5cb5b") ?: run {
+                clearChargeOwnerChildBurnCache()
+                return
+            }
+            val ownerAddr = decodeAbiAddressWord(ownerHex) ?: run {
+                clearChargeOwnerChildBurnCache()
+                return
+            }
+            val apData = buildAdminParentCalldata(walletNorm)
+            if (apData.isEmpty()) return
+            val parentHex = jsonRpcEthCall(card, apData) ?: run {
+                clearChargeOwnerChildBurnCache()
+                return
+            }
+            val parentAddr = decodeAbiAddressWord(parentHex) ?: run {
+                clearChargeOwnerChildBurnCache()
+                return
+            }
+            val zero = "0x0000000000000000000000000000000000000000"
+            val parentIsZero = parentAddr.equals(zero, ignoreCase = true)
+            val parentIsOwner = ownerAddr.equals(parentAddr, ignoreCase = true)
+            val eligible = when {
+                parentIsOwner -> true
+                parentIsZero -> {
+                    val isAd = buildIsAdminCalldata(walletNorm)
+                    if (isAd.isEmpty()) false
+                    else decodeAbiBoolWord(jsonRpcEthCall(card, isAd) ?: "")
+                }
+                else -> false
+            }
+            getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit().apply {
+                putBoolean(PREF_KEY_CHARGE_OWNER_CHILD_ELIGIBLE, eligible)
+                putString(PREF_KEY_CHARGE_OWNER_CHILD_CARD, card.lowercase())
+                putString(PREF_KEY_CHARGE_OWNER_CHILD_WALLET, walletNorm.lowercase())
+                apply()
+            }
+            Log.d("ChargeOwnerChildBurn", "cache synced eligible=$eligible card=${card.take(10)}…")
+        } catch (e: Exception) {
+            Log.w("ChargeOwnerChildBurn", "sync cache failed", e)
+        }
+    }
+
+    private fun clearChargeOwnerChildBurnCache() {
+        try {
+            getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+                .remove(PREF_KEY_CHARGE_OWNER_CHILD_ELIGIBLE)
+                .remove(PREF_KEY_CHARGE_OWNER_CHILD_CARD)
+                .remove(PREF_KEY_CHARGE_OWNER_CHILD_WALLET)
+                .apply()
+        } catch (_: Exception) { }
+    }
+
+    /** 与当前钱包、当前基础设施卡地址匹配的缓存为 owner 直属时返回 true */
+    private fun isCachedChargeOwnerChildBurnEligible(): Boolean {
+        if (!BeamioWeb3Wallet.isInitialized()) return false
+        val wallet = BeamioWeb3Wallet.getAddress().trim()
+        val prefs = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+        val w = prefs.getString(PREF_KEY_CHARGE_OWNER_CHILD_WALLET, null)?.trim()?.lowercase() ?: return false
+        val c = prefs.getString(PREF_KEY_CHARGE_OWNER_CHILD_CARD, null)?.trim()?.lowercase() ?: return false
+        if (w != wallet.lowercase()) return false
+        if (c != infraCardAddress().trim().lowercase()) return false
+        return prefs.getBoolean(PREF_KEY_CHARGE_OWNER_CHILD_ELIGIBLE, false)
+    }
+
+    /**
+     * QR / NFC Charge JSON：附 chargeOwnerChildBurn。缓存标明 owner 直属时强制再拉一次链上缓存并构建签字，减少漏附焚烧。
+     */
+    private fun attachChargeOwnerChildBurnToRequestBody(body: org.json.JSONObject, containerPayload: org.json.JSONObject) {
+        try {
+            val posEoa = BeamioWeb3Wallet.getAddress()
+            var burn = buildChargeOwnerChildBurnJsonIfNeeded(containerPayload, posEoa)
+            if (burn == null && isCachedChargeOwnerChildBurnEligible()) {
+                syncChargeOwnerChildBurnEligibilityCache(posEoa)
+                burn = buildChargeOwnerChildBurnJsonIfNeeded(containerPayload, posEoa)
+                if (burn == null) {
+                    Log.w(
+                        "ChargeOwnerChildBurn",
+                        "Cached owner-direct but burn payload not built (check items=single infra ERC1155)"
+                    )
+                }
+            }
+            burn?.let { body.put("chargeOwnerChildBurn", it) }
+        } catch (_: Exception) { /* optional attachment */ }
     }
 
     /** GET /api/getCardAdminInfo 完整 JSON（含 admins / metadatas，与 biz 部署的 tierRouting 同源） */
@@ -4136,6 +4312,130 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 解码 eth_call 返回的单 address（32 字节右对齐） */
+    private fun decodeAbiAddressWord(hex: String): String? {
+        val raw = hex.trim().removePrefix("0x")
+        if (raw.length < 64) return null
+        return "0x" + raw.substring(raw.length - 40)
+    }
+
+    /** adminParent(address) selector + 参数 */
+    private fun buildAdminParentCalldata(adminEoa: String): String {
+        val trimmed = adminEoa.trim().removePrefix("0x").lowercase()
+        if (trimmed.length != 40 || !trimmed.all { it in '0'..'9' || it in 'a'..'f' }) return ""
+        return "0x49dd0900" + trimmed.padStart(64, '0')
+    }
+
+    /** isAdmin(address) — selector 0x24d7806c */
+    private fun buildIsAdminCalldata(adminEoa: String): String {
+        val trimmed = adminEoa.trim().removePrefix("0x").lowercase()
+        if (trimmed.length != 40 || !trimmed.all { it in '0'..'9' || it in 'a'..'f' }) return ""
+        return "0x24d7806c" + trimmed.padStart(64, '0')
+    }
+
+    /** eth_call 返回单个 bool（32 字节 word） */
+    private fun decodeAbiBoolWord(hex: String): Boolean {
+        val raw = hex.trim().removePrefix("0x")
+        if (raw.length < 64) return false
+        val w = raw.substring(raw.length - 64)
+        return w.any { it != '0' }
+    }
+
+    /** POST /api/burnPointsByAdminPrepare — 返回 cardAddr、data、deadline、nonce */
+    private fun postBurnPointsByAdminPrepare(cardAddress: String, targetAa: String, amountDigits: String): org.json.JSONObject? {
+        return try {
+            val url = java.net.URL("$BEAMIO_API/api/burnPointsByAdminPrepare")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            val body = org.json.JSONObject().apply {
+                put("cardAddress", cardAddress)
+                put("target", targetAa)
+                put("amount", amountDigits)
+            }.toString()
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            val root = org.json.JSONObject(resp)
+            if (code !in 200..299 || root.has("error") && root.optString("error").isNotEmpty()) {
+                Log.w("ChargeOwnerChildBurn", "burnPointsByAdminPrepare failed code=$code resp=${resp.take(300)}")
+                return null
+            }
+            root
+        } catch (e: Exception) {
+            Log.w("ChargeOwnerChildBurn", "burnPointsByAdminPrepare", e)
+            null
+        }
+    }
+
+    /**
+     * owner 直属下级 POS Charge：链上 adminParent(payee)==owner 且 container 仅含基础设施卡 ERC1155 点数时，
+     * 请求 burn prepare 并由终端钱包签 ExecuteForAdmin，供 Master relay 后焚烧入账 points。
+     */
+    private fun buildChargeOwnerChildBurnJsonIfNeeded(containerPayload: org.json.JSONObject, payeeEoa: String): org.json.JSONObject? {
+        if (!BeamioWeb3Wallet.isInitialized()) return null
+        val payeeTrim = payeeEoa.trim()
+        if (!looksLikeEthereumAddress(payeeTrim)) return null
+        val payeeNorm = if (payeeTrim.startsWith("0x", true)) payeeTrim else "0x$payeeTrim"
+        val toAa = containerPayload.optString("to").trim()
+        if (!looksLikeEthereumAddress(toAa)) return null
+        val items = containerPayload.optJSONArray("items") ?: return null
+        val byAsset = mutableMapOf<String, Long>()
+        for (i in 0 until items.length()) {
+            val it = items.optJSONObject(i) ?: continue
+            if (it.optInt("kind") != 1) continue
+            val asset = it.optString("asset").trim()
+            if (asset.isEmpty()) continue
+            val amt = it.optString("amount").toLongOrNull() ?: 0L
+            if (amt <= 0L) continue
+            val k = asset.lowercase()
+            byAsset[k] = (byAsset[k] ?: 0L) + amt
+        }
+        if (byAsset.size != 1) return null
+        val infra = infraCardAddress().trim()
+        val onlyKey = byAsset.keys.single()
+        if (!onlyKey.equals(infra.lowercase(), ignoreCase = true)) return null
+        val pointsSum = byAsset.values.single()
+        if (pointsSum <= 0L) return null
+        val ownerHex = jsonRpcEthCall(infra, "0x8da5cb5b") ?: return null
+        val ownerAddr = decodeAbiAddressWord(ownerHex) ?: return null
+        val apData = buildAdminParentCalldata(payeeNorm)
+        if (apData.isEmpty()) return null
+        val parentHex = jsonRpcEthCall(infra, apData) ?: return null
+        val parentAddr = decodeAbiAddressWord(parentHex) ?: return null
+        val zero = "0x0000000000000000000000000000000000000000"
+        val parentIsZero = parentAddr.equals(zero, ignoreCase = true)
+        val parentIsOwner = ownerAddr.equals(parentAddr, ignoreCase = true)
+        if (!parentIsOwner) {
+            if (!parentIsZero) return null
+            val isAd = buildIsAdminCalldata(payeeNorm)
+            if (isAd.isEmpty()) return null
+            val isHex = jsonRpcEthCall(infra, isAd) ?: return null
+            if (!decodeAbiBoolWord(isHex)) return null
+        }
+        val prep = postBurnPointsByAdminPrepare(infra, toAa, pointsSum.toString()) ?: return null
+        val cardAddrPrep = prep.optString("cardAddr", "").ifEmpty { infra }
+        val data = prep.optString("data", "")
+        val nonce = prep.optString("nonce", "")
+        val deadline = when (val d = prep.opt("deadline")) {
+            is Number -> d.toLong()
+            else -> prep.optString("deadline").toLongOrNull() ?: 0L
+        }
+        if (data.isEmpty() || nonce.isEmpty() || deadline <= 0L) return null
+        val adminSig = BeamioWeb3Wallet.signExecuteForAdmin(cardAddrPrep, data, deadline, nonce)
+        return org.json.JSONObject().apply {
+            put("cardAddr", cardAddrPrep)
+            put("data", data)
+            put("deadline", deadline)
+            put("nonce", nonce)
+            put("adminSignature", adminSig)
+        }
+    }
+
     /** `tiers(uint256 index)` calldata — 返回 (minUsdc6, attr, tierExpirySeconds) 各 32 字节 */
     private fun buildTiersGetterCalldata(index: Long): String {
         val idx = index.coerceAtLeast(0L)
@@ -4180,7 +4480,8 @@ class MainActivity : ComponentActivity() {
                     name = "Tier $i",
                     description = desc,
                     image = null,
-                    backgroundColor = null
+                    backgroundColor = null,
+                    chainTierIndex = i
                 )
             )
         }
@@ -4264,17 +4565,60 @@ class MainActivity : ComponentActivity() {
         for (i in 0 until tiersArr.length()) {
             val t = tiersArr.optJSONObject(i) ?: continue
             val minUsdc6 = t.optString("minUsdc6").toLongOrNull() ?: t.optLong("minUsdc6", 0L)
+            val chainIdx = when (val v = t.opt("index")) {
+                is Number -> v.toInt()
+                is String -> v.toIntOrNull()
+                else -> null
+            }
             parsed.add(
                 MetadataTier(
                     minUsdc6 = minUsdc6.coerceAtLeast(0L),
                     name = t.optString("name").takeIf { it.isNotBlank() },
                     description = t.optString("description").takeIf { it.isNotBlank() },
                     image = t.optString("image").takeIf { it.isNotBlank() },
-                    backgroundColor = normalizeHexColorString(t.optString("backgroundColor"))
+                    backgroundColor = normalizeHexColorString(t.optString("backgroundColor")),
+                    chainTierIndex = chainIdx
                 )
             )
         }
         return parsed.sortedBy { it.minUsdc6 }
+    }
+
+    /** Chain tier indices to match `MetadataTier.chainTierIndex` (API nft.tier / attribute). */
+    private fun chainTierIndexCandidatesFromNft(nft: NftItem): List<Int> {
+        val ordered = LinkedHashSet<Int>()
+        val tierRaw = nft.tier.trim()
+        tierRaw.toIntOrNull()?.let { ordered.add(it) }
+        Regex("""(?i)chain-tier-(\d+)""").find(tierRaw)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { ordered.add(it) }
+        nft.attribute.trim().toIntOrNull()?.let { ordered.add(it) }
+        return ordered.toList()
+    }
+
+    /**
+     * Pick metadata tier row for the **primary** membership NFT (`primaryMemberTokenId` or legacy max tokenId).
+     * Do not use points balance for this — tier display must match on-chain NFT tier, not voucher balance vs minUsdc6.
+     */
+    private fun selectMetadataTierForPrimaryMembership(card: CardItem, tiers: List<MetadataTier>): MetadataTier? {
+        if (tiers.isEmpty()) return null
+        val primaryTid = card.primaryMemberTokenId?.toLongOrNull()?.takeIf { it > 0L }
+            ?: card.nfts
+                .asSequence()
+                .filter { it.tokenId.toLongOrNull()?.let { id -> id > 0L } == true }
+                .maxByOrNull { it.tokenId.toLongOrNull() ?: 0L }
+                ?.tokenId
+                ?.toLongOrNull()
+        val primaryNft = primaryTid?.let { tid -> card.nfts.find { it.tokenId.toLongOrNull() == tid } }
+            ?: return null
+        for (idx in chainTierIndexCandidatesFromNft(primaryNft)) {
+            tiers.firstOrNull { it.chainTierIndex == idx }?.let { return it }
+        }
+        val tierLabel = primaryNft.tier.trim()
+        if (tierLabel.isNotEmpty() && tierLabel.toIntOrNull() == null &&
+            !Regex("""(?i)chain-tier-\d+""").containsMatchIn(tierLabel)
+        ) {
+            tiers.firstOrNull { it.name?.equals(tierLabel, ignoreCase = true) == true }?.let { return it }
+        }
+        return null
     }
 
     /** Pre-fetch 基础设施卡 metadata 与 tiers（Home 进入时）。缓存全局；topup/charge 成功路径复用缓存。 */
@@ -4331,11 +4675,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enrichCardTierFromMetadata(card: CardItem): CardItem {
-        val needTier = card.tierName.isNullOrBlank() || card.tierDescription.isNullOrBlank() || card.cardBackground.isNullOrBlank() || card.cardImage.isNullOrBlank()
-        if (!needTier) return card
+        val tiers = fetchCardMetadataTiers(card.cardAddress)
+        val fromPrimary = selectMetadataTierForPrimaryMembership(card, tiers)
+        val points6 = card.points6.toLongOrNull() ?: 0L
+        val fromPoints = if (tiers.isNotEmpty()) tiers.lastOrNull { it.minUsdc6 <= points6 } else null
+        val selected = fromPrimary ?: fromPoints
+
         val isInfraCard = card.cardAddress.equals(infraCardAddress(), ignoreCase = true)
         var cardImage = card.cardImage
-        // For infra card: use cached tiers only (pre-fetched on Home enter). No per-NFT fetch after topup/charge.
         if (cardImage.isNullOrBlank() && !isInfraCard) {
             val bestTokenId = card.primaryMemberTokenId?.toLongOrNull()?.takeIf { it > 0 }
                 ?: card.nfts
@@ -4346,16 +4693,21 @@ class MainActivity : ComponentActivity() {
                 cardImage = fetchNftTierMetadataImage(card.cardAddress, bestTokenId)
             }
         }
-        val tiers = fetchCardMetadataTiers(card.cardAddress)
-        val points6 = card.points6.toLongOrNull() ?: 0L
-        val selected = if (tiers.isNotEmpty()) {
-            tiers.lastOrNull { it.minUsdc6 <= points6 } ?: tiers.first()
-        } else null
+
+        val tierNeedsFill = card.tierName.isNullOrBlank() || card.tierDescription.isNullOrBlank()
+        val styleNeedsFill = card.cardBackground.isNullOrBlank() || cardImage.isNullOrBlank()
+        if (fromPrimary == null && !tierNeedsFill && !styleNeedsFill) return card
+
+        // getUIDAssets / getWalletAssets 卡行的 tierName、tierDescription 与链上主档一致；勿用 cardMetadata 覆盖已有文案
+        // （否则 metadata 里整段营销 name 会与 API 的「档名 + 描述」拼错，例如单独一行 "Silver 5% discount"）。
+        val tierNameOut = if (!card.tierName.isNullOrBlank()) card.tierName else fromPrimary?.name ?: selected?.name
+        val tierDescOut = if (!card.tierDescription.isNullOrBlank()) card.tierDescription else fromPrimary?.description ?: selected?.description
+
         return card.copy(
-            tierName = card.tierName ?: selected?.name,
-            tierDescription = card.tierDescription ?: selected?.description,
-            cardImage = cardImage ?: selected?.image,
-            cardBackground = card.cardBackground ?: selected?.backgroundColor
+            tierName = tierNameOut,
+            tierDescription = tierDescOut,
+            cardImage = cardImage ?: fromPrimary?.image ?: selected?.image,
+            cardBackground = card.cardBackground ?: fromPrimary?.backgroundColor ?: selected?.backgroundColor
         )
     }
 
@@ -5170,6 +5522,7 @@ internal fun TopupScreen(
     cardImage: String?,
     tierName: String?,
     tierDescription: String?,
+    passCardSnapshot: CardItem? = null,
     settlementViaQr: Boolean = false,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
@@ -5227,6 +5580,7 @@ internal fun TopupScreen(
                 cardImage = cardImage,
                 tierName = tierName,
                 tierDescription = tierDescription,
+                passCard = passCardSnapshot,
                 settlementViaQr = settlementViaQr,
                 onDone = onBack
             )
@@ -5276,6 +5630,7 @@ private fun TopupSuccessContent(
     cardImage: String?,
     tierName: String?,
     tierDescription: String?,
+    passCard: CardItem? = null,
     settlementViaQr: Boolean = false,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
@@ -5380,8 +5735,9 @@ private fun TopupSuccessContent(
                                 .padding(start = 12.dp),
                             horizontalAlignment = Alignment.End
                         ) {
-                            val titleTxt = tierName?.takeIf { it.isNotBlank() }
-                                ?.removeSuffix(" CARD")?.removeSuffix(" Card") ?: "Card"
+                            val rawTitle = passCard?.cardName?.takeIf { it.isNotBlank() }
+                                ?: tierName?.takeIf { it.isNotBlank() }
+                            val titleTxt = rawTitle?.removeSuffix(" CARD")?.removeSuffix(" Card") ?: "Card"
                             Text(
                                 titleTxt,
                                 fontSize = 16.sp,
@@ -5392,8 +5748,9 @@ private fun TopupSuccessContent(
                                 textAlign = TextAlign.End,
                                 modifier = Modifier.fillMaxWidth()
                             )
-                            val subtitle = tierDescription?.takeIf { it.isNotBlank() }
-                                ?.takeIf { !it.equals("Card", ignoreCase = true) } ?: ""
+                            val subtitle = passCard?.let { passTierSubtitleForPassCard(it).takeIf { s -> s.isNotBlank() } }
+                                ?: tierDescription?.takeIf { it.isNotBlank() }
+                                    ?.takeIf { !it.equals("Card", ignoreCase = true) } ?: ""
                             if (subtitle.isNotBlank()) {
                                 Text(
                                     subtitle,
@@ -5724,6 +6081,45 @@ private fun looksLikeEthereumAddress(value: String): Boolean {
     return t.drop(2).all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
 }
 
+/**
+ * 当 API 未提供 `tierName` 时的回退：用主档 NFT 的链上 `tier` 拼「Tier N」（与 getUIDAssets 卡行占位一致）。
+ * 有 `tierName` 时应优先用 [passTierSubtitleForPassCard]（卡级 metadata.tiers 展示名）。
+ */
+private fun chainTierLabelFromPrimaryNft(card: CardItem): String? {
+    val primaryTid = card.primaryMemberTokenId?.trim().orEmpty()
+    val primaryNft = when {
+        primaryTid.isNotEmpty() ->
+            card.nfts.firstOrNull { it.tokenId == primaryTid }
+                ?: card.nfts.firstOrNull { it.tokenId.equals(primaryTid, ignoreCase = true) }
+        else -> null
+    } ?: card.nfts.firstOrNull { (it.tokenId.toLongOrNull() ?: 0L) > 0L }
+        ?: return null
+    val tierRaw = primaryNft.tier.trim()
+    if (tierRaw.isEmpty()) return null
+    if (tierRaw.all { it.isDigit() }) return "Tier $tierRaw"
+    Regex("""(?i)chain-tier-(\d+)""").find(tierRaw)?.groupValues?.getOrNull(1)?.let { return "Tier $it" }
+    return null
+}
+
+/** Pass 副标题：优先 API `tierName`（卡级 metadata.tiers 名称）+ `tierDescription`；缺失时再回退链上「Tier N」。 */
+private fun passTierSubtitleForPassCard(card: CardItem): String {
+    val displayName = card.tierName?.takeIf { it.isNotBlank() }
+    val chainTier = chainTierLabelFromPrimaryNft(card)
+    val desc = card.tierDescription?.takeIf { it.isNotBlank() && !it.equals("Card", ignoreCase = true) }
+    return when {
+        displayName != null && desc != null && !desc.equals(displayName, ignoreCase = true) && !desc.startsWith(displayName, ignoreCase = true) ->
+            "$displayName · $desc"
+        displayName != null -> displayName
+        chainTier != null && desc != null && !desc.equals(chainTier, ignoreCase = true) && !desc.startsWith(chainTier, ignoreCase = true) ->
+            "$chainTier · $desc"
+        chainTier != null -> chainTier
+        else ->
+            desc
+                ?: card.cardType.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() }
+                ?: ""
+    }
+}
+
 /** Member # from one card: API `primaryMemberTokenId` (max `tiers[i].minUsdc6`) or legacy max tokenId. */
 private fun memberNoFromCardItem(card: CardItem?): String {
     if (card == null) return ""
@@ -5823,10 +6219,7 @@ private fun ReadBalancePassCard(
                         textAlign = TextAlign.End,
                         modifier = Modifier.fillMaxWidth()
                     )
-                    val subtitle = card.tierName
-                        ?: card.tierDescription?.takeIf { it.isNotBlank() }
-                        ?: card.cardType.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() }
-                        ?: ""
+                    val subtitle = passTierSubtitleForPassCard(card)
                     if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
                         Text(
                             subtitle,
@@ -6308,6 +6701,7 @@ private fun PaymentSuccessContent(
     cardName: String? = null,
     tierName: String? = null,
     cardType: String? = null,
+    passCard: CardItem? = null,
     settlementViaQr: Boolean = false,
     /** ScanMethod 页顶栏 overlay 占位，避免 Approved 标题被 Back 栏遮住 */
     extraTopInset: Dp = 0.dp,
@@ -6445,8 +6839,9 @@ private fun PaymentSuccessContent(
                                         .padding(start = 10.dp),
                                     horizontalAlignment = Alignment.End
                                 ) {
+                                    val titleFromPass = passCard?.cardName?.takeIf { it.isNotBlank() }
                                     Text(
-                                        (cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
+                                        (titleFromPass ?: cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
                                         fontSize = 16.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = Color.White,
@@ -6455,7 +6850,8 @@ private fun PaymentSuccessContent(
                                         textAlign = TextAlign.End,
                                         modifier = Modifier.fillMaxWidth()
                                     )
-                                    val subtitle = tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: ""
+                                    val subtitle = passCard?.let { passTierSubtitleForPassCard(it).takeIf { s -> s.isNotBlank() } }
+                                        ?: (tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: "")
                                     if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
                                         Text(
                                             subtitle,
@@ -6877,6 +7273,7 @@ internal fun PaymentScreen(
     cardName: String? = null,
     tierName: String? = null,
     cardType: String? = null,
+    passCardSnapshot: CardItem? = null,
     settlementViaQr: Boolean = false,
     chargeTaxPercent: Double? = null,
     chargeTierDiscountPercent: Int? = null,
@@ -6934,6 +7331,7 @@ internal fun PaymentScreen(
                 cardName = cardName,
                 tierName = tierName,
                 cardType = cardType,
+                passCard = passCardSnapshot,
                 settlementViaQr = settlementViaQr,
                 extraTopInset = 0.dp,
                 chargeTaxPercent = chargeTaxPercent,
@@ -7828,6 +8226,7 @@ internal fun ScanMethodSelectionScreen(
     paymentCardName: String? = null,
     paymentTierName: String? = null,
     paymentCardType: String? = null,
+    paymentPassCard: CardItem? = null,
     paymentChargeTaxPercent: Double? = null,
     paymentChargeTierDiscountPercent: Int? = null,
     paymentChargeTipBps: Int = 0,
@@ -7916,6 +8315,7 @@ internal fun ScanMethodSelectionScreen(
                         cardName = paymentCardName,
                         tierName = paymentTierName,
                         cardType = paymentCardType,
+                        passCard = paymentPassCard,
                         settlementViaQr = scanMethod == "qr",
                         extraTopInset = BACK_BUTTON_TOP_BAR_HEIGHT,
                         chargeTaxPercent = paymentChargeTaxPercent,
