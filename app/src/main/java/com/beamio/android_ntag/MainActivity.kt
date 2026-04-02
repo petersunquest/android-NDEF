@@ -238,7 +238,9 @@ private data class MetadataTier(
     val image: String?,
     val backgroundColor: String?,
     /** Card contract `tiers(i)` index or JSON `metadata.tiers[].index` — aligns with `_findBestValidMembership` / `primaryMemberTokenId`. */
-    val chainTierIndex: Int? = null
+    val chainTierIndex: Int? = null,
+    /** From card JSON `metadata.tiers[].discountPercent` (biz Sign & Deploy); takes precedence over parsing [description]. */
+    val discountPercent: Int? = null
 )
 
 internal sealed class ReadStatus {
@@ -412,6 +414,8 @@ class MainActivity : ComponentActivity() {
     private var paymentArmed by mutableStateOf(false)
     private var paymentViaQr by mutableStateOf(false)
     private val cardMetadataTierCache = mutableMapOf<String, List<MetadataTier>>()
+    /** True when [fetchCardMetadataTiers] filled tiers from GET `/api/cardMetadata` `metadata.tiers` (not chain probe fallback). */
+    private val cardMetadataTierFromApiCache = mutableMapOf<String, Boolean>()
 
     /**
      * 基础设施 BeamioUserCard 合约地址：首启后 GET `/api/myPosAddress?wallet=<终端EOA>` 解析；
@@ -497,6 +501,7 @@ class MainActivity : ComponentActivity() {
                     if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
                         beamioUserCardAssetAddressRuntime = resolved
                         cardMetadataTierCache.clear()
+                        cardMetadataTierFromApiCache.clear()
                         val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
                             !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
                         if (onHome) {
@@ -2400,7 +2405,11 @@ class MainActivity : ComponentActivity() {
                 val routingDetails = fetchTierRoutingDetailsForTerminalWalletSync(payeeWallet)
                 val subtotalPay = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
                 val taxPctResolved = routingDetails?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
-                val tierDiscPct = pickTierDiscountPercentFromAssets(assets, routingDetails?.discountByTierKey ?: emptyMap())
+                val tierDiscPct = pickChargeTierDiscountPercentForPaymentCard(
+                    paymentCard,
+                    assets,
+                    routingDetails?.discountByTierKey ?: emptyMap()
+                )
                 val taxAmtCad = subtotalPay * taxPctResolved / 100.0
                 val discAmtCad = subtotalPay * tierDiscPct / 100.0
                 val taxFiat6Str = kotlin.math.round(taxAmtCad * 1_000_000.0).toLong().toString()
@@ -2596,7 +2605,13 @@ class MainActivity : ComponentActivity() {
                 val payeeWalletTerminal = BeamioWeb3Wallet.getAddress()
                 val routingDetailsQr = fetchTierRoutingDetailsForTerminalWalletSync(payeeWalletTerminal)
                 val taxPctQr = routingDetailsQr?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
-                val tierDiscQr = pickTierDiscountPercentFromAssets(assets, routingDetailsQr?.discountByTierKey ?: emptyMap())
+                // 与 NFC executePayment 一致：账单/折扣以客户主卡（服务端 cards[0]）为准
+                val paymentCardForQrCharge = assets.cards?.firstOrNull()
+                val tierDiscQr = pickChargeTierDiscountPercentForPaymentCard(
+                    paymentCardForQrCharge,
+                    assets,
+                    routingDetailsQr?.discountByTierKey ?: emptyMap()
+                )
                 val requestQr = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
                 val tipQr = chargeTipFromRequestAndBps(requestQr, paymentScreenTipRateBps)
                 val taxAmtCadQr = requestQr * taxPctQr / 100.0
@@ -2605,8 +2620,6 @@ class MainActivity : ComponentActivity() {
                 val discFiat6StrQr = kotlin.math.round(discAmtCadQr * 1_000_000.0).toLong().toString()
                 val taxBpsQr = kotlin.math.round(taxPctQr * 100.0).toInt().coerceIn(0, 10000)
                 val discBpsQr = (tierDiscQr * 100).coerceIn(0, 10000)
-                // 与 NFC executePayment 一致：账单 request 币种取 cards 首张；tier 折扣仍用 pickTierDiscountPercentFromAssets(全卡 NFT)
-                val paymentCardForQrCharge = assets.cards?.firstOrNull()
                 val payCurrencyQr = paymentCardForQrCharge?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrencyQr = chargeTotalInCurrency(requestQr, taxPctQr, tierDiscQr, tipQr)
                 val enteredUsdc6 = currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
@@ -4051,6 +4064,51 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** `metadata.tiers[].discountPercent`（biz 与 cardMetadata API）；缺省或无法解析时 null */
+    private fun parseMetadataTierDiscountPercentField(t: org.json.JSONObject): Int? {
+        if (!t.has("discountPercent") || t.isNull("discountPercent")) return null
+        return try {
+            when (val v = t.opt("discountPercent")) {
+                is Number -> kotlin.math.round(v.toDouble()).toInt().coerceIn(0, 100)
+                is String -> {
+                    val s = v.trim()
+                    if (s.isEmpty()) null
+                    else kotlin.math.round(s.toDoubleOrNull() ?: return null).toInt().coerceIn(0, 100)
+                }
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** 单条 metadata tier 的 Charge 折扣：优先 [MetadataTier.discountPercent]，否则解析 description 内 `N%` */
+    private fun discountPercentFromMetadataTier(row: MetadataTier): Int {
+        row.discountPercent?.let { return it.coerceIn(0, 100) }
+        return parseDiscountPercentFromMembershipTierDescription(row.description ?: "") ?: 0
+    }
+
+    /**
+     * Charge 档位折扣：客户主卡（`cards[0]`）的 `metadata.tiers` 中与主会员 NFT 对应的行（与 biz 表格同源）；
+     * 若无 API tiers 或未匹配到行，回退终端 `tierRoutingDiscounts`（[pickTierDiscountPercentFromAssets]）。
+     */
+    private fun pickChargeTierDiscountPercentForPaymentCard(
+        paymentCard: CardItem?,
+        assets: UIDAssets,
+        tierKeyToDiscountFallback: Map<String, Int>
+    ): Int {
+        val addr = paymentCard?.cardAddress?.trim().orEmpty()
+        if (addr.isNotEmpty() && paymentCard != null) {
+            val tiers = fetchCardMetadataTiers(addr)
+            val fromApi = cardMetadataTierFromApiCache[addr.lowercase()] == true
+            val row = selectMetadataTierForPrimaryMembership(paymentCard, tiers)
+            if (fromApi && row != null) {
+                return discountPercentFromMetadataTier(row).coerceIn(0, 100)
+            }
+        }
+        return pickTierDiscountPercentFromAssets(assets, tierKeyToDiscountFallback)
+    }
+
     /** 按客户 NFT `tier` 字段匹配 routing 表（取最大折扣率） */
     private fun pickTierDiscountPercentFromAssets(assets: UIDAssets, tierKeyToDiscount: Map<String, Int>): Int {
         if (tierKeyToDiscount.isEmpty()) return 0
@@ -4570,6 +4628,7 @@ class MainActivity : ComponentActivity() {
                 is String -> v.toIntOrNull()
                 else -> null
             }
+            val discPct = parseMetadataTierDiscountPercentField(t)
             parsed.add(
                 MetadataTier(
                     minUsdc6 = minUsdc6.coerceAtLeast(0L),
@@ -4577,7 +4636,8 @@ class MainActivity : ComponentActivity() {
                     description = t.optString("description").takeIf { it.isNotBlank() },
                     image = t.optString("image").takeIf { it.isNotBlank() },
                     backgroundColor = normalizeHexColorString(t.optString("backgroundColor")),
-                    chainTierIndex = chainIdx
+                    chainTierIndex = chainIdx,
+                    discountPercent = discPct
                 )
             )
         }
@@ -4630,6 +4690,7 @@ class MainActivity : ComponentActivity() {
         val key = cardAddress.lowercase()
         cardMetadataTierCache[key]?.let { return it }
         var apiTiers: List<MetadataTier> = emptyList()
+        var fromApiTiers = false
         try {
             val url = java.net.URL("$BEAMIO_API/api/cardMetadata?cardAddress=$cardAddress")
             val conn = url.openConnection() as java.net.HttpURLConnection
@@ -4641,12 +4702,18 @@ class MainActivity : ComponentActivity() {
             conn.disconnect()
             if (code in 200..299) {
                 val root = org.json.JSONObject(body)
-                apiTiers = parseMetadataTiers(root.optJSONObject("metadata"))
+                val meta = root.optJSONObject("metadata")
+                val tiersLen = meta?.optJSONArray("tiers")?.length() ?: 0
+                if (tiersLen > 0) {
+                    apiTiers = parseMetadataTiers(meta)
+                    fromApiTiers = apiTiers.isNotEmpty()
+                }
             }
         } catch (_: Exception) {
         }
         val resolved = apiTiers.takeIf { it.isNotEmpty() }
             ?: fetchChainTiersAsMetadataTiersSync(cardAddress)
+        cardMetadataTierFromApiCache[key] = fromApiTiers
         cardMetadataTierCache[key] = resolved
         return resolved
     }
