@@ -6,6 +6,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import java.util.Locale
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.util.Log
@@ -56,16 +57,19 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBars
@@ -86,11 +90,15 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -106,13 +114,21 @@ import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.automirrored.filled.Label
+import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Contactless
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -134,16 +150,23 @@ import kotlinx.coroutines.isActive
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
@@ -154,9 +177,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
+import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
 import java.util.concurrent.CountDownLatch
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
@@ -186,12 +211,16 @@ internal data class CardItem(
     val tierName: String? = null,
     val tierDescription: String? = null,
     /** Server: NFT with max on-chain `tiers[i].minUsdc6` on this card (matches `_findBestValidMembership`). */
-    val primaryMemberTokenId: String? = null
+    val primaryMemberTokenId: String? = null,
+    /** From card `metadata.tiers[].discountPercent` (after [enrichCardTierFromMetadata]); 0–100，两位小数。 */
+    val tierDiscountPercent: Double? = null
 )
 internal data class UIDAssets(
     val ok: Boolean,
     val address: String? = null,
     val aaAddress: String? = null,
+    /** 根级 `primaryMemberTokenId`（无 `cards[]`、客户端合成单卡时用，与 iOS `readBalanceCardList` 对齐） */
+    val primaryMemberTokenId: String? = null,
     /** 客户 Beamio 用户名（无 @）；来自 API `beamioTag` / `accountName` */
     val beamioTag: String? = null,
     /** NFC 流程下服务端返回的 UID */
@@ -212,7 +241,11 @@ internal data class UIDAssets(
     val unitPriceUSDC6: String? = null,
     /** AA Factory 配置的 beamioUserCard，maxAmount>0 时 ERC1155 必须用此地址 */
     val beamioUserCard: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    /** Cluster getUIDAssets/getWalletAssets：商户基础设施卡上该会员 DB 最近 top-up（与 insertMemberTopupEvent 同源） */
+    val posLastTopupAt: String? = null,
+    val posLastTopupUsdcE6: String? = null,
+    val posLastTopupPointsE6: String? = null
 )
 internal data class NftItem(
     val tokenId: String,
@@ -239,8 +272,8 @@ private data class MetadataTier(
     val backgroundColor: String?,
     /** Card contract `tiers(i)` index or JSON `metadata.tiers[].index` — aligns with `_findBestValidMembership` / `primaryMemberTokenId`. */
     val chainTierIndex: Int? = null,
-    /** From card JSON `metadata.tiers[].discountPercent` (biz Sign & Deploy); takes precedence over parsing [description]. */
-    val discountPercent: Int? = null
+    /** From card JSON `metadata.tiers[].discountPercent` (biz Sign & Deploy); 0–100，两位小数；优先于解析 [description]。 */
+    val discountPercent: Double? = null
 )
 
 internal sealed class ReadStatus {
@@ -305,11 +338,11 @@ internal fun filterPaymentRoutingStepsForDisplay(steps: List<RoutingStep>): List
 private fun chargeTotalInCurrency(
     requestAmount: Double,
     taxPercent: Double,
-    tierDiscountPercent: Int?,
+    tierDiscountPercent: Double?,
     tipAmount: Double
 ): Double {
     val tax = requestAmount * (taxPercent / 100.0)
-    val disc = requestAmount * ((tierDiscountPercent ?: 0).toDouble() / 100.0)
+    val disc = requestAmount * ((tierDiscountPercent ?: 0.0) / 100.0)
     return requestAmount + tax - disc + tipAmount
 }
 
@@ -320,6 +353,49 @@ private fun chargeTipFromRequestAndRate(requestAmount: Double, tipRateFraction: 
 /** Tip on full request: tip = requestAmount × (tipRateBps / 10000). */
 private fun chargeTipFromRequestAndBps(requestAmount: Double, tipRateBps: Int): Double =
     requestAmount * (tipRateBps.coerceIn(0, 10000) / 10000.0)
+
+/** Insufficient-balance full screen (see verra-home home1.html). */
+private data class InsufficientBalanceUiModel(
+    val totalChargeFormatted: String,
+    val currentBalanceFormatted: String,
+    val shortfallFormatted: String,
+    val voucherDeductionFormatted: String,
+    val tierDiscountFormatted: String,
+    val tipFormatted: String,
+    val taxFormatted: String,
+    /** `"nfc"` | `"qr"` — restore scan method on Continue Charge */
+    val returnScanMethod: String,
+    /** 客户可扣 USDC6 上限；>0 时展示「Charge Available Balance」 */
+    val availableBalanceUsdc6: Long = 0L,
+)
+
+/** PARTIAL APPROVAL：客户余额不足但已扣完全部可用资产后，展示剩余未付差额（verra-home home1.html）。 */
+internal data class PartialApprovalUiModel(
+    val payCurrency: String,
+    val chargedPayCur: Double,
+    val shortfallPayCur: Double,
+    val orderTotalPayCur: Double,
+    val subtotal: Double,
+    val tierDiscountAmount: Double,
+    val tierDiscountLabel: String?,
+    val taxPercent: Double,
+    val taxAmount: Double,
+    val tipAmount: Double,
+    val memberDisplayName: String,
+    val memberNoDisplay: String,
+    val txHash: String,
+    val settlementViaQr: Boolean,
+    val settlementDetail: String,
+    val originalSubtotal: Double,
+    val originalTipBps: Int,
+    val tierDiscPct: Double,
+    val returnScanMethod: String,
+    /** 与 Balance Details / getUIDAssets `cardBackground` 一致，供标准 Pass Hero 渐变。 */
+    val tierCardBackgroundHex: String? = null,
+    val cardMetadataImageUrl: String? = null,
+    /** Hero 底栏 program 行；缺省则回退 [memberDisplayName]。 */
+    val programCardDisplayName: String? = null,
+)
 
 class MainActivity : ComponentActivity() {
     private companion object {
@@ -363,6 +439,8 @@ class MainActivity : ComponentActivity() {
     private var topupScreenPostBalance by mutableStateOf<String?>(null)
     private var topupScreenCardCurrency by mutableStateOf<String?>(null)
     private var topupScreenAddress by mutableStateOf<String?>(null)
+    /** getUIDAssets/getWalletAssets `beamioTag`，与 Balance Hero 主名一致 */
+    private var topupScreenBeamioTag by mutableStateOf<String?>(null)
     private var topupScreenCardBackground by mutableStateOf<String?>(null)
     private var topupScreenCardImage by mutableStateOf<String?>(null)
     private var topupScreenTierName by mutableStateOf<String?>(null)
@@ -397,7 +475,7 @@ class MainActivity : ComponentActivity() {
     /** Charge 明细：税率（与终端 metadata / 基础设施 routing 一致） */
     private var paymentChargeBreakdownTaxPercent by mutableStateOf<Double?>(null)
     /** null = 尚未根据客户卡解析；0–100 为会员 tier 折扣率 */
-    private var paymentChargeBreakdownTierDiscountPercent by mutableStateOf<Int?>(null)
+    private var paymentChargeBreakdownTierDiscountPercent by mutableStateOf<Double?>(null)
     private var paymentScreenPreBalance by mutableStateOf<String?>(null)
     private var paymentScreenPostBalance by mutableStateOf<String?>(null)
     private var paymentScreenCardCurrency by mutableStateOf<String?>(null)
@@ -409,8 +487,27 @@ class MainActivity : ComponentActivity() {
     private var paymentScreenMemberNo by mutableStateOf<String?>(null)
     /** Charge 成功页 Pass 与 Balance Loaded 对齐 */
     private var paymentScreenPassCardSnapshot by mutableStateOf<CardItem?>(null)
+    /** 客户 beamioTag / EOA，供收据 Hero 主名与 Balance 一致 */
+    private var paymentScreenPayerBeamioTag by mutableStateOf<String?>(null)
+    private var paymentScreenPayerAddress by mutableStateOf<String?>(null)
     /** Charge 选小费页填写的桌号，随成功页 / 打印收据展示 */
     private var paymentScreenTableNumber by mutableStateOf("")
+    /** 余额不足专用页（home1.html 风格）；非 null 时优先全屏展示 */
+    private var insufficientBalanceUi by mutableStateOf<InsufficientBalanceUiModel?>(null)
+    /**
+     * 与 iOS `chargeInsufficientRetry*` 一致：不足额页点「Charge available balance」时直执行 partial max，不再次贴卡/扫码。
+     * 在 [openInsufficientBalanceScreen] 前写入；取消/继续收款/Top-up/[resetPaymentScreenState] 时清空。
+     */
+    private var insufficientPartialRetryContext: InsufficientPartialRetryContext? = null
+    /** 扣完全部余额后仍有短款的 PARTIAL APPROVAL 页；与 [PaymentStatus.Success] 同时有效 */
+    private var paymentPartialApprovalUi by mutableStateOf<PartialApprovalUiModel?>(null)
+    /**
+     * 用户在「余额不足」页选择按当前可用余额扣款时置 true；下一次 NFC/QR execute 在链上按 min(应收, 客户总资产) 扣款，随后 PARTIAL APPROVAL。
+     * 一次性消费，成功进入 partial 分支或重新打开 insufficient 时清除。
+     */
+    private var chargeCapToCustomerAvailableBalance by mutableStateOf(false)
+    /** 当前账单下最近一次 Charge 动态 QR 解析得到的 relay JSON（含离线 signature）。 */
+    private var lastQrPaymentOpenRelayPayload: org.json.JSONObject? = null
     private var paymentArmed by mutableStateOf(false)
     private var paymentViaQr by mutableStateOf(false)
     private val cardMetadataTierCache = mutableMapOf<String, List<MetadataTier>>()
@@ -503,7 +600,8 @@ class MainActivity : ComponentActivity() {
                         cardMetadataTierCache.clear()
                         cardMetadataTierFromApiCache.clear()
                         val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
-                            !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
+                            !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
+                            insufficientBalanceUi == null
                         if (onHome) {
                             Thread { prefetchInfraCardMetadata() }.start()
                         }
@@ -857,6 +955,7 @@ class MainActivity : ComponentActivity() {
                         topupScreenPostBalance = null
                         topupScreenCardCurrency = null
                         topupScreenAddress = null
+                        topupScreenBeamioTag = null
                         topupScreenCardBackground = null
                         topupScreenCardImage = null
                         topupScreenTierName = null
@@ -937,17 +1036,18 @@ class MainActivity : ComponentActivity() {
                             val (charge, topUp) = fetchCardStatsSync(wallet)
                             runOnUiThread {
                                 if (profile != null) terminalProfile = profile
-                                if (admin != null) terminalAdminProfile = admin
-                                if (profile != null || admin != null) saveProfileCache(wallet, profile, admin)
+                                terminalAdminProfile = admin
+                                saveProfileCache(wallet, profile, admin)
                                 if (charge != null) cardChargeAmount = charge
                                 if (topUp != null) cardTopUpAmount = topUp
                             }
                         }.start()
                     }
                 }
-                LaunchedEffect(showWelcomePage, showOnboardingScreen, showTopupScreen, showReadScreen, showScanMethodScreen, showAmountInputScreen, showTipScreen, showPaymentScreen, showInitFlowScreen) {
+                LaunchedEffect(showWelcomePage, showOnboardingScreen, showTopupScreen, showReadScreen, showScanMethodScreen, showAmountInputScreen, showTipScreen, showPaymentScreen, showInitFlowScreen, insufficientBalanceUi) {
                     val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
-                        !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
+                        !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
+                        insufficientBalanceUi == null
                     if (onHome) {
                         Thread { prefetchInfraCardMetadata() }.start()
                     }
@@ -962,10 +1062,12 @@ class MainActivity : ComponentActivity() {
                     showAmountInputScreen,
                     showTipScreen,
                     showPaymentScreen,
-                    showInitFlowScreen
+                    showInitFlowScreen,
+                    insufficientBalanceUi
                 ) {
                     val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
-                        !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen
+                        !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
+                        insufficientBalanceUi == null
                     if (!onHome || !BeamioWeb3Wallet.isInitialized()) return@LaunchedEffect
                     while (isActive) {
                         val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
@@ -996,6 +1098,14 @@ class MainActivity : ComponentActivity() {
                     if (linkAppDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(linkAppDeepLinkUrl)
                 }
                 when {
+                    insufficientBalanceUi != null -> InsufficientBalanceScreen(
+                        model = insufficientBalanceUi!!,
+                        onTopUp = { onInsufficientBalanceTopUpFromScreen() },
+                        onChargeAvailableBalance = { onInsufficientBalanceChargeAvailableFromScreen() },
+                        onContinueCharge = { onInsufficientBalanceContinueChargeFromScreen() },
+                        onCancel = { onInsufficientBalanceCancelFromScreen() },
+                        modifier = Modifier.fillMaxSize()
+                    )
                     showWelcomePage -> WelcomePage(
                         versionName = BuildConfig.VERSION_NAME ?: "1.0",
                         onCreateWalletClick = {
@@ -1028,6 +1138,7 @@ class MainActivity : ComponentActivity() {
                         postBalance = topupScreenPostBalance,
                         cardCurrency = topupScreenCardCurrency,
                         address = topupScreenAddress,
+                        customerBeamioTag = topupScreenBeamioTag,
                         memberNo = topupScreenMemberNo,
                         cardBackground = topupScreenCardBackground,
                         cardImage = topupScreenCardImage,
@@ -1114,10 +1225,15 @@ class MainActivity : ComponentActivity() {
                         paymentTierName = if (pendingScanAction == "payment") paymentScreenTierName else null,
                         paymentCardType = if (pendingScanAction == "payment") paymentScreenCardType else null,
                         paymentPassCard = if (pendingScanAction == "payment") paymentScreenPassCardSnapshot else null,
+                        paymentCustomerBeamioTag = if (pendingScanAction == "payment") paymentScreenPayerBeamioTag else null,
+                        paymentCustomerWalletAddress = if (pendingScanAction == "payment") paymentScreenPayerAddress else null,
                         paymentChargeTaxPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTaxPercent else null,
                         paymentChargeTierDiscountPercent = if (pendingScanAction == "payment") paymentChargeBreakdownTierDiscountPercent else null,
                         paymentChargeTipBps = if (pendingScanAction == "payment") paymentScreenTipRateBps else 0,
                         paymentTableNumber = if (pendingScanAction == "payment") paymentScreenTableNumber else "",
+                        paymentPartialApproval = if (pendingScanAction == "payment") paymentPartialApprovalUi else null,
+                        onPartialApprovalContinue = { onPartialApprovalContinue() },
+                        onPartialApprovalCancel = { onPartialApprovalCancel() },
                         onPaymentDone = {
                             showScanMethodScreen = false
                             showTipScreen = false
@@ -1172,6 +1288,7 @@ class MainActivity : ComponentActivity() {
                         rawResponseJson = readScreenRawJson,
                         error = readScreenError,
                         settlementViaQr = readViaQr,
+                        posMerchantInfraCard = infraCardAddress(),
                         onBack = { closeReadScreen() },
                         onTopupClick = {
                             closeReadScreen()
@@ -1257,9 +1374,14 @@ class MainActivity : ComponentActivity() {
                         cardType = paymentScreenCardType,
                         passCardSnapshot = paymentScreenPassCardSnapshot,
                         settlementViaQr = paymentViaQr,
+                        customerBeamioTag = paymentScreenPayerBeamioTag,
+                        customerWalletAddress = paymentScreenPayerAddress,
                         chargeTaxPercent = paymentChargeBreakdownTaxPercent,
                         chargeTierDiscountPercent = paymentChargeBreakdownTierDiscountPercent,
                         tableNumber = paymentScreenTableNumber.takeIf { it.isNotBlank() },
+                        partialApproval = paymentPartialApprovalUi,
+                        onPartialApprovalContinue = { onPartialApprovalContinue() },
+                        onPartialApprovalCancel = { onPartialApprovalCancel() },
                         onBack = { closePaymentScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1466,9 +1588,706 @@ class MainActivity : ComponentActivity() {
         paymentScreenCardType = null
         paymentScreenMemberNo = null
         paymentScreenPassCardSnapshot = null
+        paymentScreenPayerBeamioTag = null
+        paymentScreenPayerAddress = null
         paymentScreenTableNumber = ""
         paymentQrInterpreting = false
         paymentQrParseError = ""
+        insufficientBalanceUi = null
+        insufficientPartialRetryContext = null
+        paymentPartialApprovalUi = null
+        chargeCapToCustomerAvailableBalance = false
+        lastQrPaymentOpenRelayPayload = null
+    }
+
+    /** PARTIAL APPROVAL：按未付比例缩小 subtotal 后继续收款（保持小费 bps 与税率由后续 execute 重算）。 */
+    private fun onPartialApprovalContinue() {
+        val snap = paymentPartialApprovalUi ?: return
+        paymentPartialApprovalUi = null
+        val order = snap.orderTotalPayCur.coerceAtLeast(1e-9)
+        val ratio = (snap.shortfallPayCur / order).coerceIn(0.0, 1.0)
+        val newSub = (snap.originalSubtotal * ratio).coerceAtLeast(0.01)
+        paymentScreenSubtotal = "%.2f".format(newSub)
+        paymentScreenTipRateBps = snap.originalTipBps
+        paymentScreenStatus = PaymentStatus.Waiting
+        paymentScreenTxHash = ""
+        paymentScreenError = ""
+        paymentScreenRoutingSteps = emptyList()
+        paymentScreenPostBalance = null
+        paymentScreenPreBalance = null
+        chargeCapToCustomerAvailableBalance = false
+        paymentArmed = false
+        nfcFetchingInfo = false
+        nfcFetchError = ""
+        paymentQrParseError = ""
+        paymentQrInterpreting = false
+        lastQrPaymentOpenRelayPayload = null
+        scanMethodState = snap.returnScanMethod
+        showScanMethodScreen = true
+        showPaymentScreen = false
+        pendingScanAction = "payment"
+        syncScanMethodEntryAndTabs()
+    }
+
+    private fun onPartialApprovalCancel() {
+        paymentPartialApprovalUi = null
+        chargeTableNumber = ""
+        resetPaymentScreenState()
+        showScanMethodScreen = false
+        showPaymentScreen = false
+        paymentArmed = false
+        nfcFetchingInfo = false
+        nfcFetchError = ""
+    }
+
+    private fun formatFiatDisplayLineForInsufficient(amount: Double, currency: String): String {
+        val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(amount, currency)
+        return buildString {
+            if (prefix.isNotEmpty()) {
+                append(prefix.trimEnd())
+                append(" ")
+            }
+            append(amtStr)
+            append(suffix)
+        }
+    }
+
+    private fun buildInsufficientBalanceUiFromPaymentContext(
+        totalCurrency: Double,
+        payCurrency: String,
+        totalBalance6: Long,
+        required6: Long,
+        oracle: OracleRates,
+        subtotal: Double,
+        taxPct: Double,
+        tierDiscPct: Double,
+        tip: Double,
+        returnScanMethod: String
+    ): InsufficientBalanceUiModel {
+        val rate = getRateForCurrency(payCurrency, oracle)
+        val balancePayCur = (totalBalance6 / 1_000_000.0) * rate
+        val needPayCur = (required6 / 1_000_000.0) * rate
+        val shortfallPayCur = (needPayCur - balancePayCur).coerceAtLeast(0.0)
+        val taxAmt = subtotal * taxPct / 100.0
+        val discAmt = subtotal * tierDiscPct / 100.0 // tierDiscPct：metadata 两位小数 %
+        fun line(amt: Double) = formatFiatDisplayLineForInsufficient(amt, payCurrency)
+        return InsufficientBalanceUiModel(
+            totalChargeFormatted = line(totalCurrency),
+            currentBalanceFormatted = line(balancePayCur),
+            shortfallFormatted = "-${line(shortfallPayCur)}",
+            voucherDeductionFormatted = line(subtotal),
+            tierDiscountFormatted = line(discAmt),
+            tipFormatted = line(tip),
+            taxFormatted = line(taxAmt),
+            returnScanMethod = if (returnScanMethod == "qr") "qr" else "nfc",
+            availableBalanceUsdc6 = totalBalance6.coerceAtLeast(0L),
+        )
+    }
+
+    private fun parseInsufficientBalanceUsdcFromError(message: String): Triple<Double, Double, Double>? {
+        val re = Regex(
+            """need\s+([\d.]+)\s+USDC,\s+total assets\s+([\d.]+)\s+USDC,\s+shortfall\s+([\d.]+)\s+USDC""",
+            RegexOption.IGNORE_CASE
+        )
+        val m = re.find(message) ?: return null
+        val need = m.groupValues[1].toDoubleOrNull() ?: return null
+        val total = m.groupValues[2].toDoubleOrNull() ?: return null
+        val short = m.groupValues[3].toDoubleOrNull() ?: return null
+        return Triple(need, total, short)
+    }
+
+    private fun openInsufficientBalanceScreen(model: InsufficientBalanceUiModel) {
+        chargeCapToCustomerAvailableBalance = false
+        insufficientBalanceUi = model
+        showScanMethodScreen = false
+        showPaymentScreen = false
+        nfcFetchingInfo = false
+        nfcFetchError = ""
+        paymentQrInterpreting = false
+        paymentQrParseError = ""
+        paymentScreenStatus = PaymentStatus.Waiting
+        paymentScreenError = ""
+        paymentScreenRoutingSteps = emptyList()
+    }
+
+    private fun onInsufficientBalanceTopUpFromScreen() {
+        insufficientBalanceUi = null
+        insufficientPartialRetryContext = null
+        chargeCapToCustomerAvailableBalance = false
+        resetPaymentScreenState()
+        amountInput = "0"
+        amountInputMode = "topup"
+        showAmountInputScreen = true
+    }
+
+    private fun onInsufficientBalanceContinueChargeFromScreen() {
+        chargeCapToCustomerAvailableBalance = false
+        val method = insufficientBalanceUi?.returnScanMethod ?: "nfc"
+        insufficientBalanceUi = null
+        insufficientPartialRetryContext = null
+        paymentScreenStatus = PaymentStatus.Waiting
+        paymentScreenError = ""
+        paymentScreenRoutingSteps = emptyList()
+        paymentQrParseError = ""
+        paymentQrInterpreting = false
+        nfcFetchError = ""
+        scanMethodState = method
+        showScanMethodScreen = true
+        pendingScanAction = "payment"
+        syncScanMethodEntryAndTabs()
+    }
+
+    private fun onInsufficientBalanceCancelFromScreen() {
+        insufficientBalanceUi = null
+        insufficientPartialRetryContext = null
+        chargeCapToCustomerAvailableBalance = false
+        chargeTableNumber = ""
+        resetPaymentScreenState()
+    }
+
+    /** 按客户当前可用余额扣款（不足全额应收）；成功后走 PARTIAL APPROVAL。对齐 iOS `chargeAvailableBalanceAfterInsufficientFunds`（无需再次贴卡/扫码）。 */
+    private fun onInsufficientBalanceChargeAvailableFromScreen() {
+        val m = insufficientBalanceUi ?: return
+        if (m.availableBalanceUsdc6 <= 0L) return
+        val snap = insufficientPartialRetryContext
+        val nfcOk = snap?.nfcUid?.trim()?.isNotEmpty() == true
+        val qrOk = snap?.qrAccount?.trim()?.isNotEmpty() == true && snap.qrPayloadJson?.trim()?.isNotEmpty() == true
+        if (snap == null || (!nfcOk && !qrOk)) {
+            // 与 iOS 一致：无重试上下文时不误关页（理论上每次 openInsufficient 都会写入 context）
+            return
+        }
+        insufficientBalanceUi = null
+        insufficientPartialRetryContext = null
+        chargeCapToCustomerAvailableBalance = false
+        showScanMethodScreen = false
+        scanWaitingForNfc = false
+        showPaymentScreen = true
+        paymentArmed = false
+        paymentScreenStatus = PaymentStatus.Routing
+        paymentScreenRoutingSteps = createRoutingSteps()
+        paymentScreenError = ""
+        paymentQrParseError = ""
+        paymentQrInterpreting = false
+        nfcFetchError = ""
+        paymentScreenTxHash = ""
+        pendingScanAction = "payment"
+        executeImmediatePartialMaxCharge(snap)
+    }
+
+    /** iOS `executePartialMaxNfcCharge` / `executePartialMaxQrCharge`：刷新资产、`min(available,freshTotal)`、scaled bill、submit。 */
+    private fun executeImmediatePartialMaxCharge(snap: InsufficientPartialRetryContext) {
+        when {
+            snap.nfcUid?.trim()?.isNotEmpty() == true -> executeImmediatePartialNfcFromInsufficient(snap)
+            snap.qrAccount?.trim()?.isNotEmpty() == true && snap.qrPayloadJson?.trim()?.isNotEmpty() == true ->
+                executeImmediatePartialQrFromInsufficient(snap)
+            else -> runOnUiThread {
+                paymentScreenStatus = PaymentStatus.Error
+                paymentScreenError = "Cannot retry payment"
+            }
+        }
+    }
+
+    private fun executeImmediatePartialNfcFromInsufficient(snap: InsufficientPartialRetryContext) {
+        val uid = snap.nfcUid!!.trim()
+        val sunParams = snap.nfcSun
+        Thread {
+            try {
+                refreshMerchantInfraCardFromDbSync()
+                var steps = createRoutingSteps()
+                runOnUiThread {
+                    paymentScreenStatus = PaymentStatus.Routing
+                    paymentScreenRoutingSteps = updateStep(steps, "detectingUser", StepStatus.loading)
+                }
+                steps = updateStep(steps, "detectingUser", StepStatus.success, "NFC")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
+                steps = updateStep(steps, "membership", StepStatus.success, "Card")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
+                val assets = fetchUidAssetsSync(uid, sunParams, merchantInfraOnly = false)
+                if (assets == null || !assets.ok) {
+                    steps = updateStep(steps, "analyzingAssets", StepStatus.error, assets?.error ?: "Card not registered")
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = assets?.error ?: "Card not registered"
+                        paymentScreenRoutingSteps = steps
+                    }
+                    return@Thread
+                }
+                steps = updateStep(steps, "analyzingAssets", StepStatus.success, "Card + USDC balance")
+                val paymentMemberNo = memberNoPrimaryFromSortedCardsItem(assets)
+                val paymentCard = assets.cards?.firstOrNull()
+                val payeeWallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+                if (payeeWallet.isEmpty()) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Wallet not initialized"
+                    }
+                    return@Thread
+                }
+                val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: snap.payCurrency
+                val oracle = fetchOracle()
+                val subtotalPay = snap.subtotal
+                val taxPctResolved = snap.taxPct
+                val tierDiscPct = snap.tierDiscPct
+                val tipPay = snap.tip
+                val taxAmtCad = subtotalPay * taxPctResolved / 100.0
+                val discAmtCad = subtotalPay * tierDiscPct / 100.0
+                val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
+                val amountPartial = minOf(snap.availableUsdc6.coerceAtLeast(0L), totalBalance6)
+                if (amountPartial <= 0L) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "No available balance"
+                        paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.error, "No balance")
+                    }
+                    return@Thread
+                }
+                val chargedFiat = usdc6ToCurrencyAmount(amountPartial, payCurrency, oracle)
+                if (chargedFiat <= 0) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                    }
+                    return@Thread
+                }
+                val scaled = snap.scaledBillForChargedPayCur(chargedFiat)
+                val totalCurrency = snap.totalCurrency
+                val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
+                val taxBpsResolved = scaled.taxBps
+                val discBpsResolved = scaled.discBps
+                runOnUiThread {
+                    paymentChargeBreakdownTaxPercent = taxPctResolved
+                    paymentChargeBreakdownTierDiscountPercent = tierDiscPct
+                    paymentScreenTip = scaled.tipStr ?: "0.00"
+                    paymentScreenAmount = "%.2f".format(chargedFiat)
+                    paymentScreenCardCurrency = payCurrency
+                    paymentScreenMemberNo = paymentMemberNo.ifEmpty { null }
+                    paymentScreenCardBackground = paymentCard?.cardBackground
+                    paymentScreenCardImage = paymentCard?.cardImage
+                    paymentScreenCardName = paymentCard?.cardName
+                    paymentScreenTierName = paymentCard?.tierName
+                    paymentScreenCardType = paymentCard?.cardType
+                    paymentScreenPassCardSnapshot = paymentCard
+                    paymentScreenPayerBeamioTag = assets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                    paymentScreenPayerAddress = assets.address?.trim()
+                    paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
+                    paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading)
+                }
+                steps = updateStep(steps, "optimizingRoute", StepStatus.success, "Direct: NFC → Merchant")
+                runOnUiThread {
+                    paymentScreenStatus = PaymentStatus.Submitting
+                    paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
+                }
+                val result = payByNfcUidWithContainer(
+                    uid,
+                    amountPartial.toString(),
+                    payeeWallet,
+                    assets,
+                    oracle,
+                    sunParams,
+                    chargeTotalInPayCurrency = chargedFiat,
+                    nfcSubtotalCurrencyAmount = scaled.subtotalStr,
+                    nfcTipCurrencyAmount = scaled.tipStr,
+                    nfcTipRateBps = paymentScreenTipRateBps,
+                    nfcRequestCurrency = payCurrency,
+                    nfcTaxAmountFiat6 = scaled.taxFiat6,
+                    nfcTaxRateBps = taxBpsResolved,
+                    nfcDiscountAmountFiat6 = scaled.discFiat6,
+                    nfcDiscountRateBps = discBpsResolved,
+                )
+                steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
+                steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
+                if (!result.success) {
+                    val err = result.error ?: "Payment failed"
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = steps
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = err
+                    }
+                    return@Thread
+                }
+                val payPassSnapshotAddr = paymentCard?.cardAddress
+                steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
+                runOnUiThread {
+                    paymentScreenRoutingSteps = steps
+                    paymentScreenPostBalance = null
+                    paymentScreenStatus = PaymentStatus.Submitting
+                    paymentScreenTxHash = result.txHash ?: ""
+                    paymentScreenError = ""
+                    paymentViaQr = false
+                }
+                Thread {
+                    Thread.sleep(3000)
+                    val postAssets = fetchUidAssetsSync(uid, sunParams, merchantInfraOnly = false)
+                    val stepsAfter = updateStep(
+                        steps,
+                        "refreshBalance",
+                        StepStatus.success,
+                        if (postAssets != null && postAssets.ok) "Updated" else "Unavailable",
+                    )
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = stepsAfter
+                        var refreshedPass: CardItem? = null
+                        if (postAssets != null && postAssets.ok) {
+                            paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
+                            refreshedPass = postAssets.cards?.firstOrNull { payPassSnapshotAddr != null && it.cardAddress.equals(payPassSnapshotAddr, ignoreCase = true) }
+                                ?: postAssets.cards?.firstOrNull()
+                            if (refreshedPass != null) {
+                                paymentScreenPassCardSnapshot = refreshedPass
+                                paymentScreenCardBackground = refreshedPass.cardBackground
+                                paymentScreenCardImage = refreshedPass.cardImage
+                                paymentScreenTierName = refreshedPass.tierName
+                                paymentScreenCardName = refreshedPass.cardName
+                            }
+                        } else {
+                            paymentScreenPostBalance = "—"
+                        }
+                        val hero = refreshedPass ?: paymentCard
+                        val shortfallNfc = (totalCurrency - chargedFiat).coerceAtLeast(0.0)
+                        val memberTitleNfc = passHeroMemberDisplayNameLine(
+                            assets.beamioTag,
+                            assets.address,
+                            hero,
+                            hero?.cardName,
+                        )
+                        val mn = (paymentMemberNo.ifEmpty { memberNoPrimaryFromSortedCardsItem(assets) }).ifBlank { "—" }
+                        val term = BeamioWeb3Wallet.getAddress()?.trim()?.takeIf { it.length >= 6 }?.let { "POS-${it.takeLast(4).uppercase(Locale.US)}" } ?: "—"
+                        paymentPartialApprovalUi = PartialApprovalUiModel(
+                            payCurrency = payCurrency,
+                            chargedPayCur = chargedFiat,
+                            shortfallPayCur = shortfallNfc,
+                            orderTotalPayCur = totalCurrency,
+                            subtotal = subtotalPay,
+                            tierDiscountAmount = discAmtCad,
+                            tierDiscountLabel = hero?.tierName?.takeIf { it.isNotBlank() },
+                            taxPercent = taxPctResolved,
+                            taxAmount = taxAmtCad,
+                            tipAmount = tipPay,
+                            memberDisplayName = memberTitleNfc,
+                            memberNoDisplay = mn,
+                            txHash = result.txHash ?: "",
+                            settlementViaQr = false,
+                            settlementDetail = term,
+                            originalSubtotal = subtotalPay,
+                            originalTipBps = paymentScreenTipRateBps,
+                            tierDiscPct = tierDiscPct,
+                            returnScanMethod = if (snap.returnScanMethod == "qr") "qr" else "nfc",
+                            tierCardBackgroundHex = hero?.cardBackground,
+                            cardMetadataImageUrl = hero?.cardImage,
+                            programCardDisplayName = hero?.let { balanceDetailsCardNameLine(it) }?.takeIf { it != "—" },
+                        )
+                        paymentScreenStatus = PaymentStatus.Success
+                        scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                        scheduleElasticHomeDataPullAfterTxSuccess()
+                    }
+                }.start()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "executeImmediatePartialNfcFromInsufficient", e)
+                runOnUiThread {
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = e.message ?: "Execution failed"
+                }
+            }
+        }.start()
+    }
+
+    private fun executeImmediatePartialQrFromInsufficient(snap: InsufficientPartialRetryContext) {
+        Thread {
+            try {
+                refreshMerchantInfraCardFromDbSync()
+                val payload = org.json.JSONObject(snap.qrPayloadJson!!)
+                val account = snap.qrAccount!!.trim()
+                var steps = createRoutingSteps()
+                runOnUiThread {
+                    paymentScreenStatus = PaymentStatus.Routing
+                    paymentScreenRoutingSteps = updateStep(steps, "detectingUser", StepStatus.loading)
+                }
+                steps = updateStep(steps, "detectingUser", StepStatus.success, "Dynamic QR")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "membership", StepStatus.loading) }
+                val assets = fetchWalletAssetsSync(account, merchantInfraOnly = false)
+                if (assets == null || !assets.ok) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = assets?.error ?: "Unable to fetch customer assets"
+                    }
+                    return@Thread
+                }
+                val oracle = fetchOracle()
+                val taxPctQr = snap.taxPct
+                val tierDiscQr = snap.tierDiscPct
+                val requestQr = snap.subtotal
+                val tipQr = snap.tip
+                val taxAmtCadQr = requestQr * taxPctQr / 100.0
+                val discAmtCadQr = requestQr * tierDiscQr / 100.0
+                val paymentCardForQrCharge = assets.cards?.firstOrNull()
+                val payCurrencyQr = paymentCardForQrCharge?.cardCurrency ?: assets.cardCurrency ?: snap.payCurrency
+                val totalCurrencyQr = snap.totalCurrency
+                steps = updateStep(steps, "membership", StepStatus.success, "Cardholder")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
+                val unitPriceStr = assets.unitPriceUSDC6
+                val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
+                val cards = chargeableCards(assets)
+                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
+                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
+                val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+                val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
+                val rateQrPartial = getRateForCurrency(payCurrencyQr, oracle)
+                val balancePayCurBeforeQr = (totalBalance6 / 1_000_000.0) * rateQrPartial
+                val amountPartial = minOf(snap.availableUsdc6.coerceAtLeast(0L), totalBalance6)
+                if (amountPartial <= 0L) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "No available balance"
+                    }
+                    return@Thread
+                }
+                val chargedFiat = usdc6ToCurrencyAmount(amountPartial, payCurrencyQr, oracle)
+                if (chargedFiat <= 0) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                    }
+                    return@Thread
+                }
+                val scaled = snap.scaledBillForChargedPayCur(chargedFiat)
+                val taxFiat6Bill = scaled.taxFiat6
+                val discFiat6Bill = scaled.discFiat6
+                val taxBpsQr = scaled.taxBps
+                val discBpsQr = scaled.discBps
+                steps = updateStep(steps, "analyzingAssets", StepStatus.success, "USDC sufficient")
+                runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
+                val qrSplit = computeChargeContainerSplit(
+                    amountPartial,
+                    chargedFiat,
+                    payCurrencyQr,
+                    oracle,
+                    unitPriceUSDC6,
+                    ccsaPoints6,
+                    infraPoints6,
+                    infraCards.firstOrNull()?.cardCurrency,
+                    usdcBalance6.toLong(),
+                )
+                var ccsaPointsWei = qrSplit.ccsaPointsWei
+                var infraPointsWei = qrSplit.infraPointsWei
+                var usdcWei = qrSplit.usdcWei
+                val composedItems = mutableListOf<Map<String, Any>>()
+                if (usdcWei > 0) {
+                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                val beamio1155PointsWei = (ccsaPointsWei + infraPointsWei).coerceAtLeast(0L)
+                if (beamio1155PointsWei > 0) {
+                    composedItems.add(
+                        mapOf(
+                            "kind" to 1,
+                            "asset" to infraCardAddress(),
+                            "amount" to beamio1155PointsWei.toString(),
+                            "tokenId" to "0",
+                            "data" to "0x",
+                        ),
+                    )
+                }
+                if (composedItems.isEmpty()) {
+                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to amountPartial.toString(), "tokenId" to "0", "data" to "0x"))
+                }
+                val itemsJson = org.json.JSONArray()
+                composedItems.forEach { m -> itemsJson.put(org.json.JSONObject(m)) }
+                val finalPayload = org.json.JSONObject(payload.toString())
+                finalPayload.put("items", itemsJson)
+                if (!finalPayload.has("maxAmount")) finalPayload.put("maxAmount", "0")
+                val merchantAssets = fetchWalletAssetsSync(BeamioWeb3Wallet.getAddress(), merchantInfraOnly = false)
+                val toAddr = merchantAssets?.aaAddress?.takeIf { it.isNotEmpty() } ?: payload.optString("to")
+                if (toAddr.isEmpty()) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Merchant AA not found. Please ensure terminal is configured."
+                    }
+                    return@Thread
+                }
+                if (!finalPayload.has("deadline") && finalPayload.has("validBefore")) {
+                    finalPayload.put("deadline", finalPayload.optString("validBefore"))
+                }
+                finalPayload.put("to", toAddr)
+                steps = updateStep(
+                    steps,
+                    "optimizingRoute",
+                    StepStatus.success,
+                    when {
+                        beamio1155PointsWei > 0 && usdcWei > 0 -> "Hybrid: points + USDC"
+                        beamio1155PointsWei > 0 -> "Points only"
+                        else -> "USDC only"
+                    },
+                )
+                val qrPaymentMemberNo = memberNoPrimaryFromSortedCardsItem(assets)
+                val qrPaymentCard = paymentCardForQrCharge
+                val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
+                runOnUiThread {
+                    paymentChargeBreakdownTaxPercent = taxPctQr
+                    paymentChargeBreakdownTierDiscountPercent = tierDiscQr
+                    paymentScreenMemberNo = qrPaymentMemberNo.ifEmpty { null }
+                    paymentScreenCardBackground = qrPaymentCard?.cardBackground
+                    paymentScreenCardImage = qrPaymentCard?.cardImage
+                    paymentScreenCardName = qrPaymentCard?.cardName
+                    paymentScreenTierName = qrPaymentCard?.tierName
+                    paymentScreenCardType = qrPaymentCard?.cardType
+                    paymentScreenPassCardSnapshot = qrPaymentCard
+                    paymentScreenPayerBeamioTag = assets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                    paymentScreenPayerAddress = assets.address?.trim()
+                    paymentScreenPayee = toAddr
+                    paymentScreenTip = scaled.tipStr ?: "0.00"
+                    paymentScreenAmount = "%.2f".format(chargedFiat)
+                    paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
+                    paymentScreenCardCurrency = payCurrencyQr
+                    paymentScreenStatus = PaymentStatus.Submitting
+                    paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
+                }
+                val currencyAmountStr = "%.2f".format(chargedFiat)
+                val subtotalStrForBill = scaled.subtotalStr
+                val tipStrForBill = scaled.tipStr ?: "0.00"
+                val qrChargeBill = OpenContainerChargeBillFields(
+                    subtotal = subtotalStrForBill,
+                    tip = tipStrForBill,
+                    tipRateBps = paymentScreenTipRateBps,
+                    requestCurrency = payCurrencyQr,
+                    taxAmountFiat6 = taxFiat6Bill,
+                    taxRateBps = taxBpsQr,
+                    discountAmountFiat6 = discFiat6Bill,
+                    discountRateBps = discBpsQr,
+                )
+                val result = postAAtoEOAOpenContainer(
+                    finalPayload,
+                    listOf(payCurrencyQr),
+                    listOf(currencyAmountStr),
+                    qrChargeBill,
+                )
+                steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
+                steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
+                val customerAccountForPostBalance = account
+                val preBalanceForCheck = totalBalanceCad
+                val deductedCardAddress = if (beamio1155PointsWei > 0) infraCardAddress() else null
+                if (!result.success) {
+                    val errPost = result.error ?: "Payment failed"
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = steps
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = errPost
+                    }
+                    return@Thread
+                }
+                steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
+                runOnUiThread {
+                    paymentScreenRoutingSteps = steps
+                    paymentScreenPostBalance = null
+                    paymentScreenStatus = PaymentStatus.Submitting
+                    paymentScreenTxHash = result.txHash ?: ""
+                    paymentScreenError = ""
+                    paymentViaQr = true
+                }
+                Thread {
+                    Thread.sleep(5000)
+                    var postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true, merchantInfraOnly = false)
+                    var postCad = postAssets?.let { a ->
+                        if (!a.ok) null else {
+                            val card = deductedCardAddress?.let { addr ->
+                                a.cards?.find { it.cardAddress.equals(addr, ignoreCase = true) }
+                            }
+                            if (card != null) {
+                                val pts6 = card.points6.toLongOrNull() ?: 0L
+                                (pts6 / 1_000_000.0) * getRateForCurrency("CAD", oracle) / getRateForCurrency(card.cardCurrency, oracle)
+                            } else {
+                                totalBalanceCadFromAssets(a, oracle)
+                            }
+                        }
+                    }
+                    if (postCad != null && postCad >= preBalanceForCheck - 0.01 && totalCurrencyQr > 0.001) {
+                        Thread.sleep(3000)
+                        postAssets = fetchWalletAssetsSync(customerAccountForPostBalance, forPostPayment = true, merchantInfraOnly = false)
+                        postCad = postAssets?.let { a ->
+                            if (!a.ok) null else {
+                                val card = deductedCardAddress?.let { addr ->
+                                    a.cards?.find { it.cardAddress.equals(addr, ignoreCase = true) }
+                                }
+                                if (card != null) {
+                                    val pts6 = card.points6.toLongOrNull() ?: 0L
+                                    (pts6 / 1_000_000.0) * getRateForCurrency("CAD", oracle) / getRateForCurrency(card.cardCurrency, oracle)
+                                } else {
+                                    totalBalanceCadFromAssets(a, oracle)
+                                }
+                            }
+                        }
+                    }
+                    val finalPostCad = postCad
+                    val stepsAfter = updateStep(
+                        steps,
+                        "refreshBalance",
+                        StepStatus.success,
+                        if (postAssets != null && postAssets.ok && finalPostCad != null) "Updated" else "Unavailable",
+                    )
+                    runOnUiThread {
+                        paymentScreenRoutingSteps = stepsAfter
+                        var refreshedPass: CardItem? = null
+                        if (postAssets != null && postAssets.ok && finalPostCad != null) {
+                            paymentScreenPostBalance = "%.2f".format(finalPostCad)
+                            refreshedPass = postAssets.cards?.firstOrNull { deductedCardAddress != null && it.cardAddress.equals(deductedCardAddress, ignoreCase = true) }
+                                ?: postAssets.cards?.firstOrNull()
+                            if (refreshedPass != null) {
+                                paymentScreenPassCardSnapshot = refreshedPass
+                                paymentScreenCardBackground = refreshedPass.cardBackground
+                                paymentScreenCardImage = refreshedPass.cardImage
+                                paymentScreenTierName = refreshedPass.tierName
+                                paymentScreenCardName = refreshedPass.cardName
+                            }
+                        } else {
+                            paymentScreenPostBalance = "—"
+                        }
+                        val hero = refreshedPass ?: qrPaymentCard
+                        val shortfallQr = (totalCurrencyQr - chargedFiat).coerceAtLeast(0.0)
+                        val memberTitleQr = passHeroMemberDisplayNameLine(
+                            assets.beamioTag,
+                            assets.address,
+                            hero,
+                            hero?.cardName,
+                        )
+                        val termQr = BeamioWeb3Wallet.getAddress()?.trim()?.takeIf { it.length >= 6 }
+                            ?.let { "POS-${it.takeLast(4).uppercase(Locale.US)}" } ?: "—"
+                        paymentPartialApprovalUi = PartialApprovalUiModel(
+                            payCurrency = payCurrencyQr,
+                            chargedPayCur = chargedFiat,
+                            shortfallPayCur = shortfallQr,
+                            orderTotalPayCur = totalCurrencyQr,
+                            subtotal = requestQr,
+                            tierDiscountAmount = discAmtCadQr,
+                            tierDiscountLabel = hero?.tierName?.takeIf { it.isNotBlank() },
+                            taxPercent = taxPctQr,
+                            taxAmount = taxAmtCadQr,
+                            tipAmount = tipQr,
+                            memberDisplayName = memberTitleQr,
+                            memberNoDisplay = qrPaymentMemberNo.ifBlank { "—" },
+                            txHash = result.txHash ?: "",
+                            settlementViaQr = true,
+                            settlementDetail = termQr,
+                            originalSubtotal = requestQr,
+                            originalTipBps = paymentScreenTipRateBps,
+                            tierDiscPct = tierDiscQr,
+                            returnScanMethod = "qr",
+                            tierCardBackgroundHex = hero?.cardBackground,
+                            cardMetadataImageUrl = hero?.cardImage,
+                            programCardDisplayName = hero?.let { balanceDetailsCardNameLine(it) }?.takeIf { it != "—" },
+                        )
+                        paymentScreenStatus = PaymentStatus.Success
+                        lastQrPaymentOpenRelayPayload = null
+                        scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                        scheduleElasticHomeDataPullAfterTxSuccess()
+                    }
+                }.start()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "executeImmediatePartialQrFromInsufficient", e)
+                runOnUiThread {
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = e.message ?: "Execution failed"
+                }
+            }
+        }.start()
     }
 
     /** Charge 动态 QR：扫到码后短振动，提示进入解析阶段 */
@@ -1517,6 +2336,7 @@ class MainActivity : ComponentActivity() {
         topupScreenPostBalance = null
         topupScreenCardCurrency = null
         topupScreenAddress = null
+        topupScreenBeamioTag = null
         topupScreenCardBackground = null
         topupScreenCardImage = null
         topupScreenTierName = null
@@ -1594,6 +2414,8 @@ class MainActivity : ComponentActivity() {
             paymentScreenCardType = null
             paymentScreenMemberNo = null
             paymentScreenPassCardSnapshot = null
+            paymentScreenPayerBeamioTag = null
+            paymentScreenPayerAddress = null
             paymentChargeBreakdownTierDiscountPercent = null
             scanMethodState = "qr"
             startEmbeddedQrScanning()
@@ -1602,6 +2424,8 @@ class MainActivity : ComponentActivity() {
             scanMethodState = "nfc"
             paymentChargeBreakdownTierDiscountPercent = null
             paymentScreenPassCardSnapshot = null
+            paymentScreenPayerBeamioTag = null
+            paymentScreenPayerAddress = null
             armForNfcScan()
         }
     }
@@ -1720,6 +2544,7 @@ class MainActivity : ComponentActivity() {
                 topupScreenPostBalance = null
                 topupScreenCardCurrency = null
                 topupScreenAddress = null
+                topupScreenBeamioTag = null
                 topupScreenCardBackground = null
                 topupScreenCardImage = null
                 topupScreenTierName = null
@@ -1757,6 +2582,8 @@ class MainActivity : ComponentActivity() {
                 paymentScreenTierName = null
                 paymentScreenCardType = null
                 paymentScreenPassCardSnapshot = null
+                paymentScreenPayerBeamioTag = null
+                paymentScreenPayerAddress = null
                 paymentArmed = true
                 readArmed = false
                 initArmed = false
@@ -1779,6 +2606,7 @@ class MainActivity : ComponentActivity() {
             topupScreenPostBalance = null
             topupScreenCardCurrency = null
             topupScreenAddress = null
+            topupScreenBeamioTag = null
             topupScreenCardBackground = null
             topupScreenCardImage = null
             topupScreenTierName = null
@@ -1925,6 +2753,7 @@ class MainActivity : ComponentActivity() {
                     topupScreenPreBalance = preBalanceStr
                     topupScreenCardCurrency = preCurrency
                     topupScreenAddress = preAssets.address
+                    topupScreenBeamioTag = preAssets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
                     topupScreenCardBackground = topupCard?.cardBackground
                     topupScreenCardImage = topupCard?.cardImage
                     topupScreenTierName = topupCard?.tierName
@@ -1975,6 +2804,8 @@ class MainActivity : ComponentActivity() {
                                     topupScreenTierDescription = postCard?.tierDescription ?: topupScreenTierDescription
                                     if (postCard != null) topupScreenPassCardSnapshot = postCard
                                     topupScreenPostBalance = postCard?.points ?: postAssets.points ?: "—"
+                                    topupScreenBeamioTag = postAssets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                                        ?: topupScreenBeamioTag
                                 } else {
                                     topupScreenPostBalance = "—"
                                 }
@@ -1985,6 +2816,7 @@ class MainActivity : ComponentActivity() {
                                     showTopupScreen = true
                                 }
                                 scheduleCardStatsRefetchUntilChanged(expectChargeChange = false, expectTopUpChange = true)
+                                scheduleElasticHomeDataPullAfterTxSuccess()
                             }
                         }.start()
                     } else {
@@ -2147,6 +2979,7 @@ class MainActivity : ComponentActivity() {
                     topupScreenPreBalance = preBalanceStr
                     topupScreenCardCurrency = preCurrency
                     topupScreenAddress = preAssets.address
+                    topupScreenBeamioTag = preAssets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
                     topupScreenCardBackground = topupCard?.cardBackground
                     topupScreenCardImage = topupCard?.cardImage
                     topupScreenTierName = topupCard?.tierName
@@ -2189,11 +3022,14 @@ class MainActivity : ComponentActivity() {
                                     topupScreenTierDescription = postCard?.tierDescription ?: topupScreenTierDescription
                                     if (postCard != null) topupScreenPassCardSnapshot = postCard
                                     topupScreenPostBalance = postCard?.points ?: postAssets.points ?: "—"
+                                    topupScreenBeamioTag = postAssets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                                        ?: topupScreenBeamioTag
                                 } else {
                                     topupScreenPostBalance = "—"
                                 }
                                 topupScreenStatus = TopupStatus.Success
                                 scheduleCardStatsRefetchUntilChanged(expectChargeChange = false, expectTopUpChange = true)
+                                scheduleElasticHomeDataPullAfterTxSuccess()
                             }
                         }.start()
                     } else {
@@ -2338,8 +3174,19 @@ class MainActivity : ComponentActivity() {
         return (usdcAmount * 1_000_000).toLong().toString()
     }
 
-    /** 从 UIDAssets 计算总余额（CAD） */
-    private fun totalBalanceCadFromAssets(assets: UIDAssets, oracle: OracleRates): Double {
+    /** [currencyToUsdc6] 的逆：USDC6 → 账单货币金额（与 iOS `usdc6ToCurrencyAmount` 一致） */
+    private fun usdc6ToCurrencyAmount(usdc6: Long, currency: String, oracle: OracleRates): Double {
+        if (usdc6 <= 0L) return 0.0
+        val rate = getRateForCurrency(currency, oracle)
+        if (rate <= 0) return 0.0
+        return (usdc6 / 1_000_000.0) * rate
+    }
+
+    /**
+     * Charge 余额预检（贴卡 / 动态 QR 一致）：USDC + 各卡 points 按各自 cardCurrency 折 USDC6。
+     * Smart Routing 仍用 [chargeableCards] + CCSA unit price 组装 items；此值仅用于是否不足额与 partial 封顶。
+     */
+    private fun chargePreflightTotalBalanceUsdc6(assets: UIDAssets, oracle: OracleRates): Long {
         val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
         val cardsValueUsdc6 = assets.cards?.sumOf { card ->
             points6ToUsdc6(card.points6.toLongOrNull() ?: 0L, card.cardCurrency, oracle)
@@ -2348,7 +3195,12 @@ class MainActivity : ComponentActivity() {
             val cur = assets.cardCurrency ?: "CAD"
             points6ToUsdc6(pts6, cur, oracle)
         }
-        val totalBalance6 = usdcBalance6.toLong() + cardsValueUsdc6
+        return usdcBalance6.toLong() + cardsValueUsdc6
+    }
+
+    /** 从 UIDAssets 计算总余额（CAD） */
+    private fun totalBalanceCadFromAssets(assets: UIDAssets, oracle: OracleRates): Double {
+        val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
         return (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
     }
 
@@ -2415,7 +3267,7 @@ class MainActivity : ComponentActivity() {
                 val taxFiat6Str = kotlin.math.round(taxAmtCad * 1_000_000.0).toLong().toString()
                 val discFiat6Str = kotlin.math.round(discAmtCad * 1_000_000.0).toLong().toString()
                 val taxBpsResolved = kotlin.math.round(taxPctResolved * 100.0).toInt().coerceIn(0, 10000)
-                val discBpsResolved = (tierDiscPct * 100).coerceIn(0, 10000)
+                val discBpsResolved = kotlin.math.round(tierDiscPct * 100.0).toInt().coerceIn(0, 10000)
                 val tipPay = chargeTipFromRequestAndBps(subtotalPay, paymentScreenTipRateBps)
                 val tipStrForNfc = "%.2f".format(tipPay)
                 val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: "CAD"
@@ -2444,37 +3296,86 @@ class MainActivity : ComponentActivity() {
                     paymentScreenTierName = paymentCard?.tierName
                     paymentScreenCardType = paymentCard?.cardType
                     paymentScreenPassCardSnapshot = paymentCard
+                    paymentScreenPayerBeamioTag = assets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                    paymentScreenPayerAddress = assets.address?.trim()
                     paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading)
                 }
                 steps = updateStep(steps, "optimizingRoute", StepStatus.success, "Direct: NFC → Merchant")
-                // 总余额 = USDC + 各卡 points 按 cardCurrency 折算为 USDC（依据 oracle）
-                val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
-                val cardsValueUsdc6 = assets.cards?.sumOf { card ->
-                    points6ToUsdc6(card.points6.toLongOrNull() ?: 0L, card.cardCurrency, oracle)
-                } ?: run {
-                    val pts6 = assets.points6?.toLongOrNull() ?: 0L
-                    val cur = assets.cardCurrency ?: "CAD"
-                    points6ToUsdc6(pts6, cur, oracle)
-                }
-                val totalBalance6 = usdcBalance6.toLong() + cardsValueUsdc6
+                val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
                 // 初始余额（CAD）：总 USDC6 转 CAD，供 postBalance = pre - subtotal - tip
                 val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
                 runOnUiThread {
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
                 }
                 val required6 = amountUsdc6.toLongOrNull() ?: 0L
+                if (totalBalance6 >= required6) {
+                    chargeCapToCustomerAvailableBalance = false
+                }
+                val ratePayForPartial = getRateForCurrency(payCurrency, oracle)
+                val balancePayCurBeforeNfc = (totalBalance6 / 1_000_000.0) * ratePayForPartial
+                var partialChargeNfc = false
+                var effectiveAmountUsdc6Str = amountUsdc6
+                var chargeTotalInPayForSplit = totalCurrency
+                var nfcSubtotalStrEff = paymentScreenSubtotal.trim().ifEmpty { "%.2f".format(subtotalPay) }
+                var nfcTipStrEff = tipStrForNfc
+                var nfcTaxFiat6Eff = taxFiat6Str
+                var nfcDiscFiat6Eff = discFiat6Str
                 if (totalBalance6 < required6) {
-                    steps = updateStep(steps, "analyzingAssets", StepStatus.error, "Insufficient balance")
-                    val shortfall6 = (required6 - totalBalance6).coerceAtLeast(0L)
-                    val errMsg = "Insufficient balance (need ${String.format("%.2f", required6 / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC, shortfall ${String.format("%.2f", shortfall6 / 1_000_000.0)} USDC)"
-                    runOnUiThread {
-                        val fromScan = nfcFetchingInfo
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = errMsg
-                        paymentScreenRoutingSteps = steps
-                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = errMsg }
+                    val allowCapToAvailable = chargeCapToCustomerAvailableBalance && totalBalance6 > 0L
+                    if (!allowCapToAvailable) {
+                        steps = updateStep(steps, "analyzingAssets", StepStatus.error, "Insufficient balance")
+                        val shortfall6 = (required6 - totalBalance6).coerceAtLeast(0L)
+                        val errMsg = "Insufficient balance (need ${String.format("%.2f", required6 / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC, shortfall ${String.format("%.2f", shortfall6 / 1_000_000.0)} USDC)"
+                        runOnUiThread {
+                            val fromScan = nfcFetchingInfo
+                            val model = buildInsufficientBalanceUiFromPaymentContext(
+                                totalCurrency = totalCurrency,
+                                payCurrency = payCurrency,
+                                totalBalance6 = totalBalance6,
+                                required6 = required6,
+                                oracle = oracle,
+                                subtotal = subtotalPay,
+                                taxPct = taxPctResolved,
+                                tierDiscPct = tierDiscPct,
+                                tip = tipPay,
+                                returnScanMethod = scanMethodState
+                            )
+                            insufficientPartialRetryContext = InsufficientPartialRetryContext(
+                                totalCurrency = totalCurrency,
+                                payCurrency = payCurrency,
+                                availableUsdc6 = totalBalance6,
+                                requiredUsdc6 = required6,
+                                subtotal = subtotalPay,
+                                taxPct = taxPctResolved,
+                                tierDiscPct = tierDiscPct,
+                                tip = tipPay,
+                                returnScanMethod = if (scanMethodState == "qr") "qr" else "nfc",
+                                nfcUid = effectiveUid,
+                                nfcSun = sunParams,
+                            )
+                            openInsufficientBalanceScreen(model)
+                            if (fromScan) {
+                                nfcFetchingInfo = false
+                                nfcFetchError = ""
+                            }
+                            Log.w("Charge", "Insufficient balance (NFC pre-tx): $errMsg")
+                        }
+                        return@Thread
                     }
-                    return@Thread
+                    chargeCapToCustomerAvailableBalance = false
+                    partialChargeNfc = true
+                    val ratioNfc = totalBalance6.toDouble() / required6.toDouble().coerceAtLeast(1.0)
+                    effectiveAmountUsdc6Str = totalBalance6.toString()
+                    chargeTotalInPayForSplit = totalCurrency * ratioNfc
+                    nfcSubtotalStrEff = "%.2f".format(subtotalPay * ratioNfc)
+                    nfcTipStrEff = "%.2f".format(tipPay * ratioNfc)
+                    nfcTaxFiat6Eff = kotlin.math.round(taxAmtCad * ratioNfc * 1_000_000.0).toLong().toString()
+                    nfcDiscFiat6Eff = kotlin.math.round(discAmtCad * ratioNfc * 1_000_000.0).toLong().toString()
+                    runOnUiThread {
+                        paymentScreenAmount = "%.2f".format(balancePayCurBeforeNfc)
+                        paymentScreenTip = nfcTipStrEff
+                    }
+                    Log.w("Charge", "PARTIAL NFC charge: using full balance totalBalance6=$totalBalance6 required6=$required6 ratio=$ratioNfc")
                 }
                 runOnUiThread {
                     paymentScreenStatus = PaymentStatus.Submitting
@@ -2482,30 +3383,73 @@ class MainActivity : ComponentActivity() {
                 }
                 val result = payByNfcUidWithContainer(
                     effectiveUid,
-                    amountUsdc6,
+                    effectiveAmountUsdc6Str,
                     payee,
                     assets,
                     oracle,
                     sunParams,
-                    chargeTotalInPayCurrency = totalCurrency,
-                    nfcSubtotalCurrencyAmount = paymentScreenSubtotal,
-                    nfcTipCurrencyAmount = tipStrForNfc,
+                    chargeTotalInPayCurrency = chargeTotalInPayForSplit,
+                    nfcSubtotalCurrencyAmount = nfcSubtotalStrEff,
+                    nfcTipCurrencyAmount = nfcTipStrEff,
                     nfcTipRateBps = paymentScreenTipRateBps,
                     nfcRequestCurrency = payCurrency,
-                    nfcTaxAmountFiat6 = taxFiat6Str,
+                    nfcTaxAmountFiat6 = nfcTaxFiat6Eff,
                     nfcTaxRateBps = taxBpsResolved,
-                    nfcDiscountAmountFiat6 = discFiat6Str,
+                    nfcDiscountAmountFiat6 = nfcDiscFiat6Eff,
                     nfcDiscountRateBps = discBpsResolved
                 )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
                 if (!result.success) {
+                    val err = result.error ?: "Payment failed"
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
-                        paymentScreenRoutingSteps = steps
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = result.error ?: "Payment failed"
-                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = result.error ?: "Payment failed" }
+                        val parsed = parseInsufficientBalanceUsdcFromError(err)
+                        if (parsed != null && err.startsWith("Insufficient balance", ignoreCase = true)) {
+                            val (needU, totalU, shortU) = parsed
+                            val rate = getRateForCurrency(payCurrency, oracle)
+                            val taxAmtLine = subtotalPay * taxPctResolved / 100.0
+                            val discAmtLine = subtotalPay * tierDiscPct / 100.0
+                            val avail6FromErr = kotlin.math.round(totalU * 1_000_000.0).toLong().coerceAtLeast(0L)
+                            val need6FromErr = kotlin.math.round(needU * 1_000_000.0).toLong().coerceAtLeast(0L)
+                            val model = InsufficientBalanceUiModel(
+                                totalChargeFormatted = formatFiatDisplayLineForInsufficient(totalCurrency, payCurrency),
+                                currentBalanceFormatted = formatFiatDisplayLineForInsufficient(totalU * rate, payCurrency),
+                                shortfallFormatted = "-${formatFiatDisplayLineForInsufficient(shortU * rate, payCurrency)}",
+                                voucherDeductionFormatted = formatFiatDisplayLineForInsufficient(subtotalPay, payCurrency),
+                                tierDiscountFormatted = formatFiatDisplayLineForInsufficient(discAmtLine, payCurrency),
+                                tipFormatted = formatFiatDisplayLineForInsufficient(tipPay, payCurrency),
+                                taxFormatted = formatFiatDisplayLineForInsufficient(taxAmtLine, payCurrency),
+                                returnScanMethod = if (scanMethodState == "qr") "qr" else "nfc",
+                                availableBalanceUsdc6 = avail6FromErr,
+                            )
+                            insufficientPartialRetryContext = InsufficientPartialRetryContext(
+                                totalCurrency = totalCurrency,
+                                payCurrency = payCurrency,
+                                availableUsdc6 = avail6FromErr,
+                                requiredUsdc6 = need6FromErr,
+                                subtotal = subtotalPay,
+                                taxPct = taxPctResolved,
+                                tierDiscPct = tierDiscPct,
+                                tip = tipPay,
+                                returnScanMethod = if (scanMethodState == "qr") "qr" else "nfc",
+                                nfcUid = effectiveUid,
+                                nfcSun = sunParams,
+                            )
+                            openInsufficientBalanceScreen(model)
+                            if (fromScan) {
+                                nfcFetchingInfo = false
+                                nfcFetchError = ""
+                            }
+                        } else {
+                            paymentScreenRoutingSteps = steps
+                            paymentScreenStatus = PaymentStatus.Error
+                            paymentScreenError = err
+                            if (fromScan) {
+                                nfcFetchingInfo = false
+                                nfcFetchError = err
+                            }
+                        }
                     }
                 } else {
                     val payPassSnapshotAddr = paymentCard?.cardAddress
@@ -2533,16 +3477,62 @@ class MainActivity : ComponentActivity() {
                         )
                         runOnUiThread {
                             paymentScreenRoutingSteps = stepsAfter
+                            var refreshedPass: CardItem? = null
                             if (postAssets != null && postAssets.ok) {
                                 paymentScreenPostBalance = "%.2f".format(totalBalanceCadFromAssets(postAssets, oracle))
-                                val refreshedPass = postAssets.cards?.firstOrNull { payPassSnapshotAddr != null && it.cardAddress.equals(payPassSnapshotAddr, ignoreCase = true) }
+                                refreshedPass = postAssets.cards?.firstOrNull { payPassSnapshotAddr != null && it.cardAddress.equals(payPassSnapshotAddr, ignoreCase = true) }
                                     ?: postAssets.cards?.firstOrNull()
-                                if (refreshedPass != null) paymentScreenPassCardSnapshot = refreshedPass
+                                if (refreshedPass != null) {
+                                    paymentScreenPassCardSnapshot = refreshedPass
+                                    paymentScreenCardBackground = refreshedPass.cardBackground
+                                    paymentScreenCardImage = refreshedPass.cardImage
+                                    paymentScreenTierName = refreshedPass.tierName
+                                    paymentScreenCardName = refreshedPass.cardName
+                                }
                             } else {
                                 paymentScreenPostBalance = "—"
                             }
+                            if (partialChargeNfc) {
+                                val hero = refreshedPass ?: paymentCard
+                                val shortfallNfc = (totalCurrency - balancePayCurBeforeNfc).coerceAtLeast(0.0)
+                                val memberTitleNfc = passHeroMemberDisplayNameLine(
+                                    assets.beamioTag,
+                                    assets.address,
+                                    hero,
+                                    hero?.cardName,
+                                )
+                                val mn = (paymentMemberNo.ifEmpty { memberNoPrimaryFromSortedCardsItem(assets) }).ifBlank { "—" }
+                                val term = BeamioWeb3Wallet.getAddress()?.trim()?.takeIf { it.length >= 6 }?.let { "POS-${it.takeLast(4).uppercase(Locale.US)}" } ?: "—"
+                                paymentPartialApprovalUi = PartialApprovalUiModel(
+                                    payCurrency = payCurrency,
+                                    chargedPayCur = balancePayCurBeforeNfc,
+                                    shortfallPayCur = shortfallNfc,
+                                    orderTotalPayCur = totalCurrency,
+                                    subtotal = subtotalPay,
+                                    tierDiscountAmount = discAmtCad,
+                                    tierDiscountLabel = hero?.tierName?.takeIf { it.isNotBlank() },
+                                    taxPercent = taxPctResolved,
+                                    taxAmount = taxAmtCad,
+                                    tipAmount = tipPay,
+                                    memberDisplayName = memberTitleNfc,
+                                    memberNoDisplay = mn,
+                                    txHash = result.txHash ?: "",
+                                    settlementViaQr = false,
+                                    settlementDetail = term,
+                                    originalSubtotal = subtotalPay,
+                                    originalTipBps = paymentScreenTipRateBps,
+                                    tierDiscPct = tierDiscPct,
+                                    returnScanMethod = if (scanMethodState == "qr") "qr" else "nfc",
+                                    tierCardBackgroundHex = hero?.cardBackground,
+                                    cardMetadataImageUrl = hero?.cardImage,
+                                    programCardDisplayName = hero?.let { balanceDetailsCardNameLine(it) }?.takeIf { it != "—" },
+                                )
+                            } else {
+                                paymentPartialApprovalUi = null
+                            }
                             paymentScreenStatus = PaymentStatus.Success
                             scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                            scheduleElasticHomeDataPullAfterTxSuccess()
                         }
                     }.start()
                 }
@@ -2579,6 +3569,11 @@ class MainActivity : ComponentActivity() {
                         paymentScreenError = "Invalid payment code"
                     }
                     return@Thread
+                }
+                lastQrPaymentOpenRelayPayload = try {
+                    org.json.JSONObject(payload.toString())
+                } catch (_: Exception) {
+                    null
                 }
                 val requestQrEarly = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
                 if (requestQrEarly <= 0) {
@@ -2619,7 +3614,7 @@ class MainActivity : ComponentActivity() {
                 val taxFiat6StrQr = kotlin.math.round(taxAmtCadQr * 1_000_000.0).toLong().toString()
                 val discFiat6StrQr = kotlin.math.round(discAmtCadQr * 1_000_000.0).toLong().toString()
                 val taxBpsQr = kotlin.math.round(taxPctQr * 100.0).toInt().coerceIn(0, 10000)
-                val discBpsQr = (tierDiscQr * 100).coerceIn(0, 10000)
+                val discBpsQr = kotlin.math.round(tierDiscQr * 100.0).toInt().coerceIn(0, 10000)
                 val payCurrencyQr = paymentCardForQrCharge?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrencyQr = chargeTotalInCurrency(requestQr, taxPctQr, tierDiscQr, tipQr)
                 val enteredUsdc6 = currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
@@ -2633,7 +3628,6 @@ class MainActivity : ComponentActivity() {
                 }
                 val hasCardholder = (assets.cards?.any { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) } == true) ||
                     (assets.points6?.toLongOrNull() ?: 0L) > 0
-                val effectiveUsdc6 = enteredUsdc6
                 steps = updateStep(steps, "membership", StepStatus.success, if (hasCardholder) "Cardholder" else "No membership")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "analyzingAssets", StepStatus.loading) }
                 // QR Charge：与 NFC payByNfcUidWithContainer 对齐——不按用户卡合约地址（如 CCSA 克隆 0x2032…）拆分 container；
@@ -2648,21 +3642,84 @@ class MainActivity : ComponentActivity() {
                 val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
                 val ccsaValueUsdc6 = if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) (ccsaPoints6 * unitPriceUSDC6) / 1_000_000 else 0L
                 val infraValueUsdc6 = infraCards.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
-                val totalBalance6 = ccsaValueUsdc6 + infraValueUsdc6 + usdcBalance6.toLong()
-                if (totalBalance6 < effectiveUsdc6) {
-                    runOnUiThread {
-                        nfcFetchingInfo = false
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = "Insufficient customer balance (need ${String.format("%.2f", effectiveUsdc6 / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC)"
-                    }
-                    return@Thread
+                val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
+                val rateQrPartial = getRateForCurrency(payCurrencyQr, oracle)
+                val balancePayCurBeforeQr = (totalBalance6 / 1_000_000.0) * rateQrPartial
+                var partialChargeQr = false
+                var effectiveUsdc6Final = enteredUsdc6
+                var chargeTotalForSplitQr = totalCurrencyQr
+                var tipQrEff = tipQr
+                var requestQrEff = requestQr
+                var taxAmtQrEff = taxAmtCadQr
+                var discAmtQrEff = discAmtCadQr
+                var taxFiat6Bill = taxFiat6StrQr
+                var discFiat6Bill = discFiat6StrQr
+                if (totalBalance6 >= enteredUsdc6) {
+                    chargeCapToCustomerAvailableBalance = false
                 }
+                if (totalBalance6 < enteredUsdc6) {
+                    val allowCapQr = chargeCapToCustomerAvailableBalance && totalBalance6 > 0L
+                    if (!allowCapQr) {
+                        val shortfall6Qr = (enteredUsdc6 - totalBalance6).coerceAtLeast(0L)
+                        val errQr = "Insufficient customer balance (need ${String.format("%.2f", enteredUsdc6 / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC)"
+                        runOnUiThread {
+                            val model = buildInsufficientBalanceUiFromPaymentContext(
+                                totalCurrency = totalCurrencyQr,
+                                payCurrency = payCurrencyQr,
+                                totalBalance6 = totalBalance6,
+                                required6 = enteredUsdc6,
+                                oracle = oracle,
+                                subtotal = requestQr,
+                                taxPct = taxPctQr,
+                                tierDiscPct = tierDiscQr,
+                                tip = tipQr,
+                                /** QR execute 路径固定回到扫码，与 NFC 分支显式区分方式一致 */
+                                returnScanMethod = "qr"
+                            )
+                            insufficientPartialRetryContext = InsufficientPartialRetryContext(
+                                totalCurrency = totalCurrencyQr,
+                                payCurrency = payCurrencyQr,
+                                availableUsdc6 = totalBalance6,
+                                requiredUsdc6 = enteredUsdc6,
+                                subtotal = requestQr,
+                                taxPct = taxPctQr,
+                                tierDiscPct = tierDiscQr,
+                                tip = tipQr,
+                                returnScanMethod = "qr",
+                                qrAccount = account,
+                                qrPayloadJson = try {
+                                    payload.toString()
+                                } catch (_: Exception) {
+                                    null
+                                },
+                            )
+                            openInsufficientBalanceScreen(model)
+                            nfcFetchingInfo = false
+                            qrScanningActive = false
+                            Log.w("Charge", "Insufficient balance (QR pre-tx): $errQr shortfall6=$shortfall6Qr")
+                        }
+                        return@Thread
+                    }
+                    chargeCapToCustomerAvailableBalance = false
+                    partialChargeQr = true
+                    val ratioQr = totalBalance6.toDouble() / enteredUsdc6.toDouble().coerceAtLeast(1.0)
+                    effectiveUsdc6Final = totalBalance6
+                    chargeTotalForSplitQr = totalCurrencyQr * ratioQr
+                    requestQrEff = requestQr * ratioQr
+                    tipQrEff = tipQr * ratioQr
+                    taxAmtQrEff = taxAmtCadQr * ratioQr
+                    discAmtQrEff = discAmtCadQr * ratioQr
+                    taxFiat6Bill = kotlin.math.round(taxAmtQrEff * 1_000_000.0).toLong().toString()
+                    discFiat6Bill = kotlin.math.round(discAmtQrEff * 1_000_000.0).toLong().toString()
+                    Log.w("Charge", "PARTIAL QR charge: totalBalance6=$totalBalance6 enteredUsdc6=$enteredUsdc6 ratio=$ratioQr")
+                }
+                val effectiveUsdc6 = effectiveUsdc6Final
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success,
                     if (ccsaValueUsdc6 >= effectiveUsdc6) "\$CCSA: (Sufficient)" else if (ccsaValueUsdc6 > 0) "\$CCSA: (Partial)" else "USDC sufficient")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
                 val qrSplit = computeChargeContainerSplit(
                     effectiveUsdc6,
-                    totalCurrencyQr,
+                    chargeTotalForSplitQr,
                     payCurrencyQr,
                     oracle,
                     unitPriceUSDC6,
@@ -2738,26 +3795,28 @@ class MainActivity : ComponentActivity() {
                     paymentScreenTierName = qrPaymentCard?.tierName
                     paymentScreenCardType = qrPaymentCard?.cardType
                     paymentScreenPassCardSnapshot = qrPaymentCard
+                    paymentScreenPayerBeamioTag = assets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                    paymentScreenPayerAddress = assets.address?.trim()
                     paymentScreenPayee = toAddr
-                    paymentScreenTip = "%.2f".format(tipQr)
-                    paymentScreenAmount = "%.2f".format(totalCurrencyQr)
+                    paymentScreenTip = "%.2f".format(tipQrEff)
+                    paymentScreenAmount = if (partialChargeQr) "%.2f".format(balancePayCurBeforeQr) else "%.2f".format(totalCurrencyQr)
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
                     paymentScreenCardCurrency = payCurrencyQr
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val currencyAmountStr = "%.2f".format(totalCurrencyQr)
+                val currencyAmountStr = "%.2f".format(chargeTotalForSplitQr)
                 // 与 payByNfcUidWithContainer 一致：小计/小费用屏幕原始字符串，税/折扣 fiat6+bps 与 NFC 相同算法
-                val subtotalStrForBill = paymentScreenSubtotal.trim().ifEmpty { "%.2f".format(requestQr) }
-                val tipStrForBill = "%.2f".format(tipQr)
+                val subtotalStrForBill = "%.2f".format(requestQrEff)
+                val tipStrForBill = "%.2f".format(tipQrEff)
                 val qrChargeBill = OpenContainerChargeBillFields(
                     subtotal = subtotalStrForBill,
                     tip = tipStrForBill,
                     tipRateBps = paymentScreenTipRateBps,
                     requestCurrency = payCurrencyQr,
-                    taxAmountFiat6 = taxFiat6StrQr,
+                    taxAmountFiat6 = taxFiat6Bill,
                     taxRateBps = taxBpsQr,
-                    discountAmountFiat6 = discFiat6StrQr,
+                    discountAmountFiat6 = discFiat6Bill,
                     discountRateBps = discBpsQr
                 )
                 val result = postAAtoEOAOpenContainer(
@@ -2773,11 +3832,53 @@ class MainActivity : ComponentActivity() {
                 // 扣款来源卡地址：成功页显示该卡余额（非总资产），与用户预期一致
                 val deductedCardAddress = if (beamio1155PointsWei > 0) infraCardAddress() else null
                 if (!result.success) {
+                    val errPost = result.error ?: "Payment failed"
                     runOnUiThread {
-                        paymentScreenRoutingSteps = steps
-                        nfcFetchingInfo = false
-                        paymentScreenStatus = PaymentStatus.Error
-                        paymentScreenError = result.error ?: "Payment failed"
+                        val parsedQr = parseInsufficientBalanceUsdcFromError(errPost)
+                        if (parsedQr != null && errPost.startsWith("Insufficient balance", ignoreCase = true)) {
+                            val (needU, totalU, shortU) = parsedQr
+                            val rateE = getRateForCurrency(payCurrencyQr, oracle)
+                            val taxAmtLineQr = requestQr * taxPctQr / 100.0
+                            val discAmtLineQr = requestQr * tierDiscQr / 100.0
+                            val avail6Post = kotlin.math.round(totalU * 1_000_000.0).toLong().coerceAtLeast(0L)
+                            val need6Post = kotlin.math.round(needU * 1_000_000.0).toLong().coerceAtLeast(0L)
+                            val modelPost = InsufficientBalanceUiModel(
+                                totalChargeFormatted = formatFiatDisplayLineForInsufficient(totalCurrencyQr, payCurrencyQr),
+                                currentBalanceFormatted = formatFiatDisplayLineForInsufficient(totalU * rateE, payCurrencyQr),
+                                shortfallFormatted = "-${formatFiatDisplayLineForInsufficient(shortU * rateE, payCurrencyQr)}",
+                                voucherDeductionFormatted = formatFiatDisplayLineForInsufficient(requestQr, payCurrencyQr),
+                                tierDiscountFormatted = formatFiatDisplayLineForInsufficient(discAmtLineQr, payCurrencyQr),
+                                tipFormatted = formatFiatDisplayLineForInsufficient(tipQr, payCurrencyQr),
+                                taxFormatted = formatFiatDisplayLineForInsufficient(taxAmtLineQr, payCurrencyQr),
+                                returnScanMethod = "qr",
+                                availableBalanceUsdc6 = avail6Post,
+                            )
+                            insufficientPartialRetryContext = InsufficientPartialRetryContext(
+                                totalCurrency = totalCurrencyQr,
+                                payCurrency = payCurrencyQr,
+                                availableUsdc6 = avail6Post,
+                                requiredUsdc6 = need6Post,
+                                subtotal = requestQr,
+                                taxPct = taxPctQr,
+                                tierDiscPct = tierDiscQr,
+                                tip = tipQr,
+                                returnScanMethod = "qr",
+                                qrAccount = account,
+                                qrPayloadJson = try {
+                                    finalPayload.toString()
+                                } catch (_: Exception) {
+                                    null
+                                },
+                            )
+                            openInsufficientBalanceScreen(modelPost)
+                            qrScanningActive = false
+                            Log.w("Charge", "Insufficient balance (QR post-tx): $errPost")
+                        } else {
+                            paymentScreenRoutingSteps = steps
+                            nfcFetchingInfo = false
+                            paymentScreenStatus = PaymentStatus.Error
+                            paymentScreenError = errPost
+                        }
                     }
                 } else {
                     steps = updateStep(steps, "refreshBalance", StepStatus.loading, "Fetching latest balance")
@@ -2833,16 +3934,63 @@ class MainActivity : ComponentActivity() {
                         )
                         runOnUiThread {
                             paymentScreenRoutingSteps = stepsAfter
+                            var refreshedPass: CardItem? = null
                             if (postAssets != null && postAssets.ok && finalPostCad != null) {
                                 paymentScreenPostBalance = "%.2f".format(finalPostCad)
-                                val refreshedPass = postAssets.cards?.firstOrNull { deductedCardAddress != null && it.cardAddress.equals(deductedCardAddress, ignoreCase = true) }
+                                refreshedPass = postAssets.cards?.firstOrNull { deductedCardAddress != null && it.cardAddress.equals(deductedCardAddress, ignoreCase = true) }
                                     ?: postAssets.cards?.firstOrNull()
-                                if (refreshedPass != null) paymentScreenPassCardSnapshot = refreshedPass
+                                if (refreshedPass != null) {
+                                    paymentScreenPassCardSnapshot = refreshedPass
+                                    paymentScreenCardBackground = refreshedPass.cardBackground
+                                    paymentScreenCardImage = refreshedPass.cardImage
+                                    paymentScreenTierName = refreshedPass.tierName
+                                    paymentScreenCardName = refreshedPass.cardName
+                                }
                             } else {
                                 paymentScreenPostBalance = "—"
                             }
+                            if (partialChargeQr) {
+                                val hero = refreshedPass ?: qrPaymentCard
+                                val shortfallQr = (totalCurrencyQr - balancePayCurBeforeQr).coerceAtLeast(0.0)
+                                val memberTitleQr = passHeroMemberDisplayNameLine(
+                                    assets.beamioTag,
+                                    assets.address,
+                                    hero,
+                                    hero?.cardName,
+                                )
+                                val termQr = BeamioWeb3Wallet.getAddress()?.trim()?.takeIf { it.length >= 6 }
+                                    ?.let { "POS-${it.takeLast(4).uppercase(Locale.US)}" } ?: "—"
+                                paymentPartialApprovalUi = PartialApprovalUiModel(
+                                    payCurrency = payCurrencyQr,
+                                    chargedPayCur = balancePayCurBeforeQr,
+                                    shortfallPayCur = shortfallQr,
+                                    orderTotalPayCur = totalCurrencyQr,
+                                    subtotal = requestQr,
+                                    tierDiscountAmount = discAmtCadQr,
+                                    tierDiscountLabel = hero?.tierName?.takeIf { it.isNotBlank() },
+                                    taxPercent = taxPctQr,
+                                    taxAmount = taxAmtCadQr,
+                                    tipAmount = tipQr,
+                                    memberDisplayName = memberTitleQr,
+                                    memberNoDisplay = qrPaymentMemberNo.ifBlank { "—" },
+                                    txHash = result.txHash ?: "",
+                                    settlementViaQr = true,
+                                    settlementDetail = termQr,
+                                    originalSubtotal = requestQr,
+                                    originalTipBps = paymentScreenTipRateBps,
+                                    tierDiscPct = tierDiscQr,
+                                    returnScanMethod = "qr",
+                                    tierCardBackgroundHex = hero?.cardBackground,
+                                    cardMetadataImageUrl = hero?.cardImage,
+                                    programCardDisplayName = hero?.let { balanceDetailsCardNameLine(it) }?.takeIf { it != "—" },
+                                )
+                            } else {
+                                paymentPartialApprovalUi = null
+                            }
                             paymentScreenStatus = PaymentStatus.Success
+                            lastQrPaymentOpenRelayPayload = null
                             scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                            scheduleElasticHomeDataPullAfterTxSuccess()
                         }
                     }.start()
                 }
@@ -2942,6 +4090,54 @@ class MainActivity : ComponentActivity() {
 
     /** SUN params from NDEF URL for getUIDAssets verification. */
     private data class SunParams(val uid: String, val e: String, val c: String, val m: String)
+
+    private data class ScaledNfcBillPartial(
+        val subtotalStr: String,
+        val tipStr: String?,
+        val taxFiat6: String,
+        val taxBps: Int,
+        val discFiat6: String,
+        val discBps: Int,
+    )
+
+    /**
+     * 余额不足全屏页点「Charge available balance」：保存 NFC uid/SUN 或 QR payload，供立即 partial execute（对齐 iOS）。
+     */
+    private data class InsufficientPartialRetryContext(
+        val totalCurrency: Double,
+        val payCurrency: String,
+        val availableUsdc6: Long,
+        val requiredUsdc6: Long,
+        val subtotal: Double,
+        val taxPct: Double,
+        val tierDiscPct: Double,
+        val tip: Double,
+        val returnScanMethod: String,
+        val nfcUid: String? = null,
+        val nfcSun: SunParams? = null,
+        val qrAccount: String? = null,
+        val qrPayloadJson: String? = null,
+    ) {
+        fun scaledBillForChargedPayCur(chargedFiat: Double): ScaledNfcBillPartial {
+            val total = totalCurrency.coerceAtLeast(1e-9)
+            val ratio = (chargedFiat / total).coerceIn(0.0, 1.0)
+            val sReq = subtotal * ratio
+            val sTip = tip * ratio
+            val taxFiat6 = kotlin.math.round(sReq * taxPct / 100.0 * 1_000_000.0).toLong()
+            val taxBps = kotlin.math.round(taxPct * 100.0).toInt().coerceIn(0, 10000)
+            val discFiat6 = kotlin.math.round(sReq * tierDiscPct / 100.0 * 1_000_000.0).toLong()
+            val discBps = kotlin.math.round(tierDiscPct * 100.0).toInt().coerceIn(0, 10000)
+            val tipStr = if (sTip > 0) "%.2f".format(sTip) else null
+            return ScaledNfcBillPartial(
+                subtotalStr = "%.2f".format(sReq),
+                tipStr = tipStr,
+                taxFiat6 = taxFiat6.toString(),
+                taxBps = taxBps,
+                discFiat6 = discFiat6.toString(),
+                discBps = discBps,
+            )
+        }
+    }
 
     /** Read uid,e,c,m from NDEF URL if card has valid SUN format. Returns null if NDEF missing or template (e/c/m all 0). */
     private fun readSunParamsFromNdef(tag: Tag): SunParams? {
@@ -3428,8 +4624,14 @@ class MainActivity : ComponentActivity() {
                 linkAppCancelInProgress = false
                 if (cr.success) {
                     nfcFetchError = ""
+                    linkAppDeepLinkUrl = ""
                     linkAppLastSunForCancel = null
-                    showScanMethodScreen = true
+                    linkAppCancelInProgress = false
+                    linkAppArmed = false
+                    scanWaitingForNfc = false
+                    nfcFetchingInfo = false
+                    qrScanningActive = false
+                    showScanMethodScreen = false
                     syncScanMethodEntryAndTabs()
                 } else {
                     nfcFetchError = cr.error ?: "Cancel link lock failed"
@@ -3639,6 +4841,7 @@ class MainActivity : ComponentActivity() {
             prefs.edit().apply {
                 if (terminal != null) putString("term:$key", terminalToJson(terminal))
                 if (admin != null) putString("admin:$key", terminalToJson(admin))
+                else remove("admin:$key")
                 apply()
             }
         } catch (_: Exception) { }
@@ -3653,12 +4856,19 @@ class MainActivity : ComponentActivity() {
             put("address", p.address ?: "")
         }.toString()
 
-    /** 拉取终端 profile 与上层 admin profile。参照 biz.tsx：cardOwner → searchUsername → BeamioCapsule。从 BeamioUserCard 卡合约获取 admin 列表，upperAdmin/owner → search-users → adminProfile。 */
+    /**
+     * 拉取终端 profile 与上层 merchant 胶囊（owner 或上级 admin）。
+     * 与 iOS [POSViewModel.refreshHomeProfiles] / Cluster `getCardAdminInfo` 语义对齐：`upperAdmin` 若与 `owner` 相同（直属 owner 的 admin）仍解析该 owner；
+     * `upperAdmin` 为空时回退 `owner`（与 iOS `upperAdmin ?? owner` 一致）。首页右侧胶囊**仅当** `search-users` 有结果时展示，无结果则隐藏。
+     */
     private fun fetchTerminalProfileSync(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
         refreshMerchantInfraCardFromDbSync()
         val profile = fetchSearchUsersSync(wallet)
-        val upperAdmin = fetchGetCardAdminInfoSync(wallet)
-        val adminProfile = if (upperAdmin != null) fetchSearchUsersSync(upperAdmin) else null
+        val root = fetchGetCardAdminInfoJsonSync(wallet)
+        val ownerAddr = root?.optString("owner")?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim()
+        val upperRaw = root?.optString("upperAdmin")?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim()
+        val adminLookupAddr = upperRaw?.takeIf { it.isNotEmpty() } ?: ownerAddr?.takeIf { it.isNotEmpty() }
+        val adminProfile = adminLookupAddr?.let { fetchSearchUsersSync(it) }
         syncChargeOwnerChildBurnEligibilityCache(wallet)
         return Pair(profile, adminProfile)
     }
@@ -3780,13 +4990,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** GET /api/getCardAdminInfo?cardAddress=0x...&wallet=0x... - 从 BeamioUserCard 卡合约获取 owner 与 admin 列表，返回该终端的上层 admin（upperAdmin）。cardAddress 使用运行时基础设施卡。 */
-    private fun fetchGetCardAdminInfoSync(wallet: String): String? {
-        val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
-        return root.optString("upperAdmin").takeIf { it.isNotEmpty() && it != "null" }
-            ?: root.optString("owner").takeIf { it.isNotEmpty() && it != "null" }
-    }
-
     /**
      * 解析本终端 EOA 在 `getAdminListWithMetadata` 中对应条目的 metadata，读取 `tierRoutingDiscounts`（与 biz Sign & Deploy 一致）。
      * 与卡片 URI / DB 里的 `tiers[]` 不同：`tierRoutingDiscounts` 必须写在**链上 admin metadata**（或继承自上级的同字段）。
@@ -3844,12 +5047,12 @@ class MainActivity : ComponentActivity() {
         return Pair(0.0, if (hadAnyMeta) "No tier routing block" else "No routing metadata")
     }
 
-    /** 从会员档文案中解析首个百分比，如 `10% discount` → 10 */
-    private fun parseDiscountPercentFromMembershipTierDescription(text: String): Int? {
+    /** 从会员档文案中解析首个百分比，如 `7.5% discount` → 7.5（两位小数）。 */
+    private fun parseDiscountPercentFromMembershipTierDescription(text: String): Double? {
         if (text.isBlank()) return null
         val m = Regex("""(\d+(?:\.\d+)?)\s*%""").find(text) ?: return null
         val v = m.groupValues[1].toDoubleOrNull() ?: return null
-        return kotlin.math.round(v).toInt().coerceIn(0, 100)
+        return roundDiscountPercent2(v).takeIf { it > 0 }
     }
 
     /**
@@ -3859,7 +5062,7 @@ class MainActivity : ComponentActivity() {
     private fun parseMembershipTierDiscountSummaryFromMetadata(meta: org.json.JSONObject): String? {
         val tiersArr = meta.optJSONArray("tiers") ?: return null
         if (tiersArr.length() == 0) return null
-        data class IdxPct(val chainIndex: Int, val pct: Int)
+        data class IdxPct(val chainIndex: Int, val pct: Double)
         val rows = mutableListOf<IdxPct>()
         for (i in 0 until tiersArr.length()) {
             val row = tiersArr.optJSONObject(i) ?: continue
@@ -3873,7 +5076,7 @@ class MainActivity : ComponentActivity() {
             rows.add(IdxPct(chainIndex, pct))
         }
         if (rows.isEmpty()) return null
-        return rows.sortedBy { it.chainIndex }.joinToString(" · ") { "${it.pct}%" }
+        return rows.sortedBy { it.chainIndex }.joinToString(" · ") { "${formatTierDiscountPercentForUi(it.pct)}%" }
     }
 
     /**
@@ -3927,15 +5130,11 @@ class MainActivity : ComponentActivity() {
             tax = (kotlin.math.round(tax.coerceIn(0.0, 100.0) * 100.0) / 100.0)
 
             val tiers = tr.optJSONArray("tiers") ?: org.json.JSONArray()
-            val discParts = ArrayList<Int>(tiers.length())
+            val discParts = ArrayList<String>(tiers.length())
             for (i in 0 until tiers.length()) {
                 val row = tiers.optJSONObject(i) ?: continue
-                val d = when (val dp = row.opt("discountPercent")) {
-                    is Number -> dp.toInt().coerceIn(0, 100)
-                    is String -> dp.toIntOrNull()?.coerceIn(0, 100) ?: continue
-                    else -> continue
-                }
-                discParts.add(d)
+                val d = parseDiscountPercentJsonValue(row.opt("discountPercent")) ?: continue
+                discParts.add(formatTierDiscountPercentForUi(d))
             }
             val discLabel = if (discParts.isEmpty()) "—" else discParts.joinToString(" · ") { "$it%" }
             Pair(tax, discLabel)
@@ -3944,7 +5143,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private data class TierRoutingDetails(val taxPercent: Double, val discountByTierKey: Map<String, Int>)
+    private data class TierRoutingDetails(val taxPercent: Double, val discountByTierKey: Map<String, Double>)
 
     /** 与 biz `tierRoutingDiscounts.tiers` 一致：chain-tier-{index} / tierId -> discountPercent */
     private fun parseTierRoutingDetailsFromTerminalMetadata(metaJson: String, expectedInfrastructureCard: String): TierRoutingDetails? {
@@ -3970,15 +5169,11 @@ class MainActivity : ComponentActivity() {
             }
             tax = (kotlin.math.round(tax.coerceIn(0.0, 100.0) * 100.0) / 100.0)
 
-            val map = mutableMapOf<String, Int>()
+            val map = mutableMapOf<String, Double>()
             val tiers = tr.optJSONArray("tiers") ?: org.json.JSONArray()
             for (i in 0 until tiers.length()) {
                 val row = tiers.optJSONObject(i) ?: continue
-                val d = when (val dp = row.opt("discountPercent")) {
-                    is Number -> dp.toInt().coerceIn(0, 100)
-                    is String -> dp.toIntOrNull()?.coerceIn(0, 100) ?: continue
-                    else -> continue
-                }
+                val d = parseDiscountPercentJsonValue(row.opt("discountPercent")) ?: continue
                 val idx = when (val v = row.opt("chainTierIndex")) {
                     is Number -> v.toInt()
                     is String -> v.toIntOrNull()
@@ -4064,28 +5259,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** `metadata.tiers[].discountPercent`（biz 与 cardMetadata API）；缺省或无法解析时 null */
-    private fun parseMetadataTierDiscountPercentField(t: org.json.JSONObject): Int? {
+    /** `metadata.tiers[].discountPercent`（biz 与 cardMetadata API）；两位小数，缺省或无法解析时 null */
+    private fun parseMetadataTierDiscountPercentField(t: org.json.JSONObject): Double? {
         if (!t.has("discountPercent") || t.isNull("discountPercent")) return null
-        return try {
-            when (val v = t.opt("discountPercent")) {
-                is Number -> kotlin.math.round(v.toDouble()).toInt().coerceIn(0, 100)
-                is String -> {
-                    val s = v.trim()
-                    if (s.isEmpty()) null
-                    else kotlin.math.round(s.toDoubleOrNull() ?: return null).toInt().coerceIn(0, 100)
-                }
-                else -> null
-            }
-        } catch (_: Exception) {
-            null
-        }
+        return parseDiscountPercentJsonValue(t.opt("discountPercent"))?.takeIf { it > 0 }
     }
 
     /** 单条 metadata tier 的 Charge 折扣：优先 [MetadataTier.discountPercent]，否则解析 description 内 `N%` */
-    private fun discountPercentFromMetadataTier(row: MetadataTier): Int {
-        row.discountPercent?.let { return it.coerceIn(0, 100) }
-        return parseDiscountPercentFromMembershipTierDescription(row.description ?: "") ?: 0
+    private fun discountPercentFromMetadataTier(row: MetadataTier): Double {
+        row.discountPercent?.let { return roundDiscountPercent2(it.coerceIn(0.0, 100.0)) }
+        return parseDiscountPercentFromMembershipTierDescription(row.description ?: "") ?: 0.0
     }
 
     /**
@@ -4095,23 +5278,23 @@ class MainActivity : ComponentActivity() {
     private fun pickChargeTierDiscountPercentForPaymentCard(
         paymentCard: CardItem?,
         assets: UIDAssets,
-        tierKeyToDiscountFallback: Map<String, Int>
-    ): Int {
+        tierKeyToDiscountFallback: Map<String, Double>
+    ): Double {
         val addr = paymentCard?.cardAddress?.trim().orEmpty()
         if (addr.isNotEmpty() && paymentCard != null) {
             val tiers = fetchCardMetadataTiers(addr)
             val fromApi = cardMetadataTierFromApiCache[addr.lowercase()] == true
             val row = selectMetadataTierForPrimaryMembership(paymentCard, tiers)
             if (fromApi && row != null) {
-                return discountPercentFromMetadataTier(row).coerceIn(0, 100)
+                return roundDiscountPercent2(discountPercentFromMetadataTier(row).coerceIn(0.0, 100.0))
             }
         }
         return pickTierDiscountPercentFromAssets(assets, tierKeyToDiscountFallback)
     }
 
-    /** 按客户 NFT `tier` 字段匹配 routing 表（取最大折扣率） */
-    private fun pickTierDiscountPercentFromAssets(assets: UIDAssets, tierKeyToDiscount: Map<String, Int>): Int {
-        if (tierKeyToDiscount.isEmpty()) return 0
+    /** 按客户 NFT `tier` 字段匹配 routing 表（取最大折扣率，两位小数） */
+    private fun pickTierDiscountPercentFromAssets(assets: UIDAssets, tierKeyToDiscount: Map<String, Double>): Double {
+        if (tierKeyToDiscount.isEmpty()) return 0.0
         val keys = mutableSetOf<String>()
         assets.cards?.forEach { c ->
             c.nfts.forEach { n ->
@@ -4129,7 +5312,7 @@ class MainActivity : ComponentActivity() {
                 keys.add(t.lowercase())
             }
         }
-        var best = 0
+        var best = 0.0
         for (k in keys) {
             tierKeyToDiscount[k]?.let { best = kotlin.math.max(best, it) }
             tierKeyToDiscount[k.lowercase()]?.let { best = kotlin.math.max(best, it) }
@@ -4140,7 +5323,7 @@ class MainActivity : ComponentActivity() {
                 tierKeyToDiscount["chain-tier-$idx".lowercase()]?.let { best = kotlin.math.max(best, it) }
             }
         }
-        return best.coerceIn(0, 100)
+        return roundDiscountPercent2(best.coerceIn(0.0, 100.0))
     }
 
     /** GET /api/search-users?keyward=... - 解析 results[0] 为 TerminalProfile */
@@ -4194,6 +5377,47 @@ class MainActivity : ComponentActivity() {
             }
             startCardStatsVerifyLoopIfNeeded()
         }
+    }
+
+    /**
+     * Charge / Top-up 成功后 +6s：与首页首次进入、iOS [POSViewModel.refreshHomeProfiles] 同类拉取（profile、钱包资产、链上 KPI、路由摘要）。
+     * 与 [scheduleCardStatsRefetchUntilChanged] 互补：后者轮询 KPI 直至变化；本方法额外刷新 getCardAdminInfo / search-users 等。
+     */
+    private fun scheduleElasticHomeDataPullAfterTxSuccess() {
+        Thread {
+            try {
+                Thread.sleep(6000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+            if (wallet.isEmpty()) return@Thread
+            try {
+                refreshMerchantInfraCardFromDbSync()
+                val (profile, admin) = fetchTerminalProfileSync(wallet)
+                val assets = fetchWalletAssetsSync(wallet, forPostPayment = false, merchantInfraOnly = false)
+                val (charge, topUp) = fetchCardStatsSync(wallet)
+                val routing = fetchInfraRoutingForTerminalWalletSync(wallet)
+                runOnUiThread {
+                    if (profile != null) terminalProfile = profile
+                    terminalAdminProfile = admin
+                    saveProfileCache(wallet, profile, admin)
+                    if (assets != null && assets.ok) {
+                        hasAAAccount = !assets.aaAddress.isNullOrEmpty()
+                    } else {
+                        hasAAAccount = true
+                    }
+                    if (charge != null) cardChargeAmount = charge
+                    if (topUp != null) cardTopUpAmount = topUp
+                    if (routing != null) {
+                        dashboardInfraTaxPercent = routing.first
+                        dashboardInfraDiscountSummary = routing.second
+                    }
+                }
+            } catch (_: Exception) {
+                // best-effort
+            }
+        }.start()
     }
 
     private fun applyCardStatsFetchForVerify(charge: Double?, topUp: Double?) {
@@ -4741,6 +5965,33 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** 主会员档在 `metadata.tiers` 命中行的背景与图（与 iOS `primaryTierMetadataVisuals` 一致）。 */
+    private fun primaryTierMetadataVisuals(card: CardItem, tiers: List<MetadataTier>): Pair<String?, String?> {
+        if (tiers.isEmpty()) return Pair(null, null)
+        val row = selectMetadataTierForPrimaryMembership(card, tiers) ?: return Pair(null, null)
+        val bg = row.backgroundColor?.trim()?.takeIf { it.isNotEmpty() }
+        val img = row.image?.trim()?.takeIf { it.isNotEmpty() }
+        return Pair(bg, img)
+    }
+
+    /**
+     * 与 iOS `mergePrimaryTierStyleFromCardMetadata` 一致：GET `/api/cardMetadata` 的 `metadata.tiers` 主档行
+     * 覆盖 getUIDAssets 可能仍带的 **陈旧 NFT** `cardBackground` / `cardImage`（档名已升级时仍对齐卡面）。
+     * 链上 probe 回填的 tiers 不视为 API metadata，此时 [cardMetadataTierFromApiCache] 为 false，本函数不覆盖。
+     */
+    private fun mergePrimaryTierStyleFromCardMetadata(card: CardItem): CardItem {
+        val key = card.cardAddress.trim().lowercase(Locale.US)
+        if (key.isEmpty() || cardMetadataTierFromApiCache[key] != true) return card
+        val tiers = fetchCardMetadataTiers(card.cardAddress)
+        val (bg, img) = primaryTierMetadataVisuals(card, tiers)
+        var bgOut = card.cardBackground
+        var imgOut = card.cardImage
+        if (!bg.isNullOrBlank()) bgOut = bg
+        if (!img.isNullOrBlank()) imgOut = img
+        if (bgOut == card.cardBackground && imgOut == card.cardImage) return card
+        return card.copy(cardBackground = bgOut, cardImage = imgOut)
+    }
+
     private fun enrichCardTierFromMetadata(card: CardItem): CardItem {
         val tiers = fetchCardMetadataTiers(card.cardAddress)
         val fromPrimary = selectMetadataTierForPrimaryMembership(card, tiers)
@@ -4761,21 +6012,50 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        val tierRowForDiscount = fromPrimary ?: selected
+        val discPct = tierRowForDiscount?.let { discountPercentFromMetadataTier(it) }?.takeIf { it > 0.0 }
+
         val tierNeedsFill = card.tierName.isNullOrBlank() || card.tierDescription.isNullOrBlank()
         val styleNeedsFill = card.cardBackground.isNullOrBlank() || cardImage.isNullOrBlank()
-        if (fromPrimary == null && !tierNeedsFill && !styleNeedsFill) return card
+        val mergedDisc = discPct ?: card.tierDiscountPercent?.takeIf { it > 0.0 }
+        if (fromPrimary == null && !tierNeedsFill && !styleNeedsFill) {
+            val discOnly = if (mergedDisc != null) card.copy(tierDiscountPercent = mergedDisc) else card
+            return mergePrimaryTierStyleFromCardMetadata(discOnly)
+        }
 
         // getUIDAssets / getWalletAssets 卡行的 tierName、tierDescription 与链上主档一致；勿用 cardMetadata 覆盖已有文案
         // （否则 metadata 里整段营销 name 会与 API 的「档名 + 描述」拼错，例如单独一行 "Silver 5% discount"）。
         val tierNameOut = if (!card.tierName.isNullOrBlank()) card.tierName else fromPrimary?.name ?: selected?.name
         val tierDescOut = if (!card.tierDescription.isNullOrBlank()) card.tierDescription else fromPrimary?.description ?: selected?.description
 
-        return card.copy(
-            tierName = tierNameOut,
-            tierDescription = tierDescOut,
-            cardImage = cardImage ?: fromPrimary?.image ?: selected?.image,
-            cardBackground = card.cardBackground ?: fromPrimary?.backgroundColor ?: selected?.backgroundColor
+        return mergePrimaryTierStyleFromCardMetadata(
+            card.copy(
+                tierName = tierNameOut,
+                tierDescription = tierDescOut,
+                cardImage = cardImage ?: fromPrimary?.image ?: selected?.image,
+                cardBackground = card.cardBackground ?: fromPrimary?.backgroundColor ?: selected?.backgroundColor,
+                tierDiscountPercent = mergedDisc
+            )
         )
+    }
+
+    /** API 可能返回 `points` / `points6` 为 JSON 数字；`optString` 在部分类型下不可靠，与 iOS `JSONSerialization` 数值解码对齐。 */
+    private fun org.json.JSONObject.optBeamioAmountString(key: String, default: String = "0"): String {
+        if (!has(key) || isNull(key)) return default
+        return try {
+            when (val v = get(key)) {
+                is String -> v.trim().ifEmpty { default }
+                is Number -> v.toString()
+                else -> default
+            }
+        } catch (_: Exception) {
+            default
+        }
+    }
+
+    private fun org.json.JSONObject.optBeamioAmountStringIfPresent(key: String): String? {
+        if (!has(key) || isNull(key)) return null
+        return optBeamioAmountString(key, "0")
     }
 
     private fun parseUidAssetsJson(json: String): UIDAssets {
@@ -4816,8 +6096,8 @@ class MainActivity : ComponentActivity() {
                         cardAddress = c.optString("cardAddress", ""),
                         cardName = c.optString("cardName", "Card"),
                         cardType = c.optString("cardType", ""),
-                        points = c.optString("points", "0"),
-                        points6 = c.optString("points6", "0"),
+                        points = c.optBeamioAmountString("points", "0"),
+                        points6 = c.optBeamioAmountString("points6", "0"),
                         cardCurrency = c.optString("cardCurrency", "CAD"),
                         nfts = nftList,
                         cardBackground = cardBgRaw.takeIf { it.isNotEmpty() },
@@ -4843,19 +6123,24 @@ class MainActivity : ComponentActivity() {
                         cardAddress = legacyAddr,
                         cardName = if (legacyAddr.equals(infraCardAddress(), ignoreCase = true)) "CCSA CARD" else "Card",
                         cardType = if (legacyAddr.equals(infraCardAddress(), ignoreCase = true)) "ccsa" else "infrastructure",
-                        points = root.optString("points", "0"),
-                        points6 = root.optString("points6", "0"),
+                        points = root.optBeamioAmountString("points", "0"),
+                        points6 = root.optBeamioAmountString("points6", "0"),
                         cardCurrency = root.optString("cardCurrency", "CAD"),
-                        nfts = emptyList(),
+                        /** Legacy 响应无 `cards[]` 时 NFT 在根级 `nfts`，必须并入单卡否则 Member NO / 主档逻辑为空 */
+                        nfts = nfts,
                         cardBackground = null,
                         cardImage = null,
                         tierName = null,
-                        tierDescription = null
+                        tierDescription = null,
+                        primaryMemberTokenId = root.optString("primaryMemberTokenId").takeIf { it.isNotEmpty() }
                     )).map { enrichCardTierFromMetadata(it) }
                 } else null
             }
             val unitPriceUSDC6 = root.optString("unitPriceUSDC6").takeIf { it.isNotEmpty() }
             val beamioUserCard = root.optString("beamioUserCard").takeIf { it.isNotEmpty() }
+            val posLastTopupAt = root.optString("posLastTopupAt").takeIf { it.isNotEmpty() }
+            val posLastTopupUsdcE6 = root.optBeamioAmountStringIfPresent("posLastTopupUsdcE6")
+            val posLastTopupPointsE6 = root.optBeamioAmountStringIfPresent("posLastTopupPointsE6")
             val beamioTagVal = root.optString("beamioTag").takeIf { it.isNotEmpty() }
                 ?: root.optString("accountName").takeIf { it.isNotEmpty() }
                 ?: root.optString("username").takeIf { it.isNotEmpty() }
@@ -4870,6 +6155,7 @@ class MainActivity : ComponentActivity() {
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    primaryMemberTokenId = root.optString("primaryMemberTokenId").takeIf { it.isNotEmpty() },
                     beamioTag = beamioTagNormalized,
                     uid = uidVal,
                     tagIdHex = tagIdHexVal,
@@ -4884,7 +6170,10 @@ class MainActivity : ComponentActivity() {
                     cards = cards,
                     unitPriceUSDC6 = unitPriceUSDC6,
                     beamioUserCard = beamioUserCard,
-                    error = root.optString("error").takeIf { it.isNotEmpty() }
+                    error = root.optString("error").takeIf { it.isNotEmpty() },
+                    posLastTopupAt = posLastTopupAt,
+                    posLastTopupUsdcE6 = posLastTopupUsdcE6,
+                    posLastTopupPointsE6 = posLastTopupPointsE6
                 )
             } else {
                 val legacyCardAddr = root.optString("cardAddress").takeIf { it.isNotEmpty() }
@@ -4893,21 +6182,25 @@ class MainActivity : ComponentActivity() {
                     ok = root.optBoolean("ok", false),
                     address = root.optString("address").takeIf { it.isNotEmpty() },
                     aaAddress = root.optString("aaAddress").takeIf { it.isNotEmpty() },
+                    primaryMemberTokenId = root.optString("primaryMemberTokenId").takeIf { it.isNotEmpty() },
                     beamioTag = beamioTagNormalized,
                     uid = uidVal,
                     tagIdHex = tagIdHexVal,
                     counterHex = counterHexVal,
                     counter = counterVal,
                     cardAddress = if (isDeprecatedLegacy) null else legacyCardAddr,
-                    points = if (isDeprecatedLegacy) null else root.optString("points").takeIf { it.isNotEmpty() },
-                    points6 = if (isDeprecatedLegacy) null else root.optString("points6").takeIf { it.isNotEmpty() },
+                    points = if (isDeprecatedLegacy) null else root.optBeamioAmountStringIfPresent("points"),
+                    points6 = if (isDeprecatedLegacy) null else root.optBeamioAmountStringIfPresent("points6"),
                     usdcBalance = root.optString("usdcBalance").takeIf { it.isNotEmpty() },
                     cardCurrency = if (isDeprecatedLegacy) null else root.optString("cardCurrency").takeIf { it.isNotEmpty() },
                     nfts = if (isDeprecatedLegacy) null else nfts.takeIf { it.isNotEmpty() },
                     cards = null,
                     unitPriceUSDC6 = unitPriceUSDC6,
                     beamioUserCard = beamioUserCard,
-                    error = root.optString("error").takeIf { it.isNotEmpty() }
+                    error = root.optString("error").takeIf { it.isNotEmpty() },
+                    posLastTopupAt = posLastTopupAt,
+                    posLastTopupUsdcE6 = posLastTopupUsdcE6,
+                    posLastTopupPointsE6 = posLastTopupPointsE6
                 )
             }
         } catch (_: Exception) {
@@ -5584,6 +6877,8 @@ internal fun TopupScreen(
     postBalance: String?,
     cardCurrency: String?,
     address: String?,
+    /** 与 Balance Loaded 一致：Hero 主名优先 API beamioTag */
+    customerBeamioTag: String? = null,
     memberNo: String?,
     cardBackground: String?,
     cardImage: String?,
@@ -5616,7 +6911,6 @@ internal fun TopupScreen(
             }
             is TopupStatus.Loading -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -5642,6 +6936,7 @@ internal fun TopupScreen(
                 postBalance = postBalance,
                 cardCurrency = cardCurrency,
                 address = address,
+                customerBeamioTag = customerBeamioTag,
                 memberNo = memberNo,
                 cardBackground = cardBackground,
                 cardImage = cardImage,
@@ -5649,7 +6944,7 @@ internal fun TopupScreen(
                 tierDescription = tierDescription,
                 passCard = passCardSnapshot,
                 settlementViaQr = settlementViaQr,
-                onDone = onBack
+                onBack = onBack,
             )
             is TopupStatus.Error -> {
                 val showErrorDialog = error.isNotBlank()
@@ -5692,6 +6987,7 @@ private fun TopupSuccessContent(
     postBalance: String?,
     cardCurrency: String?,
     address: String?,
+    customerBeamioTag: String? = null,
     memberNo: String?,
     cardBackground: String?,
     cardImage: String?,
@@ -5699,7 +6995,7 @@ private fun TopupSuccessContent(
     tierDescription: String?,
     passCard: CardItem? = null,
     settlementViaQr: Boolean = false,
-    onDone: () -> Unit,
+    onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -5711,15 +7007,42 @@ private fun TopupSuccessContent(
     val shortAddr = address?.let { if (it.length > 10) "${it.take(6)}...${it.takeLast(4)}" else it } ?: "—"
     val displayMemberNo = (memberNo?.takeIf { it.isNotBlank() } ?: shortAddr).ifEmpty { "—" }
     val shortTxHash = if (txHash.length > 12) "${txHash.take(7)}...${txHash.takeLast(5)}" else txHash
-    val cardBgColor = parseHexColor(cardBackground) ?: Color(0xFF2C5535)
+    val heroMemberTitle = passHeroMemberDisplayNameLine(
+        customerBeamioTag,
+        address,
+        passCard,
+        passCard?.cardName,
+    )
+    val heroMemberNo = memberNoFromCardItem(passCard).ifEmpty { displayMemberNo }
+    val (heroBalPre, heroBalAmt, heroBalSuf) = if (postBalanceNum != null) {
+        formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
+    } else {
+        Triple("", "—", "")
+    }
+    val heroProgram = passCard?.let { balanceDetailsCardNameLine(it) } ?: "—"
+    val isFirstTopUp = memberNo.isNullOrBlank()
+    val topBarTitle = if (isFirstTopUp) "Card Minted" else "Top-Up Complete"
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
+            .windowInsetsPadding(WindowInsets.statusBars)
             .background(Color(0xFFf5f5f7))
     ) {
-        // Header: icon + Top-Up Complete + amount
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(BalanceDetailsSurface)
+        ) {
+            BalanceDetailsTopBar(onBack = onBack, title = topBarTitle)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+            ) {
+        // Success icon + amount (title only in BalanceDetailsTopBar)
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -5735,14 +7058,6 @@ private fun TopupSuccessContent(
             ) {
                 Icon(Icons.Filled.CheckCircle, null, Modifier.size(32.dp), tint = Color(0xFF34C759))
             }
-            val isFirstTopUp = memberNo.isNullOrBlank()
-            Text(
-                if (isFirstTopUp) "Card Minted" else "Top-Up Complete",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = Color.Black,
-                modifier = Modifier.padding(top = 8.dp)
-            )
             val (amtPrefix, amtStr, amtSuffix) = formatBalanceWithCurrencyProtocol(amountNum, currency)
             Row(
                 modifier = Modifier.padding(top = 4.dp),
@@ -5757,123 +7072,27 @@ private fun TopupSuccessContent(
             }
         }
 
-        // Voucher Balance card（统一会员卡风格）
+        // Pass Hero（与 Balance Details 同一标准组件）
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 20.dp)
                 .padding(bottom = 12.dp)
         ) {
-            val accentGreen = Color(0xFF6ED088)
-            val labelGrey = Color(0xFFBBBBBB)
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = cardBgColor)
-            ) {
-                // 使用 Column + Row 顺序排版，避免 Box 顶栏与 BottomCenter 行在文字变多行时重叠（动态卡 metadata / 链上 tier 描述可能较长）
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 16.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        when {
-                            cardImage != null && cardImage.isNotBlank() -> {
-                                AsyncImage(
-                                    model = cardImage,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    alignment = Alignment.Center,
-                                    modifier = Modifier.size(176.dp, 140.dp)
-                                )
-                            }
-                            else -> {
-                                Icon(Icons.Filled.Favorite, null, Modifier.size(44.dp), tint = accentGreen)
-                            }
-                        }
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(start = 12.dp),
-                            horizontalAlignment = Alignment.End
-                        ) {
-                            val rawTitle = passCard?.cardName?.takeIf { it.isNotBlank() }
-                                ?: tierName?.takeIf { it.isNotBlank() }
-                            val titleTxt = rawTitle?.removeSuffix(" CARD")?.removeSuffix(" Card") ?: "Card"
-                            Text(
-                                titleTxt,
-                                fontSize = 16.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                textAlign = TextAlign.End,
-                                modifier = Modifier.fillMaxWidth()
-                            )
-                            val subtitle = passCard?.let { passTierSubtitleForPassCard(it).takeIf { s -> s.isNotBlank() } }
-                                ?: tierDescription?.takeIf { it.isNotBlank() }
-                                    ?.takeIf { !it.equals("Card", ignoreCase = true) } ?: ""
-                            if (subtitle.isNotBlank()) {
-                                Text(
-                                    subtitle,
-                                    fontSize = 12.sp,
-                                    color = labelGrey,
-                                    maxLines = 4,
-                                    overflow = TextOverflow.Ellipsis,
-                                    textAlign = TextAlign.End,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(top = 4.dp)
-                                )
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(20.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Bottom
-                    ) {
-                        Column {
-                            Text("Member No.", fontSize = 11.sp, color = labelGrey)
-                            Text(
-                                displayMemberNo,
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                            )
-                        }
-                        Column(horizontalAlignment = Alignment.End) {
-                            Text("Balance", fontSize = 11.sp, color = labelGrey)
-                            if (postBalanceNum != null) {
-                                val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
-                                Row(
-                                    verticalAlignment = Alignment.Bottom,
-                                    horizontalArrangement = Arrangement.End
-                                ) {
-                                    if (prefix.isNotEmpty()) {
-                                        Text(prefix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
-                                    }
-                                    Text(amtStr, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
-                                    if (suffix.isNotEmpty()) {
-                                        Text(suffix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
-                                    }
-                                }
-                            } else {
-                                Text("—", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
-                            }
-                        }
-                    }
-                }
-            }
+            StandardMemberPassHeroCard(
+                memberDisplayName = heroMemberTitle,
+                memberNo = heroMemberNo,
+                tierDisplayName = passCard?.tierName?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: tierName?.trim()?.takeIf { it.isNotEmpty() },
+                tierDiscountPercent = passCard?.tierDiscountPercent,
+                programCardDisplayName = heroProgram,
+                tierCardBackgroundHex = passCard?.cardBackground ?: cardBackground,
+                cardMetadataImageUrl = passCard?.cardImage?.takeIf { it.isNotBlank() } ?: cardImage?.takeIf { it.isNotBlank() },
+                balancePrefix = heroBalPre,
+                balanceAmount = heroBalAmt,
+                balanceSuffix = heroBalSuf,
+                modifier = Modifier.fillMaxWidth()
+            )
 
             // Receipt details
             Card(
@@ -5895,10 +7114,9 @@ private fun TopupSuccessContent(
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Member No.", fontSize = 13.sp, color = Color(0xFF86868b))
                         Text(displayMemberNo, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
                     }
                     if (txHash.isNotBlank()) {
@@ -5932,7 +7150,7 @@ private fun TopupSuccessContent(
             }
         }
 
-        // Print and Done buttons
+        // Print receipt
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -5950,12 +7168,7 @@ private fun TopupSuccessContent(
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Print Receipt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             }
-            Button(
-                onClick = onDone,
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
-            ) {
-                Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        }
             }
         }
     }
@@ -6141,7 +7354,201 @@ private fun parseHexColor(hex: String?): Color? {
     }
 }
 
-/** `0x` + 40 hex：不在 Account 面板作为 uid 展示，避免与 EOA/AA 混淆 */
+/** metadata / `tierRoutingDiscounts` 百分比 0–100，统一四舍五入到两位小数（与 biz `discountPercent` 对齐）。 */
+private fun roundDiscountPercent2(raw: Double): Double =
+    kotlin.math.round(raw.coerceIn(0.0, 100.0) * 100.0) / 100.0
+
+private fun formatTierDiscountPercentForUi(percent: Double): String =
+    String.format(Locale.US, "%.2f", roundDiscountPercent2(percent))
+
+/** JSON `discountPercent` 字段：Number / 可解析 String → 两位小数百分比。 */
+private fun parseDiscountPercentJsonValue(value: Any?): Double? {
+    return try {
+        val raw = when (value) {
+            is Number -> value.toDouble()
+            is String -> value.trim().replace(",", ".").toDoubleOrNull() ?: return null
+            else -> return null
+        }
+        if (raw.isNaN() || raw < 0) return null
+        roundDiscountPercent2(raw.coerceAtMost(100.0))
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/**
+ * WCAG 2.1 相对亮度 L（sRGB），范围约 0–1。
+ * https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+ */
+private fun colorRelativeLuminance(c: Color): Double {
+    fun lin(x: Float): Double {
+        val xs = x.toDouble()
+        return if (xs <= 0.03928f) xs / 12.92 else java.lang.Math.pow((xs + 0.055) / 1.055, 2.4)
+    }
+    val r = lin(c.red)
+    val g = lin(c.green)
+    val b = lin(c.blue)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+/**
+ * WCAG 2.1 对比度： (L_light + 0.05) / (L_dark + 0.05)，L 为 [colorRelativeLuminance]。
+ * https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio
+ */
+private fun wcagContrastRatio(luminanceA: Double, luminanceB: Double): Double {
+    val light = maxOf(luminanceA, luminanceB)
+    val dark = minOf(luminanceA, luminanceB)
+    return (light + 0.05) / (dark + 0.05)
+}
+
+private const val WCAG_LUMINANCE_WHITE = 1.0
+private const val WCAG_LUMINANCE_BLACK = 0.0
+
+/**
+ * 在纯白字与纯黑字之间，按 WCAG 对比度选较优者。
+ *
+ * @return `true` 表示应采用深色前景（本卡用近黑 #0F172A），`false` 表示浅色前景（白）。
+ */
+private fun useDarkForegroundPerWcag(backgroundLuminance: Double): Boolean {
+    val lb = backgroundLuminance.coerceIn(0.0, 1.0)
+    val contrastWithWhiteText = wcagContrastRatio(WCAG_LUMINANCE_WHITE, lb)
+    val contrastWithBlackText = wcagContrastRatio(lb, WCAG_LUMINANCE_BLACK)
+    return contrastWithBlackText > contrastWithWhiteText
+}
+
+/** 与 [StandardMemberPassHeroCard] 一致：`linearGradient`(0,0)→(w,h) 上参数 t∈[0,1] 处的 sRGB 插值。 */
+private fun gradientColorAlongCardDiagonal(gradientStart: Color, gradientEnd: Color, t: Float): Color {
+    val s = t.coerceIn(0f, 1f)
+    return Color(
+        gradientStart.red + (gradientEnd.red - gradientStart.red) * s,
+        gradientStart.green + (gradientEnd.green - gradientStart.green) * s,
+        gradientStart.blue + (gradientEnd.blue - gradientStart.blue) * s,
+        gradientStart.alpha + (gradientEnd.alpha - gradientStart.alpha) * s,
+    )
+}
+
+/**
+ * 归一化坐标：左上 (0,0)、右下 (1,1)，u=横、v=纵；对角 blend 参数 t = (u·(w/h)² + v) / ((w/h)² + 1)。
+ * [aspectWidthOverHeight] 与 Hero `aspectRatio(1.6f)` 一致。
+ */
+private fun cardDiagonalGradientT(u: Float, v: Float, aspectWidthOverHeight: Float = 1.6f): Float {
+    val a2 = aspectWidthOverHeight * aspectWidthOverHeight
+    val den = a2 + 1f
+    return (u.coerceIn(0f, 1f) * a2 + v.coerceIn(0f, 1f)) / den
+}
+
+/**
+ * 优先照顾**右侧小字**（tier、discount 等）：在该区域沿对角渐变多点采样背景，对白字/黑字分别求 WCAG 对比度
+ * 的**最小值**，选最小值更大的一侧（min-max，保证最弱采样点）。
+ */
+private fun useDarkForegroundWcagPreferRightSmallTextZone(
+    gradientStart: Color,
+    gradientEnd: Color,
+    aspectWidthOverHeight: Float = 1.6f,
+): Boolean {
+    val uvSamples = arrayOf(
+        Pair(0.93f, 0.07f),
+        Pair(0.94f, 0.14f),
+        Pair(0.91f, 0.23f),
+        Pair(0.89f, 0.32f),
+        Pair(0.86f, 0.41f),
+    )
+    var minCrWhite = Double.MAX_VALUE
+    var minCrBlack = Double.MAX_VALUE
+    for ((u, v) in uvSamples) {
+        val t = cardDiagonalGradientT(u, v, aspectWidthOverHeight)
+        val bg = gradientColorAlongCardDiagonal(gradientStart, gradientEnd, t)
+        val lb = colorRelativeLuminance(bg)
+        minCrWhite = minOf(minCrWhite, wcagContrastRatio(WCAG_LUMINANCE_WHITE, lb))
+        minCrBlack = minOf(minCrBlack, wcagContrastRatio(lb, WCAG_LUMINANCE_BLACK))
+    }
+    if (!minCrWhite.isFinite() || !minCrBlack.isFinite()) {
+        return useDarkForegroundPerWcag(colorRelativeLuminance(gradientStart))
+    }
+    return minCrBlack > minCrWhite
+}
+
+private fun rgbToHsv(r: Float, g: Float, b_: Float): Triple<Float, Float, Float> {
+    val max = maxOf(r, g, b_)
+    val min = minOf(r, g, b_)
+    val delta = max - min
+    if (delta < 1e-5f) return Triple(0f, 0f, max)
+    val hDeg = when {
+        abs(max - r) < 1e-5f -> {
+            var hh = 60f * ((g - b_) / delta)
+            if (hh < 0f) hh += 360f
+            hh
+        }
+        abs(max - g) < 1e-5f -> 60f * ((b_ - r) / delta + 2f)
+        else -> 60f * ((r - g) / delta + 4f)
+    }
+    val h = ((hDeg / 360f) % 1f + 1f) % 1f
+    val s = delta / max
+    return Triple(h, s, max)
+}
+
+private fun hsvToColor(h: Float, s: Float, v: Float): Color {
+    val hh = (h * 6f % 6f + 6f) % 6f
+    val i = floor(hh.toDouble()).toInt().coerceIn(0, 5)
+    val f = hh - i
+    val p = v * (1f - s)
+    val q = v * (1f - f * s)
+    val t = v * (1f - (1f - f) * s)
+    val (rp, gp, bp) = when (i) {
+        0 -> Triple(v, t, p)
+        1 -> Triple(q, v, p)
+        2 -> Triple(p, v, t)
+        3 -> Triple(p, q, v)
+        4 -> Triple(t, p, v)
+        else -> Triple(v, p, q)
+    }
+    return Color(rp.coerceIn(0f, 1f), gp.coerceIn(0f, 1f), bp.coerceIn(0f, 1f))
+}
+
+/** 与 [start] 同色相：与 [useDarkForegroundPerWcag] 一致——偏深底则终点偏浅，偏浅底则终点偏深。 */
+private fun sameFamilyGradientEnd(start: Color): Color {
+    val lum = colorRelativeLuminance(start)
+    val deepBackground = !useDarkForegroundPerWcag(lum)
+    val (ho, s0, v0) = rgbToHsv(start.red, start.green, start.blue)
+    return if (deepBackground) {
+        val v1 = (v0 + 0.38f).coerceIn(0.52f, 0.97f)
+        val s1 = (s0 * 0.9f).coerceIn(0.1f, 1f)
+        hsvToColor(ho, s1, v1)
+    } else {
+        val v1 = (v0 - 0.32f).coerceIn(0.1f, 0.5f)
+        val s1 = (s0 * 1.06f).coerceIn(0.12f, 1f)
+        hsvToColor(ho, s1, v1)
+    }
+}
+
+private data class PassHeroPalette(
+    val gradientStart: Color,
+    val gradientEnd: Color,
+    val primaryText: Color,
+    val secondaryText: Color,
+    val tertiaryText: Color,
+    val decorativeCircle: Color,
+    val avatarBorder: Color,
+    val avatarBackdrop: Color,
+    val walletIconTint: Color,
+)
+
+/** 由 `cardBackground` 解析渐变；前景白/黑由右侧小字区的 WCAG min 对比度约束（相对纯白/纯黑）。 */
+private fun passHeroPalette(tierCardBackgroundHex: String?): PassHeroPalette {
+    val start = parseHexColor(tierCardBackgroundHex) ?: Color(0xFF1562F0)
+    val end = sameFamilyGradientEnd(start)
+    val darkForeground = useDarkForegroundWcagPreferRightSmallTextZone(start, end)
+    val primary = if (darkForeground) Color(0xFF0F172A) else Color.White
+    val secondary = if (darkForeground) Color(0xFF0F172A).copy(alpha = 0.88f) else Color.White.copy(alpha = 0.88f)
+    val tertiary = if (darkForeground) Color(0xFF0F172A).copy(alpha = 0.78f) else Color.White.copy(alpha = 0.78f)
+    val deco = if (darkForeground) Color.Black.copy(alpha = 0.06f) else Color.White.copy(alpha = 0.05f)
+    val avBorder = if (darkForeground) Color.Black.copy(alpha = 0.16f) else Color.White.copy(alpha = 0.22f)
+    val avBack = if (darkForeground) Color.Black.copy(alpha = 0.07f) else Color.White.copy(alpha = 0.08f)
+    val wallet = if (darkForeground) Color.Black.copy(alpha = 0.38f) else Color.White.copy(alpha = 0.2f)
+    return PassHeroPalette(start, end, primary, secondary, tertiary, deco, avBorder, avBack, wallet)
+}
+
+/** `0x` + 40 hex：用于区分链上地址与非地址 uid 等展示场景 */
 private fun looksLikeEthereumAddress(value: String): Boolean {
     val t = value.trim()
     if (!t.startsWith("0x", ignoreCase = true) || t.length != 42) return false
@@ -6214,6 +7621,37 @@ private fun memberNoPrimaryFromSortedCardsItem(assets: UIDAssets): String {
     return legacy?.let { "M-%s".format(it.padStart(6, '0')) } ?: ""
 }
 
+/** `cardName` 展示行（去 CARD 后缀）；与 Balance Details hero 一致。 */
+private fun balanceDetailsCardNameLine(card: CardItem): String {
+    val raw = card.cardName.trim()
+    if (raw.isEmpty()) return "—"
+    return raw.removeSuffix(" CARD").removeSuffix(" Card").trim().ifEmpty { "—" }
+}
+
+/**
+ * Pass Hero 左上主名：与 [ReadScreen] Balance Loaded 一致 —
+ * `beamioTag`（无 @）→ 短钱包地址 → 非泛化的 cardName → `"Member"`。
+ */
+private fun passHeroMemberDisplayNameLine(
+    beamioTag: String?,
+    walletAddress: String?,
+    passCard: CardItem?,
+    cardNameFallback: String?,
+): String {
+    val tag = beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+    if (tag != null) return tag
+    val a = walletAddress?.trim()
+    if (!a.isNullOrEmpty() && a.startsWith("0x") && a.length >= 10) {
+        return if (a.length > 10) "${a.take(6)}…${a.takeLast(4)}" else a
+    }
+    val nm = (passCard?.cardName ?: cardNameFallback)
+        ?.removeSuffix(" CARD")?.removeSuffix(" Card")?.trim()
+        ?.takeIf { it.isNotBlank() &&
+            !it.equals("Infrastructure card", ignoreCase = true) &&
+            !it.equals("Asset Card", ignoreCase = true) }
+    return nm ?: "Member"
+}
+
 /** Balance Loaded：单张 Pass 卡展示；compact 时压缩边距与字号以适配一屏 */
 @Composable
 private fun ReadBalancePassCard(
@@ -6236,7 +7674,6 @@ private fun ReadBalancePassCard(
     val titleFs = if (compact) 13.sp else 15.sp
     val subFs = if (compact) 10.sp else 12.sp
     val memFs = if (compact) 12.sp else 15.sp
-    val balLblFs = if (compact) 9.sp else 11.sp
     val balSideFs = if (compact) 11.sp else 14.sp
     val balMainFs = if (compact) 17.sp else 22.sp
     val corner = if (compact) 16.dp else 22.dp
@@ -6256,20 +7693,16 @@ private fun ReadBalancePassCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.Top
             ) {
-                when {
-                    card.cardImage != null && card.cardImage!!.isNotBlank() -> {
-                        AsyncImage(
-                            model = card.cardImage,
-                            contentDescription = card.cardName,
-                            contentScale = ContentScale.Crop,
-                            alignment = Alignment.Center,
-                            modifier = Modifier.size(imgW, imgH)
-                        )
-                    }
-                    else -> {
+                BeamioCardRasterOrSvgImage(
+                    model = card.cardImage,
+                    contentDescription = card.cardName,
+                    contentScale = ContentScale.Crop,
+                    alignment = Alignment.Center,
+                    modifier = Modifier.size(imgW, imgH),
+                    fallback = {
                         Icon(Icons.Filled.Favorite, null, Modifier.size(iconSz), tint = accentGreen)
-                    }
-                }
+                    },
+                )
                 Column(
                     modifier = Modifier
                         .weight(1f)
@@ -6309,7 +7742,6 @@ private fun ReadBalancePassCard(
                 verticalAlignment = Alignment.Bottom
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Member No.", fontSize = balLblFs, color = labelGrey)
                     Text(
                         memberNo.ifEmpty { "—" },
                         fontSize = memFs,
@@ -6321,7 +7753,17 @@ private fun ReadBalancePassCard(
                     )
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Text("Balance", fontSize = balLblFs, color = labelGrey)
+                    Text(
+                        balanceDetailsCardNameLine(card),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White.copy(alpha = 0.88f),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
                     val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(balanceNum, card.cardCurrency)
                     Row(
                         verticalAlignment = Alignment.Bottom,
@@ -6341,6 +7783,324 @@ private fun ReadBalancePassCard(
     }
 }
 
+/** POS Balance Detail：最近 top-up 金额仅用 `posLastTopupPointsE6`，币种与当前卡 `cardCurrency` 一致（Beamio 前缀/后缀协议）。无点数时可显示时间或 —。 */
+private fun balanceDetailsLastTopUpFallbackLine(assets: UIDAssets?): String {
+    val a = assets ?: return "—"
+    val iso = a.posLastTopupAt?.trim().orEmpty()
+    if (iso.isNotEmpty()) {
+        val t = iso.replace("T", " ").trim()
+        return t.take(minOf(16, t.length)).trim()
+    }
+    return "—"
+}
+
+@Composable
+private fun BalanceDetailsLastTopUpAmountRow(
+    assets: UIDAssets?,
+    cardCurrency: String,
+) {
+    val a = assets
+    val p6 = a?.posLastTopupPointsE6?.trim()?.toLongOrNull() ?: 0L
+    if (p6 > 0L) {
+        val v = p6 / 1_000_000.0
+        val (pre, mid, suf) = formatBalanceWithCurrencyProtocol(v, cardCurrency)
+        Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.Start) {
+            if (pre.isNotEmpty()) {
+                Text(
+                    pre,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = BalanceDetailsOnSurface,
+                    modifier = Modifier.padding(bottom = 2.dp)
+                )
+                Spacer(Modifier.width(2.dp))
+            }
+            Text(
+                mid,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = BalanceDetailsOnSurface,
+                fontFamily = FontFamily.Monospace
+            )
+            if (suf.isNotEmpty()) {
+                Spacer(Modifier.width(2.dp))
+                Text(
+                    suf.trimStart(),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = BalanceDetailsOutline,
+                    modifier = Modifier.padding(bottom = 2.dp)
+                )
+            }
+        }
+    } else {
+        Text(
+            balanceDetailsLastTopUpFallbackLine(a),
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = BalanceDetailsOnSurface,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+/** balanceNew.html：Material / surface tokens */
+private val BalanceDetailsSurface = Color(0xFFF9F9FE)
+private val BalanceDetailsPrimary = Color(0xFF003692)
+private val BalanceDetailsSecondary = Color(0xFF0052D2)
+private val BalanceDetailsOutline = Color(0xFF737685)
+private val BalanceDetailsOnSurface = Color(0xFF1A1C1F)
+private val BalanceDetailsSurfaceContainerLow = Color(0xFFF3F3F8)
+private val BalanceDetailsSurfaceContainerLowest = Color(0xFFFFFFFF)
+
+@Composable
+private fun BalanceDetailsTopBar(
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier,
+    title: String = "Balance Details",
+    trailing: (@Composable RowScope.() -> Unit)? = null,
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(BACK_BUTTON_TOP_BAR_HEIGHT)
+            .background(Color.White.copy(alpha = 0.92f)),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        BackButtonIcon(
+            onClick = onBack,
+            modifier = Modifier.padding(start = BACK_BUTTON_START_PADDING)
+        )
+        Text(
+            text = title,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = BalanceDetailsPrimary,
+            letterSpacing = (-0.2).sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 4.dp)
+        )
+        if (trailing != null) {
+            Row(
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+                content = trailing
+            )
+        } else {
+            Spacer(Modifier.width(52.dp))
+        }
+    }
+}
+
+/**
+ * POS 标准 Pass Hero：Balance Loaded、Top-Up Complete、Charge Approved / Partial Approval 共用
+ * （圆角 24dp、1.6 宽高比、`cardBackground` 起色的同色系渐变终点、依底色选白/黑文案）。
+ */
+@Composable
+private fun StandardMemberPassHeroCard(
+    memberDisplayName: String,
+    memberNo: String,
+    tierDisplayName: String?,
+    tierDiscountPercent: Double?,
+    programCardDisplayName: String,
+    /** Tier metadata `background` / API `cardBackground`：渐变起点与前景深浅的唯一依据。 */
+    tierCardBackgroundHex: String?,
+    /** Tier / NFT metadata image (GET metadata JSON `image`); bottom-right decoration replaces wallet icon when set. */
+    cardMetadataImageUrl: String?,
+    balancePrefix: String,
+    balanceAmount: String,
+    balanceSuffix: String,
+    modifier: Modifier = Modifier
+) {
+    val shape = RoundedCornerShape(24.dp)
+    val heroCornerRadius = 24.dp
+    val tone = remember(tierCardBackgroundHex) { passHeroPalette(tierCardBackgroundHex) }
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .aspectRatio(1.6f)
+            .shadow(12.dp, shape, spotColor = Color(0x33000000))
+            .clip(shape)
+            .drawBehind {
+                val r = CornerRadius(heroCornerRadius.toPx(), heroCornerRadius.toPx())
+                drawRoundRect(
+                    brush = Brush.linearGradient(
+                        colors = listOf(tone.gradientStart, tone.gradientEnd),
+                        start = Offset.Zero,
+                        end = Offset(size.width, size.height)
+                    ),
+                    cornerRadius = r
+                )
+            }
+    ) {
+        Box(
+            modifier = Modifier
+                .size(180.dp)
+                .offset(x = 120.dp, y = (-72).dp)
+                .background(tone.decorativeCircle, CircleShape)
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 22.dp, bottom = 12.dp)
+                .size(48.dp)
+                .border(1.dp, tone.avatarBorder, CircleShape)
+                .clip(CircleShape)
+                .background(tone.avatarBackdrop)
+        ) {
+            BeamioCardRasterOrSvgImage(
+                model = cardMetadataImageUrl,
+                contentDescription = programCardDisplayName,
+                contentScale = ContentScale.Crop,
+                alignment = Alignment.Center,
+                modifier = Modifier.fillMaxSize(),
+                fallback = {
+                    Icon(
+                        Icons.Filled.AccountBalanceWallet,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(10.dp),
+                        tint = tone.walletIconTint
+                    )
+                },
+            )
+        }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(24.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.Top
+            ) {
+                Column {
+                    Text(
+                        memberDisplayName,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = tone.primaryText,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text(
+                        memberNo.ifEmpty { "—" },
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = tone.primaryText,
+                        fontFamily = FontFamily.Monospace,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    val tierLine = tierDisplayName?.trim()?.takeIf { it.isNotEmpty() }
+                    if (tierLine != null) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            tierLine,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = tone.secondaryText,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = TextStyle(
+                                lineHeight = 13.sp,
+                                platformStyle = PlatformTextStyle(includeFontPadding = false)
+                            )
+                        )
+                    }
+                    val disc = tierDiscountPercent
+                    if (disc != null && disc > 0.0) {
+                        Text(
+                            "${formatTierDiscountPercentForUi(disc)}% discount",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = tone.tertiaryText,
+                            textAlign = TextAlign.End,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = TextStyle(
+                                lineHeight = 12.sp,
+                                platformStyle = PlatformTextStyle(includeFontPadding = false)
+                            )
+                        )
+                    }
+                }
+            }
+            Column {
+                Text(
+                    programCardDisplayName,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = tone.secondaryText,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.Start) {
+                    if (balancePrefix.isNotEmpty()) {
+                        Text(
+                            balancePrefix.trimEnd(),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = tone.primaryText,
+                            modifier = Modifier.padding(bottom = 2.dp)
+                        )
+                        Spacer(Modifier.width(2.dp))
+                    }
+                    Text(
+                        balanceAmount,
+                        fontSize = 32.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = tone.primaryText,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = (-0.6).sp
+                    )
+                    if (balanceSuffix.isNotEmpty()) {
+                        Spacer(Modifier.width(2.dp))
+                        Text(
+                            balanceSuffix,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = tone.primaryText,
+                            modifier = Modifier.padding(bottom = 2.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Hero「CURRENT BALANCE」用：优先 `points6`（链上 6 位小数），再 `points`，
+ * 避免仅填 `points6`、`points` 为 0 时大屏永远显示 0。
+ */
+private fun balanceAmountForBalanceDetailsHero(primaryPass: CardItem?, assets: UIDAssets?): Double {
+    val card = primaryPass
+    if (card != null) {
+        val p6 = card.points6.toLongOrNull()
+        if (p6 != null && p6 > 0L) return p6 / 1_000_000.0
+        val p = card.points.toDoubleOrNull()
+        if (p != null && p != 0.0) return p
+    }
+    val a6 = assets?.points6?.toLongOrNull()
+    if (a6 != null && a6 > 0L) return a6 / 1_000_000.0
+    val ap = assets?.points?.toDoubleOrNull()
+    if (ap != null && ap != 0.0) return ap
+    return 0.0
+}
+
 @Composable
 internal fun ReadScreen(
     uid: String,
@@ -6349,6 +8109,8 @@ internal fun ReadScreen(
     rawResponseJson: String? = null,
     error: String,
     settlementViaQr: Boolean = false,
+    /** Terminal-registered merchant / infrastructure card; hero & pass UI only use rows matching this address. */
+    posMerchantInfraCard: String,
     onBack: () -> Unit,
     onTopupClick: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -6383,7 +8145,6 @@ internal fun ReadScreen(
                         .fillMaxSize()
                         .padding(16.dp)
                 ) {
-                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -6409,281 +8170,211 @@ internal fun ReadScreen(
                     delay(60_000L)
                     topupButtonEnabled = false
                 }
-                val cardList = assets?.cards?.takeIf { it.isNotEmpty() }
-                    ?: listOfNotNull(assets?.cardAddress?.let { addr ->
-                        // 兼容旧接口：若仅返回单卡字段，也按“服务端返回资产”展示，不做 CCSA/基础设施硬编码。
-                        CardItem(
-                            cardAddress = addr,
-                            cardName = "Asset Card",
-                            cardType = "",
-                            points = assets.points ?: "0",
-                            points6 = assets.points6 ?: "0",
-                            cardCurrency = assets.cardCurrency ?: "CAD",
-                            nfts = assets.nfts ?: emptyList(),
-                            cardBackground = null,
-                            cardImage = null,
-                            tierName = null,
-                            tierDescription = null
+                val infraNorm = posMerchantInfraCard.trim()
+                val cardList: List<CardItem>? = run {
+                    val fromApi = assets?.cards?.orEmpty()?.filter { it.cardAddress.equals(infraNorm, ignoreCase = true) }
+                    if (!fromApi.isNullOrEmpty()) return@run fromApi
+                    val leg = assets?.cardAddress?.trim()
+                    if (!leg.isNullOrEmpty() && leg.equals(infraNorm, ignoreCase = true)) {
+                        val slice = assets?.cards?.orEmpty()
+                            ?.firstOrNull { it.cardAddress.equals(leg, ignoreCase = true) }
+                            ?: assets?.cards?.orEmpty()?.singleOrNull()
+                        listOf(
+                            CardItem(
+                                cardAddress = leg,
+                                cardName = slice?.cardName?.takeIf { it.isNotBlank() } ?: "Asset Card",
+                                cardType = slice?.cardType?.takeIf { it.isNotBlank() } ?: "",
+                                points = assets.points ?: slice?.points ?: "0",
+                                points6 = assets.points6 ?: slice?.points6 ?: "0",
+                                cardCurrency = assets.cardCurrency ?: slice?.cardCurrency ?: "CAD",
+                                nfts = slice?.nfts?.takeIf { it.isNotEmpty() } ?: assets.nfts ?: emptyList(),
+                                cardBackground = slice?.cardBackground,
+                                cardImage = slice?.cardImage,
+                                tierName = slice?.tierName,
+                                tierDescription = slice?.tierDescription,
+                                primaryMemberTokenId = slice?.primaryMemberTokenId?.trim()?.takeIf { it.isNotEmpty() }
+                                    ?: assets.primaryMemberTokenId?.trim()?.takeIf { it.isNotEmpty() },
+                                tierDiscountPercent = slice?.tierDiscountPercent
+                            )
                         )
-                    }).takeIf { it.isNotEmpty() }
+                    } else null
+                }?.distinctBy { it.cardAddress.trim().lowercase(Locale.US) }
                 BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
                     val compact = maxHeight < 560.dp
-                    val sidePad = if (compact) 12.dp else 16.dp
-                    val gapSm = if (compact) 6.dp else 8.dp
-                    val headerBox = if (compact) 36.dp else 46.dp
-                    val headerIcon = if (compact) 22.dp else 30.dp
-                    val passRowH = if (compact) 142.dp else 176.dp
-                    val pageCardW = (maxWidth - sidePad * 2 - 20.dp).coerceAtLeast(160.dp)
-                    val accInnerPad = if (compact) 10.dp else 14.dp
-                    val accSpacing = if (compact) 6.dp else 8.dp
-                    val usdcPadH = if (compact) 12.dp else 16.dp
-                    val usdcPadV = if (compact) 10.dp else 14.dp
-                    val usdcTitleSp = if (compact) 13.sp else 14.sp
-                    val usdcAmtSp = if (compact) 16.sp else 17.sp
+                    val sidePad = if (compact) 16.dp else 20.dp
+                    val gapSm = if (compact) 8.dp else 10.dp
                     val btnH = if (compact) 44.dp else 48.dp
-                    val bottomPad = if (compact) 10.dp else 14.dp
-                    Column(Modifier.fillMaxSize()) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = sidePad, vertical = if (compact) 4.dp else 6.dp),
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(headerBox)
-                                    .background(Color.White, CircleShape)
-                                    .padding(if (compact) 5.dp else 7.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Filled.CheckCircle, null, Modifier.size(headerIcon), tint = Color(0xFF34C759))
-                            }
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                "Balance Loaded",
-                                fontSize = if (compact) 17.sp else 19.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = Color.Black
-                            )
+                    val bottomPad = if (compact) 12.dp else 16.dp
+                    val primaryPass = cardList?.firstOrNull()
+                    val balanceDetailsHeroCardBackgroundHex = primaryPass?.cardBackground?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: assets?.cards?.orEmpty()
+                            ?.firstOrNull { it.cardAddress.equals(infraNorm, ignoreCase = true) }
+                            ?.cardBackground?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: assets?.cards?.orEmpty()?.singleOrNull()?.cardBackground?.trim()?.takeIf { it.isNotEmpty() }
+                    val memberDisplayName = passHeroMemberDisplayNameLine(
+                        assets?.beamioTag,
+                        assets?.address,
+                        primaryPass,
+                        primaryPass?.cardName,
+                    )
+                    val memberNoStr = when {
+                        primaryPass != null -> memberNoFromCardItem(primaryPass)
+                        assets != null -> {
+                            val p = assets.primaryMemberTokenId?.trim()?.takeIf { it.isNotEmpty() }
+                            if (p != null && (p.toLongOrNull()?.let { id -> id > 0 } == true)) {
+                                "M-%s".format(p.padStart(6, '0'))
+                            } else ""
                         }
+                        else -> ""
+                    }
+                    val balanceNum = balanceAmountForBalanceDetailsHero(primaryPass, assets)
+                    val balCurrency = primaryPass?.cardCurrency ?: assets?.cardCurrency ?: "CAD"
+                    val (balPrefix, balAmt, balSuffix) = formatBalanceWithCurrencyProtocol(balanceNum, balCurrency)
+                    val usdcBal = assets?.usdcBalance?.toDoubleOrNull() ?: 0.0
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(BalanceDetailsSurface)
+                    ) {
+                        BalanceDetailsTopBar(onBack = onBack)
                         Column(
                             modifier = Modifier
-                                .weight(1f, fill = true)
+                                .weight(1f)
                                 .fillMaxWidth()
                                 .verticalScroll(balanceScroll)
+                                .padding(horizontal = sidePad)
+                                .padding(top = 16.dp, bottom = gapSm)
                         ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = sidePad)
-                                    .padding(bottom = gapSm)
+                            StandardMemberPassHeroCard(
+                                memberDisplayName = memberDisplayName,
+                                memberNo = memberNoStr,
+                                tierDisplayName = primaryPass?.tierName?.trim()?.takeIf { it.isNotEmpty() },
+                                tierDiscountPercent = primaryPass?.tierDiscountPercent,
+                                programCardDisplayName = primaryPass?.let { balanceDetailsCardNameLine(it) } ?: "—",
+                                tierCardBackgroundHex = balanceDetailsHeroCardBackgroundHex,
+                                cardMetadataImageUrl = primaryPass?.cardImage,
+                                balancePrefix = balPrefix,
+                                balanceAmount = balAmt,
+                                balanceSuffix = balSuffix,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(gapSm + 4.dp))
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(24.dp),
+                                colors = CardDefaults.cardColors(containerColor = BalanceDetailsSurfaceContainerLow),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
                             ) {
-                                val displayBeamioTag = assets?.beamioTag?.trim()?.removePrefix("@")?.trim()?.takeIf { it.isNotEmpty() }
-                                val rawUid = assets?.uid?.takeIf { it.isNotEmpty() } ?: uid.takeIf { it.isNotEmpty() }
-                                val uidForDisplay = rawUid?.takeIf { !looksLikeEthereumAddress(it) }
-                                val tagId = assets?.tagIdHex?.takeIf { it.isNotEmpty() }
-                                val counterVal = assets?.counter
-                                if (displayBeamioTag != null || uidForDisplay != null || tagId != null || counterVal != null) {
-                                    Card(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
-                                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                                        elevation = CardDefaults.cardElevation(defaultElevation = if (compact) 1.dp else 2.dp)
-                                    ) {
-                                        Column(
-                                            modifier = Modifier.padding(accInnerPad),
-                                            verticalArrangement = Arrangement.spacedBy(accSpacing)
-                                        ) {
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Text("Account", fontSize = if (compact) 11.sp else 12.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
-                                                counterVal?.let { cnt ->
-                                                    Row(
-                                                        modifier = Modifier
-                                                            .clip(RoundedCornerShape(999.dp))
-                                                            .background(Color.Black.copy(alpha = 0.06f))
-                                                            .padding(horizontal = 6.dp, vertical = 3.dp),
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                                    ) {
-                                                        Icon(Icons.Filled.Refresh, null, Modifier.size(11.dp), tint = Color.Gray)
-                                                        Text("$cnt", fontSize = 10.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = Color.Black)
-                                                    }
-                                                }
-                                            }
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .weight(1f)
-                                                        .wrapContentHeight(),
-                                                    contentAlignment = Alignment.CenterStart
-                                                ) {
-                                                    when {
-                                                        displayBeamioTag != null -> BeamioTagCopyCapsule(
-                                                            beamioTag = displayBeamioTag,
-                                                            modifier = Modifier.fillMaxWidth()
-                                                        )
-                                                        uidForDisplay != null -> HexCopyCapsule(
-                                                            value = uidForDisplay,
-                                                            copyLabel = "uid",
-                                                            leadingIcon = {
-                                                                Icon(Icons.Filled.Fingerprint, null, Modifier.size(11.dp), tint = Color(0xFF1562f0))
-                                                            }
-                                                        )
-                                                        else -> { }
-                                                    }
-                                                }
-                                                if (tagId != null) {
-                                                    HexCopyCapsule(
-                                                        value = tagId,
-                                                        copyLabel = "tagId",
-                                                        leadingIcon = {
-                                                            Icon(Icons.AutoMirrored.Filled.Label, null, Modifier.size(11.dp), tint = Color(0xFF7C3AED))
-                                                        }
-                                                    )
-                                                } else {
-                                                    Row(
-                                                        modifier = Modifier
-                                                            .clip(RoundedCornerShape(999.dp))
-                                                            .background(Color.Black.copy(alpha = 0.06f))
-                                                            .padding(horizontal = 6.dp, vertical = 3.dp),
-                                                        verticalAlignment = Alignment.CenterVertically,
-                                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                                    ) {
-                                                        Icon(Icons.AutoMirrored.Filled.Label, null, Modifier.size(11.dp), tint = Color(0xFF7C3AED))
-                                                        Text("—", fontSize = 10.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace, color = Color.Gray)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Spacer(modifier = Modifier.height(gapSm))
-                                }
-                                val usdcBal = assets?.usdcBalance?.toDoubleOrNull() ?: 0.0
-                                Card(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = RoundedCornerShape(if (compact) 14.dp else 18.dp),
-                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1c1c1e))
+                                Column(
+                                    modifier = Modifier.padding(24.dp),
+                                    verticalArrangement = Arrangement.spacedBy(16.dp)
                                 ) {
                                     Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(horizontal = usdcPadH, vertical = usdcPadV),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(16.dp),
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("USDC on Base", fontSize = usdcTitleSp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.9f))
-                                        Row(
-                                            verticalAlignment = Alignment.Bottom,
-                                            horizontalArrangement = Arrangement.End
+                                        Column(
+                                            Modifier.weight(1f),
+                                            verticalArrangement = Arrangement.spacedBy(4.dp)
                                         ) {
                                             Text(
-                                                java.lang.String.format(java.util.Locale.US, "%,.2f", usdcBal),
-                                                fontSize = usdcAmtSp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = Color.White
-                                            )
-                                            Text(
-                                                " USDC",
-                                                fontSize = if (compact) 10.sp else 11.sp,
+                                                "LAST TOP-UP",
+                                                fontSize = 11.sp,
                                                 fontWeight = FontWeight.Medium,
-                                                color = Color.White.copy(alpha = 0.9f),
-                                                modifier = Modifier.padding(bottom = 1.dp)
+                                                color = BalanceDetailsOutline,
+                                                letterSpacing = 1.sp
+                                            )
+                                            BalanceDetailsLastTopUpAmountRow(
+                                                assets = assets,
+                                                cardCurrency = balCurrency
                                             )
                                         }
-                                    }
-                                }
-                                if (cardList != null) {
-                                    Spacer(modifier = Modifier.height(gapSm))
-                                    Text(
-                                        "${cardList.size} Passes",
-                                        fontSize = if (compact) 10.sp else 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.Gray,
-                                        modifier = Modifier.padding(horizontal = 2.dp)
-                                    )
-                                    Spacer(modifier = Modifier.height(if (compact) 4.dp else 6.dp))
-                                    if (cardList.size > 1) {
-                                        LazyRow(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .height(passRowH),
-                                            horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                            contentPadding = PaddingValues(end = 4.dp)
+                                        Column(
+                                            Modifier.weight(1f),
+                                            horizontalAlignment = Alignment.End,
+                                            verticalArrangement = Arrangement.spacedBy(4.dp)
                                         ) {
-                                            itemsIndexed(cardList) { _, card ->
-                                                ReadBalancePassCard(
-                                                    card = card,
-                                                    compact = true,
-                                                    modifier = Modifier.width(pageCardW)
-                                                )
-                                            }
-                                        }
-                                    } else {
-                                        ReadBalancePassCard(
-                                            card = cardList.first(),
-                                            compact = compact,
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
-                                    }
-                                }
-                                if (rawResponseJson != null && rawResponseJson.isNotBlank()) {
-                                    Card(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(top = gapSm)
-                                            .clickable { responseExpanded = !responseExpanded },
-                                        shape = RoundedCornerShape(if (compact) 12.dp else 16.dp),
-                                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
-                                    ) {
-                                        Column(modifier = Modifier.padding(if (compact) 10.dp else 14.dp)) {
+                                            Text(
+                                                "USDC on Base",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                color = BalanceDetailsOutline,
+                                                letterSpacing = 1.sp,
+                                                textAlign = TextAlign.End,
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
                                             Row(
                                                 modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                horizontalArrangement = Arrangement.End,
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 Text(
-                                                    "Response Data",
-                                                    fontSize = if (compact) 13.sp else 15.sp,
-                                                    fontWeight = FontWeight.SemiBold,
-                                                    color = Color(0xFF86868b)
+                                                    String.format(Locale.US, "%,.2f", usdcBal),
+                                                    fontSize = 20.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = BalanceDetailsOnSurface,
+                                                    fontFamily = FontFamily.Monospace
                                                 )
                                                 Text(
-                                                    if (responseExpanded) "▼" else "▶",
-                                                    fontSize = 11.sp,
-                                                    color = Color(0xFF86868b)
+                                                    " USDC",
+                                                    fontSize = 12.sp,
+                                                    fontWeight = FontWeight.Medium,
+                                                    color = BalanceDetailsOutline
                                                 )
                                             }
-                                            if (responseExpanded) {
-                                                Spacer(modifier = Modifier.height(6.dp))
-                                                Box(
-                                                    modifier = Modifier
-                                                        .fillMaxWidth()
-                                                        .heightIn(max = if (compact) 160.dp else 240.dp)
-                                                        .verticalScroll(rememberScrollState())
-                                                        .background(Color(0xFFf8fafc), RoundedCornerShape(8.dp))
-                                                        .padding(8.dp)
-                                                ) {
-                                                    Text(
-                                                        text = try {
-                                                            org.json.JSONObject(rawResponseJson).toString(2)
-                                                        } catch (_: Exception) {
-                                                            rawResponseJson
-                                                        },
-                                                        fontSize = 9.sp,
-                                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                                                        color = Color(0xFF64748b)
-                                                    )
-                                                }
+                                        }
+                                    }
+                                }
+                            }
+                            if (rawResponseJson != null && rawResponseJson.isNotBlank()) {
+                                Card(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = gapSm)
+                                        .clickable { responseExpanded = !responseExpanded },
+                                    shape = RoundedCornerShape(16.dp),
+                                    colors = CardDefaults.cardColors(containerColor = BalanceDetailsSurfaceContainerLowest),
+                                    border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
+                                ) {
+                                    Column(modifier = Modifier.padding(if (compact) 10.dp else 14.dp)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(
+                                                "Response Data",
+                                                fontSize = if (compact) 13.sp else 15.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = BalanceDetailsOutline
+                                            )
+                                            Text(
+                                                if (responseExpanded) "▼" else "▶",
+                                                fontSize = 11.sp,
+                                                color = BalanceDetailsOutline
+                                            )
+                                        }
+                                        if (responseExpanded) {
+                                            Spacer(modifier = Modifier.height(6.dp))
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(max = if (compact) 160.dp else 240.dp)
+                                                    .verticalScroll(rememberScrollState())
+                                                    .background(Color(0xFFf8fafc), RoundedCornerShape(8.dp))
+                                                    .padding(8.dp)
+                                            ) {
+                                                Text(
+                                                    text = try {
+                                                        org.json.JSONObject(rawResponseJson).toString(2)
+                                                    } catch (_: Exception) {
+                                                        rawResponseJson
+                                                    },
+                                                    fontSize = 9.sp,
+                                                    fontFamily = FontFamily.Monospace,
+                                                    color = Color(0xFF64748b)
+                                                )
                                             }
                                         }
                                     }
@@ -6693,16 +8384,16 @@ internal fun ReadScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .windowInsetsPadding(WindowInsets.navigationBars)
                                 .padding(horizontal = sidePad)
                                 .padding(top = gapSm, bottom = bottomPad)
                         ) {
-                            val actionBtnH = btnH
                             Button(
                                 onClick = onTopupClick,
                                 enabled = topupButtonEnabled,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(actionBtnH),
+                                    .height(btnH),
                                 colors = ButtonDefaults.buttonColors(
                                     containerColor = Color(0xFF1562f0),
                                     contentColor = Color.White,
@@ -6713,16 +8404,6 @@ internal fun ReadScreen(
                                 Icon(Icons.Filled.Add, null, Modifier.size(14.dp))
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text("Top-Up Card Now", fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                            Spacer(modifier = Modifier.height(if (compact) 8.dp else 10.dp))
-                            Button(
-                                onClick = onBack,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(actionBtnH),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
-                            ) {
-                                Text("Done", fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.SemiBold)
                             }
                         }
                     }
@@ -6753,6 +8434,21 @@ internal fun ReadScreen(
     }
 }
 
+/** Base mainnet transaction page on BaseScan. */
+private fun baseScanTransactionUri(txHash: String): Uri? {
+    val t = txHash.trim()
+    if (t.isEmpty()) return null
+    val path = when {
+        t.startsWith("0x", ignoreCase = true) -> t
+        t.length == 64 && t.all { it.isDigit() || it in 'a'..'f' || it in 'A'..'F' } ->
+            "0x${t.lowercase(Locale.US)}"
+        else -> t
+    }
+    return Uri.parse("https://basescan.org/tx/$path")
+}
+
+private val receiptScrollBottomSpacerDp = 128.dp
+
 @Composable
 private fun PaymentSuccessContent(
     amount: String,
@@ -6763,6 +8459,10 @@ private fun PaymentSuccessContent(
     postBalance: String?,
     cardCurrency: String?,
     memberNo: String?,
+    /** 客户 beamioTag（无 @），与 Balance Loaded 一致 */
+    customerBeamioTag: String? = null,
+    /** 客户 EOA，收据 Hero 在无 tag 时显示短地址 */
+    customerWalletAddress: String? = null,
     cardBackground: String? = null,
     cardImage: String? = null,
     cardName: String? = null,
@@ -6770,12 +8470,8 @@ private fun PaymentSuccessContent(
     cardType: String? = null,
     passCard: CardItem? = null,
     settlementViaQr: Boolean = false,
-    /** ScanMethod 页顶栏 overlay 占位，避免 Approved 标题被 Back 栏遮住 */
-    extraTopInset: Dp = 0.dp,
-    /** 与底部 Total 明细一致：税率 % */
     chargeTaxPercent: Double? = null,
-    /** 与底部 Total 明细一致：等级折扣 % */
-    chargeTierDiscountPercent: Int? = null,
+    chargeTierDiscountPercent: Double? = null,
     tableNumber: String? = null,
     onDone: () -> Unit,
     modifier: Modifier = Modifier
@@ -6783,7 +8479,7 @@ private fun PaymentSuccessContent(
     val context = LocalContext.current
     val amountNum = amount.toDoubleOrNull() ?: 0.0
     val subtotalNum = subtotal?.toDoubleOrNull()
-    val tipNum = tip?.toDoubleOrNull()
+    val tipNum = tip?.toDoubleOrNull() ?: 0.0
     val postBalanceNum = postBalance?.toDoubleOrNull()
     val currency = cardCurrency ?: "CAD"
     val dateString = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.US).format(java.util.Date())
@@ -6792,307 +8488,363 @@ private fun PaymentSuccessContent(
     val displayMemberNo = (memberNo?.takeIf { it.isNotBlank() } ?: shortAddr).ifEmpty { "—" }
     val shortTxHash = if (txHash.length > 12) "${txHash.take(7)}...${txHash.takeLast(5)}" else txHash
 
-    // 全屏高度：顶栏 Approved 固定、底栏按钮固定；中间区域占满剩余高度，仅必要时在中间滚动（避免整页超长滚动条）
-    BoxWithConstraints(
+    val surface = BalanceDetailsSurface
+    val primaryContainer = Color(0xFF004BC3)
+    val primary = Color(0xFF003692)
+    val onSurface = Color(0xFF1A1C1F)
+    val onSurfaceVariant = Color(0xFF434654)
+    val outline = Color(0xFF737685)
+    val outlineVariant = Color(0xFFC3C6D6)
+    val surfaceContainerLow = Color(0xFFF3F3F8)
+    val memberTitle = passHeroMemberDisplayNameLine(
+        customerBeamioTag,
+        customerWalletAddress,
+        passCard,
+        cardName,
+    )
+
+    fun shareReceipt() {
+        val body = buildString {
+            append("Transaction Receipt\n")
+            append("Date: $dateString, $timeString\n")
+            append("Member: $memberTitle\n")
+            append("Member No: $displayMemberNo\n")
+            if (subtotalNum != null) {
+                val (p, a, s) = formatBalanceWithCurrencyProtocol(subtotalNum, currency)
+                append("Voucher deduction: $p$a$s\n")
+            }
+            val (ap, astr, asuf) = formatBalanceWithCurrencyProtocol(amountNum, currency)
+            append("Total charged: $ap$astr$asuf\n")
+            if (txHash.isNotBlank()) append("TX: $txHash\n")
+            append("Payee: $payee\n")
+        }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, body)
+        }
+        context.startActivity(Intent.createChooser(send, "Share receipt"))
+    }
+
+    val scrollMid = rememberScrollState()
+
+    Column(
         modifier = modifier
             .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
             .background(Color(0xFFf5f5f7))
     ) {
-        val tightH = maxHeight < 580.dp
-        val vCompactH = maxHeight < 460.dp
-        val headerTopPad = if (vCompactH) 8.dp else if (tightH) 14.dp else 24.dp
-        val headerBottomPad = if (vCompactH) 6.dp else if (tightH) 8.dp else 12.dp
-        val amountTextSp = when {
-            vCompactH -> 26.sp
-            tightH -> 30.sp
-            else -> 36.sp
-        }
-        val cardImgW = when {
-            vCompactH -> 112.dp
-            tightH -> 144.dp
-            else -> 176.dp
-        }
-        val cardImgH = when {
-            vCompactH -> 88.dp
-            tightH -> 115.dp
-            else -> 140.dp
-        }
-        val hPad = if (vCompactH) 14.dp else 20.dp
-        val sectionGapBelowCards = if (vCompactH) 6.dp else if (tightH) 8.dp else 12.dp
-        val routingTopPad = if (vCompactH) 6.dp else 8.dp
-        val receiptTopPad = if (vCompactH) 8.dp else 12.dp
-        val receiptInnerV = if (vCompactH) 6.dp else 8.dp
-        val scrollMid = rememberScrollState()
-
-        Column(Modifier.fillMaxSize()) {
-            // Header: Approved + amount（无顶部 icon）；Scan 流程下 extraTopInset 与顶栏 overlay 对齐
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = headerTopPad + extraTopInset, bottom = headerBottomPad),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    "Approved",
-                    fontSize = if (vCompactH) 18.sp else 20.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.Black
-                )
-                val (amtPrefix, amtStr, amtSuffix) = formatBalanceWithCurrencyProtocol(amountNum, currency)
-                Row(
-                    modifier = Modifier.padding(top = if (vCompactH) 2.dp else 4.dp),
-                    verticalAlignment = Alignment.Bottom
-                ) {
-                    Text("-", fontSize = if (vCompactH) 14.sp else 16.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        if (amtPrefix.isNotEmpty()) Text(amtPrefix, fontSize = if (vCompactH) 9.sp else 10.sp, color = Color.Black)
-                        Text(amtStr, fontSize = amountTextSp, fontWeight = FontWeight.Light, color = Color.Black)
-                        if (amtSuffix.isNotEmpty()) Text(amtSuffix, fontSize = if (vCompactH) 9.sp else 10.sp, color = Color.Black)
+        Column(Modifier.fillMaxSize().background(BalanceDetailsSurface)) {
+            BalanceDetailsTopBar(
+                onBack = onDone,
+                title = "Transaction Receipt",
+                trailing = {
+                    IconButton(
+                        onClick = { shareReceipt() },
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Share,
+                            contentDescription = "Share",
+                            tint = BalanceDetailsOutline,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            printChargeReceipt(
+                                context,
+                                amount,
+                                subtotal,
+                                tip,
+                                postBalance,
+                                cardCurrency,
+                                payee,
+                                txHash,
+                                dateString,
+                                timeString,
+                                tableNumber
+                            )
+                        },
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            Icons.Filled.Print,
+                            contentDescription = "Print",
+                            tint = BalanceDetailsOutline,
+                            modifier = Modifier.size(24.dp)
+                        )
                     }
                 }
-            }
-
-            Column(
-                modifier = Modifier
-                    .weight(1f, fill = true)
+            )
+            BoxWithConstraints(
+                Modifier
+                    .weight(1f)
                     .fillMaxWidth()
-                    .verticalScroll(scrollMid)
             ) {
-                // Voucher Balance card（对齐 Balance Loaded 风格：背景色、图片、布局）
+                val vCompactH = maxHeight < 460.dp
+                val hPad = if (vCompactH) 16.dp else 24.dp
+                val overlapTop = if (vCompactH) 40.dp else 48.dp
                 Column(
                     modifier = Modifier
-                        .fillMaxWidth()
+                        .fillMaxSize()
+                        .verticalScroll(scrollMid)
                         .padding(horizontal = hPad)
-                        .padding(bottom = sectionGapBelowCards)
+                        .padding(top = 4.dp, bottom = 8.dp)
+                        .windowInsetsPadding(WindowInsets.navigationBars),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    val cardBgColor = parseHexColor(cardBackground) ?: Color(0xFF2C5535)
-                    val accentGreen = Color(0xFF6ED088)
-                    val labelGrey = Color(0xFFBBBBBB)
-                    val voucherInnerPad = if (vCompactH) 14.dp else 20.dp
-                    val voucherInnerBottom = if (vCompactH) 12.dp else 16.dp
-                    val gapVoucherHeaderToFooter = if (vCompactH) 12.dp else 18.dp
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(24.dp),
-                        colors = CardDefaults.cardColors(containerColor = cardBgColor)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = voucherInnerPad, top = voucherInnerPad, end = voucherInnerPad, bottom = voucherInnerBottom)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.Top
-                            ) {
-                                when {
-                                    cardImage != null && cardImage.isNotBlank() -> {
-                                        AsyncImage(
-                                            model = cardImage,
-                                            contentDescription = "Card",
-                                            contentScale = ContentScale.Crop,
-                                            alignment = Alignment.Center,
-                                            modifier = Modifier.size(cardImgW, cardImgH)
-                                        )
-                                    }
-                                    else -> {
-                                        Icon(Icons.Filled.Favorite, null, Modifier.size(if (vCompactH) 36.dp else 44.dp), tint = accentGreen)
-                                    }
-                                }
-                                Column(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .padding(start = 10.dp),
-                                    horizontalAlignment = Alignment.End
-                                ) {
-                                    val titleFromPass = passCard?.cardName?.takeIf { it.isNotBlank() }
-                                    Text(
-                                        (titleFromPass ?: cardName?.takeIf { it.isNotBlank() } ?: "Card").removeSuffix(" CARD").removeSuffix(" Card"),
-                                        fontSize = 16.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
-                                        textAlign = TextAlign.End,
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                    val subtitle = passCard?.let { passTierSubtitleForPassCard(it).takeIf { s -> s.isNotBlank() } }
-                                        ?: (tierName ?: cardType?.takeIf { it.isNotBlank() && it.lowercase() != "infrastructure" }?.replaceFirstChar { it.uppercase() } ?: "")
-                                    if (subtitle.isNotBlank() && !subtitle.equals("Card", ignoreCase = true)) {
-                                        Text(
-                                            subtitle,
-                                            fontSize = 12.sp,
-                                            color = labelGrey,
-                                            maxLines = if (vCompactH) 3 else 4,
-                                            overflow = TextOverflow.Ellipsis,
-                                            textAlign = TextAlign.End,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(top = 4.dp)
-                                        )
-                                    }
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(gapVoucherHeaderToFooter))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.Bottom
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("Member No.", fontSize = 11.sp, color = labelGrey)
-                                    Text(
-                                        displayMemberNo,
-                                        fontSize = 15.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
-                                    )
-                                }
-                                Column(horizontalAlignment = Alignment.End) {
-                                    Text("Balance", fontSize = 11.sp, color = labelGrey)
-                                    if (postBalanceNum != null) {
-                                        val (prefix, amtStr, suffix) = formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
-                                        Row(
-                                            verticalAlignment = Alignment.Bottom,
-                                            horizontalArrangement = Arrangement.End
-                                        ) {
-                                            if (prefix.isNotEmpty()) {
-                                                Text(prefix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
-                                            }
-                                            Text(amtStr, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
-                                            if (suffix.isNotEmpty()) {
-                                                Text(suffix, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = accentGreen, modifier = Modifier.padding(bottom = 2.dp))
-                                            }
-                                        }
-                                    } else {
-                                        Text("—", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = accentGreen)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-            // Smart Routing: Voucher Deduction (charge amount)
-            if (subtotalNum != null) {
-                Card(
+                // Overlapping status + standard Pass Hero（与 Balance Details 一致）
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(top = routingTopPad),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color.White),
-                    border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
+                        .padding(top = overlapTop)
                 ) {
-                    Column(modifier = Modifier.padding(if (vCompactH) 10.dp else 12.dp)) {
-                        Text(
-                            "Smart Routing Engine",
-                            fontSize = if (vCompactH) 13.sp else 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.Black,
-                            modifier = Modifier.padding(bottom = if (vCompactH) 6.dp else 8.dp)
+                    val payHeroDisc: Double? = passCard?.tierDiscountPercent ?: chargeTierDiscountPercent
+                    val payProg = passCard?.let { balanceDetailsCardNameLine(it) }
+                        ?: cardName?.takeIf { it.isNotBlank() }
+                            ?.removeSuffix(" CARD")?.removeSuffix(" Card")?.trim()?.takeIf { it.isNotEmpty() }
+                        ?: "—"
+                    val (payBp, payBamt, payBs) = if (postBalanceNum != null) {
+                        formatBalanceWithCurrencyProtocol(postBalanceNum, currency)
+                    } else {
+                        Triple("", "—", "")
+                    }
+                    StandardMemberPassHeroCard(
+                        memberDisplayName = memberTitle,
+                        memberNo = displayMemberNo,
+                        tierDisplayName = passCard?.tierName?.trim()?.takeIf { it.isNotEmpty() }
+                            ?: tierName?.trim()?.takeIf { it.isNotEmpty() },
+                        tierDiscountPercent = payHeroDisc?.takeIf { it > 0.0 },
+                        programCardDisplayName = payProg,
+                        tierCardBackgroundHex = passCard?.cardBackground ?: cardBackground,
+                        cardMetadataImageUrl = passCard?.cardImage?.takeIf { it.isNotBlank() }
+                            ?: cardImage?.takeIf { it.isNotBlank() },
+                        balancePrefix = payBp,
+                        balanceAmount = payBamt,
+                        balanceSuffix = payBs,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .offset(y = (-overlapTop))
+                            .zIndex(2f),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(64.dp)
+                                .border(4.dp, surface, CircleShape)
+                                .clip(CircleShape)
+                                .background(primaryContainer)
+                                .shadow(12.dp, CircleShape, spotColor = primaryContainer.copy(alpha = 0.35f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Filled.CheckCircle,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(34.dp)
+                            )
+                        }
+                        Surface(
+                            modifier = Modifier.padding(top = 8.dp),
+                            shape = RoundedCornerShape(999.dp),
+                            color = Color.White,
+                            shadowElevation = 2.dp
+                        ) {
+                            Text(
+                                text = "Approved",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 2.sp,
+                                color = primaryContainer,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Smart Routing Engine
+                if (subtotalNum != null) {
+                    val taxP = chargeTaxPercent ?: 0.0
+                    val taxAmt = subtotalNum * taxP / 100.0
+                    val discP = chargeTierDiscountPercent
+                    val discAmt = if (discP != null && discP > 0.0) subtotalNum * discP / 100.0 else 0.0
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(surfaceContainerLow)
+                            .padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        val (sumP, sumS, sumX) = formatBalanceWithCurrencyProtocol(amountNum, currency)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(0.dp)
+                            ) {
+                                if (sumP.isNotEmpty()) {
+                                    Text(
+                                        sumP,
+                                        fontSize = if (vCompactH) 20.sp else 22.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = primaryContainer,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                                Text(
+                                    sumS,
+                                    fontSize = if (vCompactH) 30.sp else 34.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = primaryContainer,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                            if (sumX.isNotEmpty()) {
+                                Text(
+                                    sumX,
+                                    fontSize = if (vCompactH) 20.sp else 22.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = primaryContainer,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                        HorizontalDivider(
+                            thickness = 1.dp,
+                            color = outlineVariant.copy(alpha = 0.35f)
                         )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                Icons.Filled.Memory,
+                                contentDescription = null,
+                                tint = primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                "SMART ROUTING ENGINE",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = onSurfaceVariant,
+                                letterSpacing = 0.2.sp
+                            )
+                        }
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("Voucher Deduction", fontSize = 15.sp, color = Color(0xFF86868b))
-                            val (sPrefix, sAmt, sSuffix) = formatBalanceWithCurrencyProtocol(subtotalNum, currency)
+                            Text("Voucher Deduction", fontSize = 14.sp, color = onSurfaceVariant)
+                            val (vp, vs, vx) = formatBalanceWithCurrencyProtocol(subtotalNum, currency)
                             Row(verticalAlignment = Alignment.Bottom) {
-                                if (sPrefix.isNotEmpty()) Text(sPrefix, fontSize = 11.sp, color = Color.Black)
-                                Text(sAmt, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
-                                if (sSuffix.isNotEmpty()) Text(sSuffix, fontSize = 11.sp, color = Color.Black)
+                                if (vp.isNotEmpty()) Text(vp, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(vs, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                if (vx.isNotEmpty()) Text(vx, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
                             }
                         }
-                        val taxP = chargeTaxPercent ?: 0.0
-                        val taxAmt = subtotalNum * taxP / 100.0
-                        Spacer(modifier = Modifier.height(8.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                "Tax (${String.format("%.2f", taxP)}%)",
-                                fontSize = 15.sp,
-                                color = Color(0xFF86868b)
+                                "Tax (${String.format(Locale.US, "%.2f", taxP)}%)",
+                                fontSize = 14.sp,
+                                color = onSurfaceVariant
                             )
-                            val (txPrefix, txStr, txSuffix) = formatBalanceWithCurrencyProtocol(taxAmt, currency)
+                            val (txp, txs, txx) = formatBalanceWithCurrencyProtocol(taxAmt, currency)
                             Row(verticalAlignment = Alignment.Bottom) {
-                                if (txPrefix.isNotEmpty()) Text(txPrefix, fontSize = 11.sp, color = Color.Black)
-                                Text(txStr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
-                                if (txSuffix.isNotEmpty()) Text(txSuffix, fontSize = 11.sp, color = Color.Black)
+                                if (txp.isNotEmpty()) Text(txp, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = outline, fontFamily = FontFamily.Monospace)
+                                Text(txs, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = outline, fontFamily = FontFamily.Monospace)
+                                if (txx.isNotEmpty()) Text(txx, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = outline, fontFamily = FontFamily.Monospace)
                             }
                         }
-                        val discP = chargeTierDiscountPercent
-                        val discAmt = if (discP != null) subtotalNum * discP / 100.0 else null
-                        Spacer(modifier = Modifier.height(8.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (discP != null && discP > 0) {
-                                Text(
-                                    "Tier discount ($discP%)",
-                                    fontSize = 15.sp,
-                                    color = Color(0xFF86868b)
-                                )
-                                val (dPrefix, dStr, dSuffix) = formatBalanceWithCurrencyProtocol(discAmt ?: 0.0, currency)
-                                Row(verticalAlignment = Alignment.Bottom) {
-                                    Text("-", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF059669))
-                                    if (dPrefix.isNotEmpty()) Text(dPrefix, fontSize = 11.sp, color = Color(0xFF059669))
-                                    Text(dStr, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFF059669))
-                                    if (dSuffix.isNotEmpty()) Text(dSuffix, fontSize = 11.sp, color = Color(0xFF059669))
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("Tier discount", fontSize = 14.sp, color = onSurfaceVariant)
+                                if (discP != null && discP > 0.0) {
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = primaryContainer.copy(alpha = 0.1f)
+                                    ) {
+                                        Text(
+                                            "${formatTierDiscountPercentForUi(discP)}%",
+                                            fontSize = 9.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = primaryContainer,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
                                 }
-                            } else {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text("Tier discount", fontSize = 15.sp, color = Color(0xFF86868b))
-                                    Text("Not applied", fontSize = 11.sp, color = Color(0xFF94a3b8))
-                                }
-                                Text("—", fontSize = 15.sp, color = Color(0xFF94a3b8))
+                            }
+                            val (dp, ds, dx) = formatBalanceWithCurrencyProtocol(discAmt, currency)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text("- ", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = primary, fontFamily = FontFamily.Monospace)
+                                if (dp.isNotEmpty()) Text(dp, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = primary, fontFamily = FontFamily.Monospace)
+                                Text(ds, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = primary, fontFamily = FontFamily.Monospace)
+                                if (dx.isNotEmpty()) Text(dx, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = primary, fontFamily = FontFamily.Monospace)
                             }
                         }
-                        if (tipNum != null && tipNum > 0) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("Tip", fontSize = 15.sp, color = Color(0xFF86868b))
-                                val (tPrefix, tAmt, tSuffix) = formatBalanceWithCurrencyProtocol(tipNum, currency)
-                                Row(verticalAlignment = Alignment.Bottom) {
-                                    if (tPrefix.isNotEmpty()) Text(tPrefix, fontSize = 11.sp, color = Color.Black)
-                                    Text(tAmt, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color.Black)
-                                    if (tSuffix.isNotEmpty()) Text(tSuffix, fontSize = 11.sp, color = Color.Black)
-                                }
+                        HorizontalDivider(
+                            modifier = Modifier.padding(top = 2.dp),
+                            thickness = 1.dp,
+                            color = outlineVariant.copy(alpha = 0.35f)
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Tip", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = onSurfaceVariant)
+                            val (tp, ts, tt) = formatBalanceWithCurrencyProtocol(tipNum, currency)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                if (tp.isNotEmpty()) Text(tp, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(ts, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                if (tt.isNotEmpty()) Text(tt, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = onSurface, fontFamily = FontFamily.Monospace)
                             }
                         }
                     }
                 }
-            }
 
-            // Receipt details
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = receiptTopPad),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.05f))
-            ) {
-                Column(modifier = Modifier.padding(horizontal = if (vCompactH) 12.dp else 16.dp, vertical = receiptInnerV)) {
+                // Metadata
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Date", fontSize = 13.sp, color = Color(0xFF86868b))
-                        Text("$dateString, $timeString", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
+                        Text(
+                            "DATE & TIME",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = outline,
+                            letterSpacing = 1.sp
+                        )
+                        Text(
+                            "$dateString, $timeString",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = onSurface,
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
                     if (!tableNumber.isNullOrBlank()) {
                         Row(
@@ -7100,17 +8852,34 @@ private fun PaymentSuccessContent(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("Table number", fontSize = 13.sp, color = Color(0xFF86868b))
-                            Text(tableNumber.trim(), fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
+                            Text(
+                                "TABLE",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = outline,
+                                letterSpacing = 1.sp
+                            )
+                            Text(
+                                tableNumber.trim(),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = onSurface,
+                                fontFamily = FontFamily.Monospace
+                            )
                         }
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Member No.", fontSize = 13.sp, color = Color(0xFF86868b))
-                        Text(displayMemberNo, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color.Black)
+                        Text(
+                            displayMemberNo,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = onSurface,
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
                     if (txHash.isNotBlank()) {
                         Row(
@@ -7118,8 +8887,33 @@ private fun PaymentSuccessContent(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("TX Hash", fontSize = 13.sp, color = Color(0xFF86868b))
-                            Text(shortTxHash, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
+                            Text(
+                                "TX HASH",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = outline,
+                                letterSpacing = 1.sp
+                            )
+                            Surface(
+                                modifier = Modifier.clickable {
+                                    val uri = baseScanTransactionUri(txHash) ?: return@clickable
+                                    try {
+                                        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                                    } catch (_: Exception) {
+                                    }
+                                },
+                                shape = RoundedCornerShape(999.dp),
+                                color = primary.copy(alpha = 0.06f)
+                            ) {
+                                Text(
+                                    shortTxHash,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = primary,
+                                    fontFamily = FontFamily.Monospace,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
                         }
                     }
                     Row(
@@ -7127,70 +8921,367 @@ private fun PaymentSuccessContent(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Settlement", fontSize = 13.sp, color = Color(0xFF86868b))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Filled.Shield, null, Modifier.size(12.dp), tint = Color(0xFF34C759))
-                            Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            "SETTLEMENT",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = outline,
+                            letterSpacing = 1.sp
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
                                 if (settlementViaQr) "App Validator" else "NTAG 424 DNA",
-                                fontSize = 13.sp,
+                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Medium,
-                                color = Color(0xFF34C759)
+                                color = onSurface
+                            )
+                            Icon(
+                                Icons.Filled.Verified,
+                                contentDescription = null,
+                                tint = primary,
+                                modifier = Modifier.size(16.dp)
                             )
                         }
                     }
                 }
-            }
-        }
-            }
-
-            // Print and Done buttons（贴底 + 导航栏安全区，避免整页滚动）
-            val approvedActionButtonModifier = Modifier
-                .fillMaxWidth()
-                .height(if (vCompactH) 44.dp else 48.dp)
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .windowInsetsPadding(WindowInsets.navigationBars)
-                    .padding(horizontal = hPad, vertical = if (vCompactH) 6.dp else 10.dp)
-                    .padding(bottom = if (vCompactH) 6.dp else 10.dp),
-                verticalArrangement = Arrangement.spacedBy(if (vCompactH) 6.dp else 8.dp)
-            ) {
-            OutlinedButton(
-                onClick = {
-                    printChargeReceipt(
-                        context,
-                        amount,
-                        subtotal,
-                        tip,
-                        postBalance,
-                        cardCurrency,
-                        payee,
-                        txHash,
-                        dateString,
-                        timeString,
-                        tableNumber
-                    )
-                },
-                modifier = approvedActionButtonModifier,
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
-                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.3f))
-            ) {
-                Icon(Icons.Filled.Print, null, Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Print Receipt", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            }
-            Button(
-                onClick = onDone,
-                modifier = approvedActionButtonModifier,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Black, contentColor = Color.White)
-            ) {
-                Text("Done", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            }
+                Spacer(modifier = Modifier.height(receiptScrollBottomSpacerDp))
+                }
             }
         }
     }
 }
+
+@Composable
+private fun PartialApprovalContent(
+    model: PartialApprovalUiModel,
+    postBalance: String?,
+    onBack: () -> Unit,
+    onContinueRemaining: () -> Unit,
+    onCancelRemaining: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val primaryBlue = Color(0xFF1D4ED8)
+    val onSurface = Color(0xFF1A1C1F)
+    val onSurfaceVariant = Color(0xFF434654)
+    val outline = Color(0xFF737685)
+    val emerald = Color(0xFF059669)
+    val emeraldBadgeBg = Color(0xFFD1FAE5)
+    val emeraldBadgeText = Color(0xFF065F46)
+    val errorCol = Color(0xFFBA1A1A)
+    val overlapTopPartial = 40.dp
+    val datePart = java.text.SimpleDateFormat("MMM d, yyyy", Locale.US).format(java.util.Date()).uppercase(Locale.US)
+    val timePart = java.text.SimpleDateFormat("HH:mm:ss", Locale.US).format(java.util.Date())
+    val dateTimeLine = "$datePart · $timePart"
+    val shortTx = if (model.txHash.length > 12) "${model.txHash.take(6)}...${model.txHash.takeLast(4)}" else model.txHash
+    fun sharePartial() {
+        fun fiatLine(amt: Double): String {
+            val (p, a, s) = formatBalanceWithCurrencyProtocol(amt, model.payCurrency)
+            return buildString {
+                if (p.isNotEmpty()) {
+                    append(p.trimEnd())
+                    append(" ")
+                }
+                append(a)
+                append(s)
+            }
+        }
+        val body = buildString {
+            append("Partial charge approved\n")
+            append("Charged: ${fiatLine(model.chargedPayCur)}\n")
+            append("Remaining: ${fiatLine(model.shortfallPayCur)}\n")
+            append("Order total: ${fiatLine(model.orderTotalPayCur)}\n")
+            if (model.txHash.isNotBlank()) append("TX: ${model.txHash}\n")
+        }
+        context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TEXT, body)
+        }, null))
+    }
+    val scroll = rememberScrollState()
+    val balNum = postBalance?.takeIf { it.isNotBlank() && it != "—" }?.toDoubleOrNull() ?: 0.0
+    val (chPref, chAmt, chSuf) = formatBalanceWithCurrencyProtocol(model.chargedPayCur, model.payCurrency)
+    val (sfPref, sfAmt, sfSuf) = formatBalanceWithCurrencyProtocol(model.shortfallPayCur, model.payCurrency)
+    val (totPref, totAmt, totSuf) = formatBalanceWithCurrencyProtocol(model.orderTotalPayCur, model.payCurrency)
+    val (vPre, vAmt, vSuf) = formatBalanceWithCurrencyProtocol(model.subtotal, model.payCurrency)
+    val (dPre, dAmt, dSuf) = formatBalanceWithCurrencyProtocol(model.tierDiscountAmount, model.payCurrency)
+    val (taxPre, taxAmt, taxSuf) = formatBalanceWithCurrencyProtocol(model.taxAmount, model.payCurrency)
+    val (tipPre, tipAm, tipSuf) = formatBalanceWithCurrencyProtocol(model.tipAmount, model.payCurrency)
+    val tierLine = buildString {
+        append("Tier Discount")
+        model.tierDiscountLabel?.takeIf { it.isNotBlank() }?.let { append(" ($it)") }
+    }
+    val taxLabel = "Tax (${String.format(Locale.US, "%.2f", model.taxPercent)}%)"
+
+    Column(
+        modifier
+            .fillMaxSize()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .background(Color(0xFFf5f5f7))
+    ) {
+        Column(Modifier.fillMaxSize().background(BalanceDetailsSurface)) {
+            val hPad = 24.dp
+            BalanceDetailsTopBar(
+                onBack = onBack,
+                title = "Partial Approval",
+                trailing = {
+                    IconButton(onClick = { sharePartial() }, modifier = Modifier.size(40.dp)) {
+                        Icon(
+                            Icons.Filled.Share,
+                            contentDescription = "Share",
+                            tint = BalanceDetailsOutline,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+            )
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(scroll)
+                    .padding(horizontal = hPad)
+                    .padding(top = 8.dp, bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(22.dp)
+            ) {
+                Box(Modifier.fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = overlapTopPartial)
+                    ) {
+                        val (pBp, pBa, pBs) = formatBalanceWithCurrencyProtocol(balNum, model.payCurrency)
+                        StandardMemberPassHeroCard(
+                            memberDisplayName = model.memberDisplayName,
+                            memberNo = model.memberNoDisplay,
+                            tierDisplayName = model.tierDiscountLabel?.trim()?.takeIf { it.isNotEmpty() },
+                            tierDiscountPercent = model.tierDiscPct.takeIf { it > 0.0 },
+                            programCardDisplayName = model.programCardDisplayName ?: model.memberDisplayName,
+                            tierCardBackgroundHex = model.tierCardBackgroundHex,
+                            cardMetadataImageUrl = model.cardMetadataImageUrl,
+                            balancePrefix = pBp,
+                            balanceAmount = pBa,
+                            balanceSuffix = pBs,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    Column(
+                        Modifier
+                            .align(Alignment.TopCenter)
+                            .offset(y = (-overlapTopPartial))
+                            .zIndex(2f),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Color.White)
+                                .shadow(4.dp, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Filled.CheckCircle, null, tint = emerald, modifier = Modifier.size(32.dp))
+                        }
+                        Surface(
+                            modifier = Modifier.padding(top = 8.dp),
+                            shape = RoundedCornerShape(999.dp),
+                            color = emeraldBadgeBg
+                        ) {
+                            Text(
+                                "PARTIAL APPROVAL",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = emeraldBadgeText,
+                                letterSpacing = 2.sp,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
+                }
+
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.White)
+                        .shadow(2.dp, RoundedCornerShape(12.dp))
+                        .padding(20.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Successfully Charged", fontSize = 12.sp, color = onSurfaceVariant, fontWeight = FontWeight.Medium)
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                                Text(chPref, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = primaryBlue, fontFamily = FontFamily.Monospace)
+                                Text(chAmt, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = primaryBlue, fontFamily = FontFamily.Monospace)
+                                Text(chSuf, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = primaryBlue, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        Box(
+                            Modifier
+                                .width(1.dp)
+                                .height(40.dp)
+                                .background(Color(0xFFE2E2E7))
+                        )
+                        Column(Modifier.weight(1f), horizontalAlignment = Alignment.End) {
+                            Text("Remaining Shortfall", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = errorCol)
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End, modifier = Modifier.padding(top = 4.dp)) {
+                                Text(sfPref, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = errorCol, fontFamily = FontFamily.Monospace)
+                                Text(sfAmt, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = errorCol, fontFamily = FontFamily.Monospace)
+                                Text(sfSuf, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = errorCol, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFFF3F3F8))
+                            .padding(14.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Icon(Icons.Filled.Info, null, tint = onSurfaceVariant, modifier = Modifier.size(20.dp))
+                            Text(
+                                "The member's balance was exhausted. Please collect the remaining amount via an alternative payment method.",
+                                fontSize = 11.sp,
+                                lineHeight = 16.sp,
+                                color = onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "SMART ROUTING ENGINE",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = onSurfaceVariant,
+                        letterSpacing = 2.sp,
+                        modifier = Modifier.padding(start = 4.dp)
+                    )
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.White)
+                            .shadow(2.dp, RoundedCornerShape(12.dp))
+                            .padding(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Voucher Deduction", fontSize = 14.sp, color = onSurfaceVariant)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text("-", fontSize = 13.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(vPre, fontSize = 12.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(vAmt, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(vSuf, fontSize = 12.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(tierLine, fontSize = 14.sp, color = onSurfaceVariant)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text("-", fontSize = 13.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(dPre, fontSize = 12.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(dAmt, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = emerald, fontFamily = FontFamily.Monospace)
+                                Text(dSuf, fontSize = 12.sp, color = emerald, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(taxLabel, fontSize = 14.sp, color = onSurfaceVariant)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text("+", fontSize = 13.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(taxPre, fontSize = 12.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(taxAmt, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(taxSuf, fontSize = 12.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Service Tip", fontSize = 14.sp, color = onSurfaceVariant)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text("+", fontSize = 13.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(tipPre, fontSize = 12.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(tipAm, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(tipSuf, fontSize = 12.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                        HorizontalDivider(Modifier.padding(vertical = 4.dp), color = Color(0xFFE2E2E7).copy(0.5f))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Total Order Value", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = onSurface)
+                            Row(verticalAlignment = Alignment.Bottom) {
+                                Text(totPref, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(totAmt, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = onSurface, fontFamily = FontFamily.Monospace)
+                                Text(totSuf, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = onSurface, fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
+                }
+
+                Column(Modifier.padding(horizontal = 4.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column {
+                            Text("DATE & TIME", fontSize = 9.sp, color = outline, letterSpacing = 1.sp)
+                            Text(dateTimeLine, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = onSurface, modifier = Modifier.padding(top = 4.dp))
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text("TX HASH", fontSize = 9.sp, color = outline, letterSpacing = 1.sp)
+                            Text(shortTx, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = onSurface, modifier = Modifier.padding(top = 4.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "SETTLEMENT (${if (model.settlementViaQr) "App Validator" else "NTAG 424 DNA"})",
+                                fontSize = 9.sp,
+                                color = outline,
+                                letterSpacing = 1.sp
+                            )
+                            Text(model.settlementDetail, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = onSurface, modifier = Modifier.padding(top = 4.dp))
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(model.memberNoDisplay, fontSize = 11.sp, fontWeight = FontWeight.Medium, color = onSurface)
+                        }
+                    }
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.92f))
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(horizontal = hPad, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(999.dp))
+                        .background(Brush.horizontalGradient(listOf(Color(0xFF004BC3), Color(0xFF1562F0))))
+                        .clickable { onContinueRemaining() }
+                        .padding(vertical = 16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Continue Remaining Charge", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Icon(Icons.AutoMirrored.Filled.ArrowForward, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    }
+                }
+                TextButton(
+                    onClick = onCancelRemaining,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Cancel Remaining", color = outline, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
 
 @Composable
 private fun PaymentRoutingMonitorRow(step: RoutingStep) {
@@ -7273,10 +9364,12 @@ internal fun PaymentRoutingMonitorDisplayCard(
                 .fillMaxSize()
                 .padding(horizontal = 10.dp, vertical = 10.dp)
         ) {
+            // ~0.5rem inset so bottom-anchored process lines sit slightly above the bezel edge
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth(),
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
                 verticalArrangement = Arrangement.Bottom
             ) {
                 visible.forEach { step -> PaymentRoutingMonitorRow(step) }
@@ -7342,9 +9435,14 @@ internal fun PaymentScreen(
     cardType: String? = null,
     passCardSnapshot: CardItem? = null,
     settlementViaQr: Boolean = false,
+    customerBeamioTag: String? = null,
+    customerWalletAddress: String? = null,
     chargeTaxPercent: Double? = null,
-    chargeTierDiscountPercent: Int? = null,
+    chargeTierDiscountPercent: Double? = null,
     tableNumber: String? = null,
+    partialApproval: PartialApprovalUiModel? = null,
+    onPartialApprovalContinue: () -> Unit = {},
+    onPartialApprovalCancel: () -> Unit = {},
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -7369,7 +9467,6 @@ internal fun PaymentScreen(
             }
             is PaymentStatus.Routing, is PaymentStatus.Submitting, is PaymentStatus.Refreshing -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -7383,29 +9480,41 @@ internal fun PaymentScreen(
                     }
                 }
             }
-            is PaymentStatus.Success -> PaymentSuccessContent(
-                modifier = Modifier.fillMaxSize(),
-                amount = amount,
-                payee = payee,
-                txHash = txHash,
-                subtotal = subtotal,
-                tip = tip,
-                postBalance = postBalance,
-                cardCurrency = cardCurrency,
-                memberNo = memberNo,
-                cardBackground = cardBackground,
-                cardImage = cardImage,
-                cardName = cardName,
-                tierName = tierName,
-                cardType = cardType,
-                passCard = passCardSnapshot,
-                settlementViaQr = settlementViaQr,
-                extraTopInset = 0.dp,
-                chargeTaxPercent = chargeTaxPercent,
-                chargeTierDiscountPercent = chargeTierDiscountPercent,
-                tableNumber = tableNumber,
-                onDone = onBack
-            )
+            is PaymentStatus.Success -> if (partialApproval != null) {
+                PartialApprovalContent(
+                    model = partialApproval,
+                    postBalance = postBalance,
+                    onBack = onBack,
+                    onContinueRemaining = onPartialApprovalContinue,
+                    onCancelRemaining = onPartialApprovalCancel,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                PaymentSuccessContent(
+                    modifier = Modifier.fillMaxSize(),
+                    amount = amount,
+                    payee = payee,
+                    txHash = txHash,
+                    subtotal = subtotal,
+                    tip = tip,
+                    postBalance = postBalance,
+                    cardCurrency = cardCurrency,
+                    memberNo = memberNo,
+                    cardBackground = cardBackground,
+                    cardImage = cardImage,
+                    cardName = cardName,
+                    tierName = tierName,
+                    cardType = cardType,
+                    passCard = passCardSnapshot,
+                    settlementViaQr = settlementViaQr,
+                    customerBeamioTag = customerBeamioTag,
+                    customerWalletAddress = customerWalletAddress,
+                    chargeTaxPercent = chargeTaxPercent,
+                    chargeTierDiscountPercent = chargeTierDiscountPercent,
+                    tableNumber = tableNumber,
+                    onDone = onBack
+                )
+            }
             is PaymentStatus.Error -> {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
                     Button(onClick = onBack, modifier = Modifier.height(24.dp)) { Text("Back") }
@@ -7479,114 +9588,6 @@ fun WelcomePanelNoAA(
     }
 }
 
-/** Balance Loaded：展示 @beamioTag，点击复制纯 tag（无 @）；无 tag 时调用方勿渲染 */
-@Composable
-private fun BeamioTagCopyCapsule(
-    beamioTag: String,
-    modifier: Modifier = Modifier
-) {
-    val normalized = beamioTag.trim().removePrefix("@").trim()
-    if (normalized.isEmpty()) return
-    val context = LocalContext.current
-    var copied by remember(beamioTag) { mutableStateOf(false) }
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(2000)
-            copied = false
-        }
-    }
-    val display = "@$normalized"
-    val short = if (display.length >= 14) "${display.take(8)}…${display.takeLast(4)}" else display
-    Row(
-        modifier = modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(Color.Black.copy(alpha = 0.06f))
-            .clickable {
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                cm?.setPrimaryClip(ClipData.newPlainText("beamioTag", normalized))
-                copied = true
-            }
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        Icon(
-            Icons.Filled.Store,
-            contentDescription = null,
-            modifier = Modifier.size(11.dp),
-            tint = Color(0xFF1562f0)
-        )
-        Text(
-            short,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.SemiBold,
-            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-            color = Color.Black,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f)
-        )
-        Icon(
-            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-            contentDescription = "Copy beamio tag",
-            modifier = Modifier.size(12.dp),
-            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
-        )
-    }
-}
-
-/** 十六进制值胶囊：leadingIcon（或 label 文本）+ 短缩 hex + copy 图标，点击复制完整值，成功后绿色 check 约 2 秒 */
-@Composable
-private fun HexCopyCapsule(
-    value: String,
-    copyLabel: String,
-    leadingIcon: @Composable (() -> Unit)? = null,
-    label: String? = null,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    var copied by remember { mutableStateOf(false) }
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(2000)
-            copied = false
-        }
-    }
-    val short = if (value.length >= 10) "${value.take(6)}…${value.takeLast(4)}" else value
-    val desc = label ?: copyLabel
-    Row(
-        modifier = modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(Color.Black.copy(alpha = 0.06f))
-            .clickable(enabled = value.isNotEmpty()) {
-                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                cm?.setPrimaryClip(ClipData.newPlainText(copyLabel, value))
-                copied = true
-            }
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        if (leadingIcon != null) {
-            leadingIcon()
-        } else if (label != null) {
-            Text(label, fontSize = 10.sp, color = Color.Gray)
-        }
-        Text(
-            short,
-            fontSize = 11.sp,
-            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-            color = Color.Black
-        )
-        Icon(
-            if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-            contentDescription = "Copy $desc",
-            modifier = Modifier.size(12.dp),
-            tint = if (copied) Color(0xFF34C759) else Color.Black.copy(alpha = 0.6f)
-        )
-    }
-}
-
 /** 姓名字段：空白或字面量 "null" 视为无值（避免 API/JSON 把 null 序列化成字符串） */
 private fun sanitizeProfileNamePart(raw: String?): String {
     val t = raw?.trim() ?: ""
@@ -7619,13 +9620,23 @@ private fun BeamioCapsuleCompact(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        AsyncImage(
-            model = profile.image?.takeIf { it.isNotBlank() } ?: avatarUrl,
+        val avatarModifier = Modifier
+            .size(28.dp)
+            .clip(CircleShape)
+        val primaryAvatarModel = profile.image?.takeIf { it.isNotBlank() } ?: avatarUrl
+        BeamioCardRasterOrSvgImage(
+            model = primaryAvatarModel,
             contentDescription = null,
-            modifier = Modifier
-                .size(28.dp)
-                .clip(CircleShape),
-            contentScale = ContentScale.Crop
+            modifier = avatarModifier,
+            contentScale = ContentScale.Crop,
+            fallback = {
+                AsyncImage(
+                    model = avatarUrl,
+                    contentDescription = null,
+                    modifier = avatarModifier,
+                    contentScale = ContentScale.Crop
+                )
+            },
         )
         Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
             if (hasNameRow) {
@@ -8294,10 +10305,16 @@ internal fun ScanMethodSelectionScreen(
     paymentTierName: String? = null,
     paymentCardType: String? = null,
     paymentPassCard: CardItem? = null,
+    /** Charge 成功页与 Balance 对齐：客户 beamioTag / EOA */
+    paymentCustomerBeamioTag: String? = null,
+    paymentCustomerWalletAddress: String? = null,
     paymentChargeTaxPercent: Double? = null,
-    paymentChargeTierDiscountPercent: Int? = null,
+    paymentChargeTierDiscountPercent: Double? = null,
     paymentChargeTipBps: Int = 0,
     paymentTableNumber: String = "",
+    paymentPartialApproval: PartialApprovalUiModel? = null,
+    onPartialApprovalContinue: () -> Unit = {},
+    onPartialApprovalCancel: () -> Unit = {},
     onPaymentDone: () -> Unit = {},
     onProceed: () -> Unit,
     onProceedNfcStay: (() -> Unit)? = null,
@@ -8332,6 +10349,13 @@ internal fun ScanMethodSelectionScreen(
         !(pendingAction == "payment" && paymentQrInterpreting)
     val effectiveShowMethodToggle = showMethodToggle && !hideMethodToggle
 
+    /** 中央为 loading / routing / execute 时隐藏顶栏返回，避免流程中误退 */
+    val scanMethodTopBarLoading = showPaymentRouting ||
+        (pendingAction == "payment" && paymentQrInterpreting) ||
+        (pendingAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) ||
+        nfcFetchingInfo ||
+        (linkAppLockedShowCancel && linkAppCancelInProgress)
+
     /** Charge：底部 Total = request + tax%*request - tier%*request + tip（与链上记账一致）；勿仅用 totalAmount 字符串以免漏税 */
     val bottomTotalDisplay = if (pendingAction == "payment") {
         val req = paymentSubtotal?.toDoubleOrNull() ?: 0.0
@@ -8345,6 +10369,7 @@ internal fun ScanMethodSelectionScreen(
     } else {
         totalAmount.toDoubleOrNull() ?: 0.0
     }
+    val haptic = LocalHapticFeedback.current
 
     Box(
         modifier = modifier
@@ -8367,7 +10392,16 @@ internal fun ScanMethodSelectionScreen(
                 if (true) {
                     // Charge 支付结果（NFC 贴卡 或 QR 扫码）：中间窗口显示
                     if (showPaymentSuccess) {
-                    // Approved：PaymentSuccessContent 内顶栏固定、底栏固定；中间 weight(1f)+verticalScroll，勿在外层再包 verticalScroll
+                    if (paymentPartialApproval != null) {
+                        PartialApprovalContent(
+                            model = paymentPartialApproval,
+                            postBalance = paymentPostBalance,
+                            onBack = onPaymentDone,
+                            onContinueRemaining = onPartialApprovalContinue,
+                            onCancelRemaining = onPartialApprovalCancel,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
                     PaymentSuccessContent(
                         amount = paymentAmount,
                         payee = paymentPayee,
@@ -8384,13 +10418,15 @@ internal fun ScanMethodSelectionScreen(
                         cardType = paymentCardType,
                         passCard = paymentPassCard,
                         settlementViaQr = scanMethod == "qr",
-                        extraTopInset = BACK_BUTTON_TOP_BAR_HEIGHT,
+                        customerBeamioTag = paymentCustomerBeamioTag,
+                        customerWalletAddress = paymentCustomerWalletAddress,
                         chargeTaxPercent = paymentChargeTaxPercent,
                         chargeTierDiscountPercent = paymentChargeTierDiscountPercent,
                         tableNumber = paymentTableNumber.trim().takeIf { it.isNotEmpty() },
                         onDone = onPaymentDone,
                         modifier = Modifier.fillMaxSize()
                     )
+                    }
                 } else if (showPaymentError) {
                     Box(
                         modifier = Modifier
@@ -8881,10 +10917,26 @@ internal fun ScanMethodSelectionScreen(
                                         )
                                     } else {
                                         Button(
-                                            onClick = onLinkAppCancelLock,
-                                            modifier = Modifier.fillMaxWidth()
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                onLinkAppCancelLock()
+                                            },
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(48.dp),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = Color(0xFF1562f0),
+                                                contentColor = Color.White,
+                                                disabledContainerColor = Color(0xFF1562f0).copy(alpha = 0.35f),
+                                                disabledContentColor = Color.White.copy(alpha = 0.55f)
+                                            )
                                         ) {
-                                            Text("Cancel link lock")
+                                            Text(
+                                                "Cancel link lock",
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
                                         }
                                     }
                                     Spacer(modifier = Modifier.height(8.dp))
@@ -9023,66 +11075,65 @@ internal fun ScanMethodSelectionScreen(
             }
         }
 
-        // Top bar overlay: Back button (left) + NFC/QR toggle (center, when visible)
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(
-                    if (effectiveShowMethodToggle) 120.dp else BACK_BUTTON_TOP_BAR_HEIGHT
-                )
-                .background(Color(0xFFf5f5f7))
-                .align(Alignment.TopCenter)
-        ) {
-            BackButtonIcon(
-                onClick = {
-                    if (showPaymentSuccess) onPaymentDone()
-                    else onCancel()
-                },
+        // Top bar overlay: Back button (left) + NFC/QR toggle (center, when visible)；支付成功页自带顶栏，不再铺灰底
+        if (!showPaymentSuccess && !scanMethodTopBarLoading) {
+            Box(
                 modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
-            )
-            if (effectiveShowMethodToggle) {
-                Row(
+                    .fillMaxWidth()
+                    .height(
+                        if (effectiveShowMethodToggle) 120.dp else BACK_BUTTON_TOP_BAR_HEIGHT
+                    )
+                    .background(Color(0xFFf5f5f7))
+                    .align(Alignment.TopCenter)
+            ) {
+                BackButtonIcon(
+                    onClick = onCancel,
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = TOP_BAR_CAPSULE_TITLE_PADDING, start = 24.dp, end = 24.dp),
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Card(
-                        shape = RoundedCornerShape(999.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.08f))
+                        .align(Alignment.TopStart)
+                        .padding(top = BACK_BUTTON_TOP_PADDING, start = BACK_BUTTON_START_PADDING)
+                )
+                if (effectiveShowMethodToggle) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = TOP_BAR_CAPSULE_TITLE_PADDING, start = 24.dp, end = 24.dp),
+                        horizontalArrangement = Arrangement.Center
                     ) {
-                        Row(
-                            modifier = Modifier.padding(6.dp),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        Card(
+                            shape = RoundedCornerShape(999.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color.White),
+                            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.08f))
                         ) {
-                            Button(
-                                onClick = { onScanMethodChange("nfc") },
-                                modifier = Modifier.height(40.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (scanMethod == "nfc") Color(0xFF1562f0) else Color.Transparent,
-                                    contentColor = if (scanMethod == "nfc") Color.White else Color.Black.copy(alpha = 0.6f)
-                                ),
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                            Row(
+                                modifier = Modifier.padding(6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
-                                Icon(Icons.Filled.Nfc, null, Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Tap Card", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-                            }
-                            Button(
-                                onClick = { onScanMethodChange("qr") },
-                                modifier = Modifier.height(40.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (scanMethod == "qr") Color(0xFF1562f0) else Color.Transparent,
-                                    contentColor = if (scanMethod == "qr") Color.White else Color.Black.copy(alpha = 0.6f)
-                                ),
-                                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                            ) {
-                                Icon(Icons.Filled.QrCode2, null, Modifier.size(18.dp))
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Scan QR", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                Button(
+                                    onClick = { onScanMethodChange("nfc") },
+                                    modifier = Modifier.height(40.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (scanMethod == "nfc") Color(0xFF1562f0) else Color.Transparent,
+                                        contentColor = if (scanMethod == "nfc") Color.White else Color.Black.copy(alpha = 0.6f)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(Icons.Filled.Nfc, null, Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Tap Card", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Button(
+                                    onClick = { onScanMethodChange("qr") },
+                                    modifier = Modifier.height(40.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (scanMethod == "qr") Color(0xFF1562f0) else Color.Transparent,
+                                        contentColor = if (scanMethod == "qr") Color.White else Color.Black.copy(alpha = 0.6f)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(Icons.Filled.QrCode2, null, Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Scan QR", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                                }
                             }
                         }
                     }
@@ -9407,6 +11458,306 @@ fun ChargeAmountScreen(
                 )
             ) {
                 Text("Continue", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+
+/** Transaction status — insufficient balance (layout aligned with verra-home home1.html). */
+@Composable
+private fun InsufficientBalanceScreen(
+    model: InsufficientBalanceUiModel,
+    onTopUp: () -> Unit,
+    onChargeAvailableBalance: () -> Unit,
+    onContinueCharge: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val haptic = LocalHapticFeedback.current
+    val bg = Color(0xFFF9F9FE)
+    val onSurface = Color(0xFF1A1C1F)
+    val onSurfaceVariant = Color(0xFF434654)
+    val errorC = Color(0xFFBA1A1A)
+    val errorContainer = Color(0xFFFFDAD6)
+    val onErrorContainer = Color(0xFF93000A)
+    val primaryBlue = Color(0xFF003692)
+    val surfaceLow = Color(0xFFF3F3F8)
+    val surfaceHigh = Color(0xFFE7E8ED)
+    val secondaryBlue = Color(0xFF266AF8)
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(bg)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.statusBars)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(BACK_BUTTON_TOP_BAR_HEIGHT)
+            ) {
+                BackButtonIcon(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onCancel()
+                    },
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = BACK_BUTTON_START_PADDING)
+                )
+                Text(
+                    "Transaction Status",
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = primaryBlue,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(horizontal = 48.dp)
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(horizontal = 24.dp)
+                    .padding(bottom = 16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Box(
+                    modifier = Modifier
+                        .size(56.dp)
+                        .background(errorContainer, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.AccountBalanceWallet,
+                        contentDescription = null,
+                        modifier = Modifier.size(32.dp),
+                        tint = onErrorContainer
+                    )
+                }
+                Text(
+                    "Insufficient Balance",
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = onSurface,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 16.dp)
+                )
+                Text(
+                    "Your wallet requires additional funds to complete this request.",
+                    fontSize = 14.sp,
+                    color = onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 8.dp, start = 8.dp, end = 8.dp)
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = surfaceLow),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Total Charge Amount", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = onSurfaceVariant)
+                            Text(
+                                model.totalChargeFormatted,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = onSurface,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Current Wallet Balance", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = onSurfaceVariant)
+                            Text(
+                                model.currentBalanceFormatted,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = onSurface,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                        HorizontalDivider(color = Color.Black.copy(alpha = 0.06f))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(errorContainer.copy(alpha = 0.22f), RoundedCornerShape(12.dp))
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                "SHORTFALL AMOUNT",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = errorC,
+                                letterSpacing = 1.sp
+                            )
+                            Text(
+                                model.shortfallFormatted,
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.Black,
+                                color = errorC,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = surfaceHigh.copy(alpha = 0.35f)),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                ) {
+                    Column(modifier = Modifier.padding(20.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        ) {
+                            Icon(Icons.Filled.Memory, contentDescription = null, tint = primaryBlue, modifier = Modifier.size(18.dp))
+                            Text(
+                                "SMART ROUTING ENGINE",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = primaryBlue,
+                                letterSpacing = 2.sp
+                            )
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Voucher Deduction", fontSize = 14.sp, color = onSurfaceVariant)
+                            Text(model.voucherDeductionFormatted, fontSize = 14.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Tier discount", fontSize = 14.sp, color = onSurfaceVariant)
+                            Text(model.tierDiscountFormatted, fontSize = 14.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Tip", fontSize = 14.sp, color = onSurfaceVariant)
+                            Text(model.tipFormatted, fontSize = 14.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("Tax", fontSize = 14.sp, color = onSurfaceVariant)
+                            Text(model.taxFormatted, fontSize = 14.sp, color = onSurface, fontFamily = FontFamily.Monospace)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(28.dp))
+                if (model.availableBalanceUsdc6 > 0L) {
+                    Button(
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onChargeAvailableBalance()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp),
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = primaryBlue,
+                            contentColor = Color.White
+                        ),
+                        elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
+                    ) {
+                        Text("Charge Available Balance", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+                Button(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onTopUp()
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    shape = RoundedCornerShape(999.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = secondaryBlue,
+                        contentColor = Color.White
+                    ),
+                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 4.dp)
+                ) {
+                    Text("Top-Up", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onContinueCharge()
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(52.dp),
+                    shape = RoundedCornerShape(999.dp),
+                    border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.12f)),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = onSurface)
+                ) {
+                    Text("Continue Charge", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                TextButton(
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onCancel()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        "CANCEL TRANSACTION",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = errorC,
+                        letterSpacing = 2.sp
+                    )
+                }
             }
         }
     }

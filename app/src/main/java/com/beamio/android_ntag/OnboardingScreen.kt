@@ -150,17 +150,21 @@ fun OnboardingScreen(
     var tagError by remember { mutableStateOf("") }
     var lastValidatedTag by remember { mutableStateOf("") }
 
+    val onboardingHeaderLoading = loading || (step == 1 && tagStatus == "checking")
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .windowInsetsPadding(WindowInsets.statusBars)
             .verticalScroll(rememberScrollState())
     ) {
-        BackButtonTopBar(
-            onClick = {
-                if (step == 1) onBackToWelcome() else step = 1
-            }
-        )
+        if (!onboardingHeaderLoading) {
+            BackButtonTopBar(
+                onClick = {
+                    if (step == 1) onBackToWelcome() else step = 1
+                }
+            )
+        }
         Column(modifier = Modifier.padding(24.dp)) {
         Spacer(modifier = Modifier.height(16.dp))
         Text(
