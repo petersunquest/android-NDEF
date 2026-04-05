@@ -577,8 +577,12 @@ class MainActivity : ComponentActivity() {
         if (!BeamioWeb3Wallet.isInitialized()) return infraCardAddress()
         val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
         if (w.isEmpty()) return infraCardAddress()
+        val prev = beamioUserCardAssetAddressRuntime
         val resolved = fetchMyPosInfraCardAddressSync(w)
         if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
+            if (!resolved.equals(prev, ignoreCase = true)) {
+                runOnUiThread { dashboardMerchantProgramCardName = null }
+            }
             beamioUserCardAssetAddressRuntime = resolved
             Log.d("MyPosAddress", "[infra] sync before API use: $resolved")
         }
@@ -596,6 +600,10 @@ class MainActivity : ComponentActivity() {
                 val resolved = fetchMyPosInfraCardAddressSync(w)
                 runOnUiThread {
                     if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
+                        val prevInfra = beamioUserCardAssetAddressRuntime
+                        if (!resolved.equals(prevInfra, ignoreCase = true)) {
+                            dashboardMerchantProgramCardName = null
+                        }
                         beamioUserCardAssetAddressRuntime = resolved
                         cardMetadataTierCache.clear()
                         cardMetadataTierFromApiCache.clear()
@@ -696,6 +704,8 @@ class MainActivity : ComponentActivity() {
     /** 基础设施卡 metadata：`tierRoutingDiscounts.taxRatePercent`；折扣为所有 tier 一行拼接（15s home daemon） */
     private var dashboardInfraTaxPercent by mutableStateOf<Double?>(null)
     private var dashboardInfraDiscountSummary by mutableStateOf<String?>(null)
+    /** 当前 POS `merchantInfraCard` 对应行的 `cardName`（BeamioUserCard JSON metadata `name`）；与 iOS `homeMerchantProgramCardName` 对齐 */
+    private var dashboardMerchantProgramCardName by mutableStateOf<String?>(null)
 
     private val cardStatsVerifyLock = Any()
     @Volatile private var cardStatsVerifyThreadRunning = false
@@ -1032,14 +1042,22 @@ class MainActivity : ComponentActivity() {
                             val wallet = BeamioWeb3Wallet.getAddress()
                             if (wallet.isNullOrEmpty()) return@Thread
                             refreshMerchantInfraCardFromDbSync()
+                            val infra = infraCardAddress()
                             val (profile, admin) = fetchTerminalProfileSync(wallet)
+                            val assets = fetchWalletAssetsSync(wallet, forPostPayment = false, merchantInfraOnly = false)
                             val (charge, topUp) = fetchCardStatsSync(wallet)
+                            val programName = if (assets != null && assets.ok) {
+                                merchantProgramMetadataDisplayNameFromAssets(assets, infra)
+                            } else null
                             runOnUiThread {
                                 if (profile != null) terminalProfile = profile
                                 terminalAdminProfile = admin
                                 saveProfileCache(wallet, profile, admin)
                                 if (charge != null) cardChargeAmount = charge
                                 if (topUp != null) cardTopUpAmount = topUp
+                                if (assets != null && assets.ok) {
+                                    dashboardMerchantProgramCardName = programName
+                                }
                             }
                         }.start()
                     }
@@ -1419,6 +1437,7 @@ class MainActivity : ComponentActivity() {
                             cm?.setPrimaryClip(ClipData.newPlainText("url", readUrlText))
                         },
                         contentAboveCharge = { WelcomePanelNoAA(modifier = Modifier.fillMaxWidth(), compact = true) },
+                        merchantProgramCardName = dashboardMerchantProgramCardName,
                         infraRoutingTaxPercent = dashboardInfraTaxPercent,
                         infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
                         modifier = Modifier.fillMaxSize()
@@ -1434,6 +1453,7 @@ class MainActivity : ComponentActivity() {
                         topUpAmount = cardTopUpAmount,
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
+                        merchantProgramCardName = dashboardMerchantProgramCardName,
                         infraRoutingTaxPercent = dashboardInfraTaxPercent,
                         infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
                         onCopyWalletClick = {
@@ -5404,6 +5424,7 @@ class MainActivity : ComponentActivity() {
                     saveProfileCache(wallet, profile, admin)
                     if (assets != null && assets.ok) {
                         hasAAAccount = !assets.aaAddress.isNullOrEmpty()
+                        dashboardMerchantProgramCardName = merchantProgramMetadataDisplayNameFromAssets(assets, infraCardAddress())
                     } else {
                         hasAAAccount = true
                     }
@@ -7629,6 +7650,22 @@ private fun balanceDetailsCardNameLine(card: CardItem): String {
 }
 
 /**
+ * 首页黑卡：当前 `merchantInfraCard` 在 getWalletAssets `cards[]` 中的 `cardName`（metadata `name`）。
+ * 与 iOS [POSViewModel.merchantProgramMetadataDisplayName] 对齐。
+ */
+private fun merchantProgramMetadataDisplayNameFromAssets(assets: UIDAssets?, infra: String): String? {
+    val key = infra.trim()
+    if (key.isEmpty()) return null
+    val card = assets?.cards?.firstOrNull { it.cardAddress.trim().equals(key, ignoreCase = true) } ?: return null
+    val line = balanceDetailsCardNameLine(card)
+    if (line == "—" || line.isBlank()) return null
+    if (line.equals("Infrastructure card", ignoreCase = true)) return null
+    if (line.equals("Asset Card", ignoreCase = true)) return null
+    if (line.equals("Card", ignoreCase = true)) return null
+    return line
+}
+
+/**
  * Pass Hero 左上主名：与 [ReadScreen] Balance Loaded 一致 —
  * `beamioTag`（无 @）→ 短钱包地址 → 非泛化的 cardName → `"Member"`。
  */
@@ -9848,6 +9885,8 @@ fun NdefScreen(
     topUpAmount: Double? = null,
     chargeStatsRpcWarning: Boolean = false,
     topUpStatsRpcWarning: Boolean = false,
+    /** Program / infrastructure BeamioUserCard metadata `name` (`cards[].cardName`) for home black card */
+    merchantProgramCardName: String? = null,
     /** From on-chain admin metadata `tierRoutingDiscounts.taxRatePercent`; null until first successful 15s sync */
     infraRoutingTaxPercent: Double? = null,
     /** One line: all tier `discountPercent` in JSON order, e.g. `5% · 10% · 18%` */
@@ -10035,6 +10074,19 @@ fun NdefScreen(
                                 HomeDashboardStatLoadingPlaceholder(alignEnd = true)
                             }
                         }
+                    }
+                    val programLine = merchantProgramCardName?.trim().orEmpty()
+                    if (programLine.isNotEmpty()) {
+                        Text(
+                            text = programLine,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White.copy(alpha = 0.88f),
+                            maxLines = 2,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 10.dp)
+                        )
                     }
                     HomeDashboardTaxAndTierRoutingRow(
                         taxPercent = infraRoutingTaxPercent,
