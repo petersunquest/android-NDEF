@@ -32,6 +32,9 @@ internal val BACK_BUTTON_TOP_PADDING = 12.dp
 /** Top padding for scan page capsule and Charge/TopUp title. Align title with capsule. */
 internal val TOP_BAR_CAPSULE_TITLE_PADDING = 56.dp
 
+/** Nav-back arrow tint: 30% black. Use for all page `ArrowBack` controls (pill bar + text variant). */
+internal val BACK_BUTTON_ICON_TINT = Color.Black.copy(alpha = 0.3f)
+
 /** Unified back button style: grey border 0.1dp, shadow, rounded background. Used across the app. */
 private val BackButtonModifier = Modifier
     .shadow(4.dp, RoundedCornerShape(24.dp))
@@ -51,7 +54,7 @@ fun BackButtonIcon(
             Icons.AutoMirrored.Filled.ArrowBack,
             contentDescription = "Back",
             modifier = Modifier.size(24.dp),
-            tint = Color(0xFF374151)
+            tint = BACK_BUTTON_ICON_TINT
         )
     }
 }
@@ -93,8 +96,8 @@ fun BackButtonWithText(
             Icons.AutoMirrored.Filled.ArrowBack,
             contentDescription = "Back",
             modifier = Modifier.size(24.dp).padding(end = 4.dp),
-            tint = Color(0xFF1562f0)
+            tint = BACK_BUTTON_ICON_TINT
         )
-        Text("Back", fontSize = 17.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
+        Text("Back", fontSize = 17.sp, fontWeight = FontWeight.Medium, color = BACK_BUTTON_ICON_TINT)
     }
 }
