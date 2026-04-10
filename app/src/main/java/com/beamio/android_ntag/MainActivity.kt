@@ -29,6 +29,7 @@ import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
 import android.view.View
+import android.widget.Toast
 import android.graphics.pdf.PdfDocument
 import android.graphics.Paint
 import android.graphics.Typeface
@@ -432,6 +433,8 @@ class MainActivity : ComponentActivity() {
         private const val PREFS_PROFILE_CACHE = "beamio_profile_cache"
         /** 本机 POS 钱包 onboarding 注册的 beamioTag（key: registered_beamio_tag:<walletLower>） */
         private const val PREF_KEY_PREFIX_REGISTERED_BEAMIO_TAG = "registered_beamio_tag:"
+        /** 与 iOS `terminalPermissionAutoSentKey`：onboarding 后自动发 CoNET 权限申请仅一次 */
+        private const val PREF_KEY_PREFIX_TERMINAL_PERMISSION_AUTO_SENT = "terminal_permission_auto_sent:"
         /** POS 为链上 owner 直属 admin 时，QR/NFC Charge 需附 chargeOwnerChildBurn；与链上 adminParent(eoa)==owner(card) 一致 */
         private const val PREF_KEY_CHARGE_OWNER_CHILD_ELIGIBLE = "charge_owner_child_burn_eligible"
         private const val PREF_KEY_CHARGE_OWNER_CHILD_CARD = "charge_owner_child_burn_card"
@@ -738,6 +741,8 @@ class MainActivity : ComponentActivity() {
     private var permissionGateParentTagLine by mutableStateOf("")
     private var showChangeParentWorkspaceDialog by mutableStateOf(false)
     private var changeParentTagDraft by mutableStateOf("")
+    /** Waiting 页「Resend approval request」：CoNET 发送进行中，防重复点 */
+    private var awaitingParentResendInFlight by mutableStateOf(false)
 
     private val cameraPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) qrScanningActive = true
@@ -1068,6 +1073,11 @@ class MainActivity : ComponentActivity() {
                         }.start()
                     }
                 }
+                /**
+                 * 与 iOS `runParentPermissionGatePollLoop` / `refreshHomeProfiles`：
+                 * - 非门控：首帧一次 `runHomeDashboardBackgroundRefreshSync`（若当前无在飞 refresh）。
+                 * - Waiting 门控：不立即拉取；先 `delay(6s)`，再每 6s 一轮；若 `homeDashboardRefreshInFlight` 则本轮放弃（不叠跑）。
+                 */
                 LaunchedEffect(showWelcomePage, showOnboardingScreen, hasAAAccount, showAwaitingParentPermissionGate) {
                     if (showWelcomePage || showOnboardingScreen || !BeamioWeb3Wallet.isInitialized()) return@LaunchedEffect
                     val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
@@ -1075,19 +1085,24 @@ class MainActivity : ComponentActivity() {
                     val (cachedTerm, cachedAdmin) = loadProfileCache(wallet)
                     terminalProfile = mergeTerminalProfileWithRegisteredTag(wallet, cachedTerm)
                     terminalAdminProfile = cachedAdmin
-                    Thread { runHomeDashboardBackgroundRefreshSync(wallet) }.start()
-                    if (!showAwaitingParentPermissionGate) return@LaunchedEffect
+                    if (!showAwaitingParentPermissionGate) {
+                        if (!homeDashboardRefreshInFlight) {
+                            Thread { runHomeDashboardBackgroundRefreshSync(wallet) }.start()
+                        }
+                        return@LaunchedEffect
+                    }
                     while (true) {
-                        delay(6000)
+                        delay(6_000L)
                         if (!showAwaitingParentPermissionGate) break
+                        if (homeDashboardRefreshInFlight) continue
                         Thread { runHomeDashboardBackgroundRefreshSync(wallet) }.start()
                     }
                 }
-                LaunchedEffect(showWelcomePage, showOnboardingScreen, showTopupScreen, showReadScreen, showScanMethodScreen, showAmountInputScreen, showTipScreen, showPaymentScreen, showInitFlowScreen, insufficientBalanceUi) {
+                LaunchedEffect(showWelcomePage, showOnboardingScreen, showTopupScreen, showReadScreen, showScanMethodScreen, showAmountInputScreen, showTipScreen, showPaymentScreen, showInitFlowScreen, insufficientBalanceUi, showAwaitingParentPermissionGate) {
                     val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
                         !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
                         insufficientBalanceUi == null
-                    if (onHome) {
+                    if (onHome && !showAwaitingParentPermissionGate) {
                         Thread { prefetchInfraCardMetadata() }.start()
                     }
                 }
@@ -1102,12 +1117,13 @@ class MainActivity : ComponentActivity() {
                     showTipScreen,
                     showPaymentScreen,
                     showInitFlowScreen,
-                    insufficientBalanceUi
+                    insufficientBalanceUi,
+                    showAwaitingParentPermissionGate
                 ) {
                     val onHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
                         !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
                         insufficientBalanceUi == null
-                    if (!onHome || !BeamioWeb3Wallet.isInitialized()) return@LaunchedEffect
+                    if (!onHome || !BeamioWeb3Wallet.isInitialized() || showAwaitingParentPermissionGate) return@LaunchedEffect
                     while (isActive) {
                         val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
                         if (wallet.isNotEmpty()) {
@@ -1136,6 +1152,9 @@ class MainActivity : ComponentActivity() {
                 val linkAppQrBitmap = androidx.compose.runtime.remember(linkAppDeepLinkUrl) {
                     if (linkAppDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(linkAppDeepLinkUrl)
                 }
+                val posAtPrimaryHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
+                    !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
+                    insufficientBalanceUi == null
                 when {
                     insufficientBalanceUi != null -> InsufficientBalanceScreen(
                         model = insufficientBalanceUi!!,
@@ -1163,6 +1182,8 @@ class MainActivity : ComponentActivity() {
                                 WalletStorageManager.savePrivateKey(this@MainActivity, privateKeyHex)
                                 BeamioWeb3Wallet.init(privateKeyHex)
                                 val addr = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+                                val pkForConet = privateKeyHex.trim().removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+                                var tagLineForConet = ""
                                 if (addr.isNotEmpty()) {
                                     resetTrustedInfraPosHomeAccessForWallet(addr)
                                     val parentNorm = normalizeParentWorkspaceTag(parentForPending)
@@ -1170,12 +1191,13 @@ class MainActivity : ComponentActivity() {
                                         persistPendingParentWorkspaceTag(addr, parentNorm)
                                         permissionGateParentTagLine = parentNorm
                                     } else {
-                                        permissionGateParentTagLine = loadPendingParentWorkspaceTag(addr.lowercase(Locale.US)).orEmpty()
+                                        permissionGateParentTagLine = loadPendingParentWorkspaceTag(addr).orEmpty()
                                     }
                                     showAwaitingParentPermissionGate = true
                                     persistRegisteredTerminalBeamioTag(addr, registeredBeamioAccountName)
                                     val tagLine = registeredBeamioAccountName.trim().lowercase(Locale.US)
                                         .let { t -> var x = t; while (x.startsWith("@")) x = x.removePrefix("@").trim(); x }
+                                    tagLineForConet = tagLine
                                     if (tagLine.isNotEmpty()) {
                                         terminalProfile = TerminalProfile(
                                             accountName = tagLine,
@@ -1192,6 +1214,17 @@ class MainActivity : ComponentActivity() {
                                 onboardingParentBeamioTag = ""
                                 showOnboardingScreen = false
                                 ensureMyPosInfraCardAddressLoaded()
+                                if (addr.isNotEmpty() && pkForConet.length == 64) {
+                                    val parentNormForConet = normalizeParentWorkspaceTag(parentForPending)
+                                    Thread {
+                                        maybeRunCoNetTerminalParentPermissionAfterOnboarding(
+                                            privateKeyHexNo0x = pkForConet,
+                                            childAddress0x = addr,
+                                            childBeamioTag = tagLineForConet,
+                                            parentNormalizedNoAt = parentNormForConet,
+                                        )
+                                    }.start()
+                                }
                             },
                             onBackToWelcome = {
                                 onboardingParentBeamioTag = ""
@@ -1458,6 +1491,52 @@ class MainActivity : ComponentActivity() {
                         onBack = { closePaymentScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
+                    posAtPrimaryHome && showAwaitingParentPermissionGate && BeamioWeb3Wallet.isInitialized() -> Box(Modifier.fillMaxSize()) {
+                        AwaitingParentWorkspacePermissionScreen(
+                            parentTagLine = permissionGateParentTagLine,
+                            resendCoNetInProgress = awaitingParentResendInFlight,
+                            onResendApprovalCoNet = { resendTerminalParentPermissionCoNetFromUi() },
+                            onChangeWorkspaceParent = {
+                                changeParentTagDraft = permissionGateParentTagLine
+                                showChangeParentWorkspaceDialog = true
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (showChangeParentWorkspaceDialog) {
+                            AlertDialog(
+                                onDismissRequest = { showChangeParentWorkspaceDialog = false },
+                                title = { Text("Change workspace parent") },
+                                text = {
+                                    OutlinedTextField(
+                                        value = changeParentTagDraft,
+                                        onValueChange = { changeParentTagDraft = it },
+                                        label = { Text("Parent @BeamioTag") },
+                                        singleLine = true,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                },
+                                confirmButton = {
+                                    TextButton(onClick = {
+                                        val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+                                        if (w.isNotEmpty()) {
+                                            val norm = normalizeParentWorkspaceTag(changeParentTagDraft)
+                                            if (norm.isNotEmpty()) {
+                                                persistPendingParentWorkspaceTag(w, norm)
+                                                permissionGateParentTagLine = norm
+                                            }
+                                            showChangeParentWorkspaceDialog = false
+                                            Thread { runHomeDashboardBackgroundRefreshSync(w) }.start()
+                                        } else {
+                                            showChangeParentWorkspaceDialog = false
+                                        }
+                                    }) { Text("Save") }
+                                },
+                                dismissButton = {
+                                    TextButton(onClick = { showChangeParentWorkspaceDialog = false }) { Text("Cancel") }
+                                }
+                            )
+                        }
+                    }
                     hasAAAccount == false -> NdefScreen(
                         uidText = uidText,
                         readUrlText = readUrlText,
@@ -5168,21 +5247,386 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun prefsKeyLastTrustedInfraPosHomeAccess(walletLower: String) =
+        "last_trusted_infra_pos_home_access:$walletLower"
+
+    private fun prefsKeyPendingParentWorkspaceTag(walletLower: String) =
+        "pending_parent_workspace_tag:$walletLower"
+
+    private fun normalizeParentWorkspaceTag(raw: String): String {
+        var s = raw.trim()
+        while (s.startsWith("@")) s = s.removePrefix("@").trim()
+        s = s.replace("@", "")
+        return s.trim().lowercase(Locale.US)
+    }
+
+    private fun loadLastTrustedInfraPosHomeAccess(walletLower: String): Boolean? {
+        val prefs = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+        val k = prefsKeyLastTrustedInfraPosHomeAccess(walletLower)
+        if (!prefs.contains(k)) return null
+        return prefs.getBoolean(k, false)
+    }
+
+    private fun persistTrustedInfraPosHomeAccess(walletLower: String, allowed: Boolean) {
+        getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+            .putBoolean(prefsKeyLastTrustedInfraPosHomeAccess(walletLower), allowed)
+            .apply()
+    }
+
+    private fun resetTrustedInfraPosHomeAccessForWallet(wallet: String) {
+        val wl = wallet.trim().lowercase(Locale.US)
+        if (wl.isEmpty()) return
+        getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+            .remove(prefsKeyLastTrustedInfraPosHomeAccess(wl))
+            .apply()
+    }
+
+    private fun persistPendingParentWorkspaceTag(wallet: String, normalizedTagNoAt: String) {
+        val wl = wallet.trim().lowercase(Locale.US)
+        if (wl.isEmpty() || normalizedTagNoAt.isEmpty()) return
+        getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+            .putString(prefsKeyPendingParentWorkspaceTag(wl), normalizedTagNoAt)
+            .apply()
+    }
+
+    private fun loadPendingParentWorkspaceTag(wallet: String): String? {
+        val wl = wallet.trim().lowercase(Locale.US)
+        if (wl.isEmpty()) return null
+        return getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+            .getString(prefsKeyPendingParentWorkspaceTag(wl), null)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun clearTerminalParentPermissionPendingStateSync(wallet: String) {
+        val wl = wallet.trim().lowercase(Locale.US)
+        if (wl.isEmpty()) return
+        getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+            .remove(prefsKeyPendingParentWorkspaceTag(wl))
+            .apply()
+    }
+
     /**
-     * 拉取终端 profile 与上层 merchant 胶囊（owner 或上级 admin）。
-     * 与 iOS [POSViewModel.refreshHomeProfiles] / Cluster `getCardAdminInfo` 语义对齐：`upperAdmin` 若与 `owner` 相同（直属 owner 的 admin）仍解析该 owner；
-     * `upperAdmin` 为空时回退 `owner`（与 iOS `upperAdmin ?? owner` 一致）。首页右侧胶囊**仅当** `search-users` 有结果时展示，无结果则隐藏。
+     * Onboarding 完成后：若尚未在 program 卡 admin 树则注册 CoNET Chat、发送 `beamio_pos_terminal_permission_v1` gossip（自动仅一次）。
+     * 对齐 iOS [POSViewModel.maybeRunTerminalParentCoNetPermissionFlowAfterOnboarding]。
      */
-    private fun fetchTerminalProfileSync(wallet: String): Pair<TerminalProfile?, TerminalProfile?> {
-        refreshMerchantInfraCardFromDbSync()
-        val profile = fetchSearchUsersSync(wallet)
-        val root = fetchGetCardAdminInfoJsonSync(wallet)
-        val ownerAddr = root?.optString("owner")?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim()
-        val upperRaw = root?.optString("upperAdmin")?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim()
-        val adminLookupAddr = upperRaw?.takeIf { it.isNotEmpty() } ?: ownerAddr?.takeIf { it.isNotEmpty() }
-        val adminProfile = adminLookupAddr?.let { fetchSearchUsersSync(it) }
-        syncChargeOwnerChildBurnEligibilityCache(wallet)
-        return Pair(profile, adminProfile)
+    private fun maybeRunCoNetTerminalParentPermissionAfterOnboarding(
+        privateKeyHexNo0x: String,
+        childAddress0x: String,
+        childBeamioTag: String,
+        parentNormalizedNoAt: String,
+    ) {
+        try {
+            val parentNorm = normalizeParentWorkspaceTag(parentNormalizedNoAt)
+            if (parentNorm.isEmpty()) {
+                Log.d("BeamioConetPOS", "maybeRun: skip (no parent tag)")
+                return
+            }
+            val wallet = childAddress0x.trim().lowercase(Locale.US).let { w ->
+                if (w.startsWith("0x", true)) w else "0x$w"
+            }
+            refreshMerchantInfraCardFromDbSync()
+            val infra = infraCardAddress()
+            val detail = posTerminalTrustedProgramCardAccessDetailSync(wallet, infra)
+            if (detail?.allowed == true) {
+                Log.d("BeamioConetPOS", "maybeRun: skip already on program card (trusted access)")
+                return
+            }
+            val wl = wallet.removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+            val prefs = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+            val autoKey = PREF_KEY_PREFIX_TERMINAL_PERMISSION_AUTO_SENT + wl
+            if (prefs.getBoolean(autoKey, false)) {
+                Log.d("BeamioConetPOS", "maybeRun: skip auto-sent already done for this wallet")
+                return
+            }
+            Log.d("BeamioConetPOS", "maybeRun: start CoNET flow parent=$parentNorm infra=${infra.take(12)}…")
+            val walletCs = BeamioOnboardingApi.toChecksumAddress0x(wl)
+            val pk = privateKeyHexNo0x.trim().removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+            if (pk.length != 64) return
+            val regOk = BeamioConetTerminalMessaging.ensureRegisteredForSenderGossip(pk, walletCs)
+            if (!regOk) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not register CoNET chat keys for this device. Check the network and try again.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return
+            }
+            val parentProf = fetchSearchUsersSync(parentNorm)
+                ?: fetchSearchUsersSync("@$parentNorm")
+            val parentEoa = parentProf?.address?.trim()?.takeIf { looksLikeEthereumAddress(it) }
+            if (parentEoa.isNullOrEmpty()) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not find the parent workspace on Beamio.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return
+            }
+            val pk0x = "0x$pk"
+            val sent = BeamioConetTerminalMessaging.sendTerminalPermissionRequest(
+                recipientEoa = parentEoa,
+                childEoa = wallet,
+                childBeamioTag = childBeamioTag,
+                parentBeamioTag = parentNorm,
+                walletPrivateKeyHexWith0x = pk0x,
+            )
+            runOnUiThread {
+                if (sent) {
+                    prefs.edit().putBoolean(autoKey, true).apply()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "A permission request was sent to your workspace parent via CoNET. You can continue when they approve.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not send the CoNET permission request. Check the network and try again.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("BeamioConetPOS", "maybeRunCoNetTerminalParentPermissionAfterOnboarding", e)
+        }
+    }
+
+    /**
+     * Waiting 页「Resend approval request」：与 onboarding 后同一 CoNET 流程
+     *（ensureRegisteredForSenderGossip + [BeamioConetTerminalMessaging.sendTerminalPermissionRequest]）。
+     */
+    private fun resendTerminalParentPermissionCoNetFromUi() {
+        val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+        val pk = WalletStorageManager.loadPrivateKey(this)?.trim().orEmpty()
+        if (w.isEmpty() || pk.isNullOrEmpty()) return
+        var parentRaw = permissionGateParentTagLine.ifEmpty { loadPendingParentWorkspaceTag(w).orEmpty() }
+        parentRaw = normalizeParentWorkspaceTag(parentRaw)
+        if (parentRaw.isEmpty()) {
+            Toast.makeText(
+                this,
+                "No workspace parent is set. Use Change workspace parent to pick one.",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        if (awaitingParentResendInFlight) return
+        awaitingParentResendInFlight = true
+        val tagLine = terminalChildBeamioTagForCoNet(w)
+        Thread {
+            try {
+                maybeRunCoNetTerminalParentPermissionResendWorker(pk, w, tagLine, parentRaw)
+            } finally {
+                runOnUiThread { awaitingParentResendInFlight = false }
+            }
+        }.start()
+    }
+
+    private fun terminalChildBeamioTagForCoNet(wallet0x: String): String {
+        val raw = terminalProfile?.accountName?.trim().orEmpty()
+        var x = raw
+        while (x.startsWith("@")) x = x.removePrefix("@").trim()
+        x = x.replace("@", "")
+        if (x.isNotEmpty()) return x.lowercase(Locale.US)
+        return loadRegisteredTerminalBeamioTag(wallet0x).orEmpty()
+    }
+
+    private fun maybeRunCoNetTerminalParentPermissionResendWorker(
+        privateKeyHexNo0x: String,
+        childAddress0x: String,
+        childBeamioTag: String,
+        parentNormalizedNoAt: String,
+    ) {
+        try {
+            val wallet = childAddress0x.trim().lowercase(Locale.US).let { a ->
+                if (a.startsWith("0x", true)) a else "0x$a"
+            }
+            val wl = wallet.removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+            val walletCs = BeamioOnboardingApi.toChecksumAddress0x(wl)
+            val pk = privateKeyHexNo0x.trim().removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+            if (pk.length != 64) return
+            val regOk = BeamioConetTerminalMessaging.ensureRegisteredForSenderGossip(pk, walletCs)
+            if (!regOk) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not register CoNET chat keys for this device. Check the network and try again.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return
+            }
+            val parentNorm = normalizeParentWorkspaceTag(parentNormalizedNoAt)
+            val parentProf = fetchSearchUsersSync(parentNorm)
+                ?: fetchSearchUsersSync("@$parentNorm")
+            val parentEoa = parentProf?.address?.trim()?.takeIf { looksLikeEthereumAddress(it) }
+            if (parentEoa.isNullOrEmpty()) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not find the parent workspace on Beamio.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return
+            }
+            val pk0x = "0x$pk"
+            val sent = BeamioConetTerminalMessaging.sendTerminalPermissionRequest(
+                recipientEoa = parentEoa,
+                childEoa = wallet,
+                childBeamioTag = childBeamioTag,
+                parentBeamioTag = parentNorm,
+                walletPrivateKeyHexWith0x = pk0x,
+            )
+            runOnUiThread {
+                if (sent) {
+                    Toast.makeText(this@MainActivity, "Approval request sent again.", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Could not send the CoNET permission request. Check the network and try again.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("BeamioConetPOS", "maybeRunCoNetTerminalParentPermissionResendWorker", e)
+        }
+    }
+
+    /** 与 iOS `BeamioAPIClient.fetchPosProgramCardHomeAccessAllowed`：优先链上 owner / isAdmin */
+    private fun fetchPosProgramCardHomeAccessAllowedSync(cardAddress: String, wallet: String): Boolean? {
+        val cardRaw = cardAddress.trim()
+        val walRaw = wallet.trim()
+        if (!cardRaw.startsWith("0x", true) || cardRaw.length != 42) return null
+        if (!walRaw.startsWith("0x", true) || walRaw.length != 42) return null
+        val cardHex = cardRaw.lowercase(Locale.US)
+        val walBody = walRaw.removePrefix("0x").removePrefix("0X").lowercase(Locale.US)
+        if (walBody.length != 40 || !walBody.all { it in '0'..'9' || it in 'a'..'f' }) return null
+        val ownerHex = jsonRpcEthCall(cardHex, "0x8da5cb5b") ?: return null
+        val owner40 = decodeAbiAddressWord(ownerHex)?.removePrefix("0x")?.lowercase(Locale.US) ?: return null
+        if (owner40 == walBody) return true
+        val isAdminData = "0x24d7806c" + walBody.padStart(64, '0')
+        val iaRes = jsonRpcEthCall(cardHex, isAdminData) ?: return null
+        return decodeAbiBoolWord(iaRes)
+    }
+
+    /** 与 iOS `POSViewModel.walletHasTrustedInfraPosHomeAccess` */
+    private fun walletHasTrustedInfraPosHomeAccessFromRoot(root: org.json.JSONObject, walletLower: String): Boolean {
+        val wl = walletLower.trim().lowercase(Locale.US)
+        val ow = root.optString("owner").trim().lowercase(Locale.US)
+            .takeIf { it.isNotEmpty() && !it.equals("null", true) } ?: ""
+        if (ow.isNotEmpty() && wl == ow) return true
+        val ua = root.optString("upperAdmin").trim().lowercase(Locale.US)
+            .takeIf { it.isNotEmpty() && !it.equals("null", true) } ?: ""
+        if (ua.isNotEmpty() && wl == ua) return true
+        val admins = root.optJSONArray("admins") ?: return false
+        for (i in 0 until admins.length()) {
+            if (admins.optString(i, "").trim().lowercase(Locale.US) == wl) return true
+        }
+        return false
+    }
+
+    private data class PosTrustedProgramCardAccessDetail(
+        val allowed: Boolean,
+        val httpRoot: org.json.JSONObject?,
+    )
+
+    /** 与 iOS `posTerminalTrustedProgramCardAccessDetail`：`nil` = 链上与 HTTP 均不可信 */
+    private fun posTerminalTrustedProgramCardAccessDetailSync(wallet: String, infra: String): PosTrustedProgramCardAccessDetail? {
+        val chain = fetchPosProgramCardHomeAccessAllowedSync(infra, wallet)
+        if (chain != null) return PosTrustedProgramCardAccessDetail(allowed = chain, httpRoot = null)
+        val root = fetchGetCardAdminInfoJsonSync(wallet) ?: return null
+        val allowed = walletHasTrustedInfraPosHomeAccessFromRoot(root, wallet)
+        return PosTrustedProgramCardAccessDetail(allowed, root)
+    }
+
+    /**
+     * 与 iOS [POSViewModel.refreshHomeProfiles] 同序：先 reconcile program 卡准入，再仅 `upperAdmin` → search-users 解析右侧胶囊（无 owner 回退）。
+     */
+    private fun runHomeDashboardBackgroundRefreshSync(wallet: String) {
+        val wTrim = wallet.trim()
+        val wl = wTrim.lowercase(Locale.US)
+        if (wl.isEmpty()) return
+        synchronized(homeDashboardRefreshLock) {
+            if (homeDashboardRefreshInFlight) return
+            homeDashboardRefreshInFlight = true
+        }
+        try {
+            refreshMerchantInfraCardFromDbSync()
+            val infra = infraCardAddress()
+            val detail = posTerminalTrustedProgramCardAccessDetailSync(wTrim, infra)
+            val pendingLine = loadPendingParentWorkspaceTag(wTrim).orEmpty()
+
+            if (detail != null) {
+                persistTrustedInfraPosHomeAccess(wl, detail.allowed)
+            }
+
+            if (detail == null) {
+                runOnUiThread {
+                    permissionGateParentTagLine = pendingLine
+                    showAwaitingParentPermissionGate = true
+                    terminalAdminProfile = null
+                }
+            } else if (!detail.allowed) {
+                runOnUiThread {
+                    permissionGateParentTagLine = pendingLine
+                    showAwaitingParentPermissionGate = true
+                    terminalAdminProfile = null
+                }
+            } else {
+                clearTerminalParentPermissionPendingStateSync(wTrim)
+                runOnUiThread {
+                    showAwaitingParentPermissionGate = false
+                    permissionGateParentTagLine = ""
+                }
+            }
+
+            val rootForAdmin = if (detail?.allowed == true) {
+                detail.httpRoot ?: fetchGetCardAdminInfoJsonSync(wTrim)
+            } else {
+                null
+            }
+            val upperRaw = rootForAdmin?.optString("upperAdmin")
+                ?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim()
+            val adminProfile = upperRaw?.let { fetchSearchUsersSync(it) }
+
+            val profile = fetchSearchUsersSync(wTrim)
+            syncChargeOwnerChildBurnEligibilityCache(wTrim)
+
+            val assets = fetchWalletAssetsSync(wTrim, forPostPayment = false, merchantInfraOnly = false)
+            val (charge, topUp) = fetchCardStatsSync(wTrim)
+            val programName = if (assets != null && assets.ok) {
+                merchantProgramMetadataDisplayNameFromAssets(assets, infra)
+            } else null
+            val routing = if (detail?.allowed == true) fetchInfraRoutingForTerminalWalletSync(wTrim) else null
+
+            runOnUiThread {
+                terminalProfile = mergeTerminalProfileWithRegisteredTag(wTrim, profile)
+                terminalAdminProfile = adminProfile
+                saveProfileCache(wTrim, profile, adminProfile)
+                if (charge != null) cardChargeAmount = charge
+                if (topUp != null) cardTopUpAmount = topUp
+                if (assets != null && assets.ok) {
+                    hasAAAccount = !assets.aaAddress.isNullOrEmpty()
+                    dashboardMerchantProgramCardName = programName
+                } else {
+                    hasAAAccount = true
+                }
+                if (routing != null) {
+                    dashboardInfraTaxPercent = routing.first
+                    dashboardInfraDiscountSummary = routing.second
+                }
+            }
+        } catch (_: Exception) {
+            // best-effort
+        } finally {
+            homeDashboardRefreshInFlight = false
+        }
     }
 
     /**
@@ -5705,28 +6149,7 @@ class MainActivity : ComponentActivity() {
             val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
             if (wallet.isEmpty()) return@Thread
             try {
-                refreshMerchantInfraCardFromDbSync()
-                val (profile, admin) = fetchTerminalProfileSync(wallet)
-                val assets = fetchWalletAssetsSync(wallet, forPostPayment = false, merchantInfraOnly = false)
-                val (charge, topUp) = fetchCardStatsSync(wallet)
-                val routing = fetchInfraRoutingForTerminalWalletSync(wallet)
-                runOnUiThread {
-                    terminalProfile = mergeTerminalProfileWithRegisteredTag(wallet, profile)
-                    terminalAdminProfile = admin
-                    saveProfileCache(wallet, profile, admin)
-                    if (assets != null && assets.ok) {
-                        hasAAAccount = !assets.aaAddress.isNullOrEmpty()
-                        dashboardMerchantProgramCardName = merchantProgramMetadataDisplayNameFromAssets(assets, infraCardAddress())
-                    } else {
-                        hasAAAccount = true
-                    }
-                    if (charge != null) cardChargeAmount = charge
-                    if (topUp != null) cardTopUpAmount = topUp
-                    if (routing != null) {
-                        dashboardInfraTaxPercent = routing.first
-                        dashboardInfraDiscountSummary = routing.second
-                    }
-                }
+                runHomeDashboardBackgroundRefreshSync(wallet)
             } catch (_: Exception) {
                 // best-effort
             }
@@ -10162,6 +10585,90 @@ private fun HomeDashboardTaxAndTierRoutingRow(
             taxPlaceable.placeRelative(0, (h - taxPlaceable.height) / 2)
             tierPlaceable.placeRelative(taxPlaceable.width + spacingPx, (h - tierPlaceable.height) / 2)
         }
+    }
+}
+
+/** 对齐 iOS `AwaitingParentWorkspacePermissionOverlay`（文案英文化，见 ui-english） */
+@Composable
+internal fun AwaitingParentWorkspacePermissionScreen(
+    parentTagLine: String,
+    /** CoNET `beamio_pos_terminal_permission_v1` 重发进行中 */
+    resendCoNetInProgress: Boolean = false,
+    /** 再次向 parent 发送 CoNET 权限申请（与 onboarding 自动发送同 workflow） */
+    onResendApprovalCoNet: () -> Unit,
+    onChangeWorkspaceParent: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val brandBlue = Color(0xFF1562F0)
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Spacer(Modifier.height(32.dp))
+        CircularProgressIndicator(color = brandBlue, modifier = Modifier.size(48.dp))
+        Spacer(Modifier.height(28.dp))
+        Text(
+            "Waiting for workspace authorization",
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 8.dp)
+        )
+        if (parentTagLine.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Requesting approval from parent @$parentTagLine",
+                fontSize = 15.sp,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            if (parentTagLine.isEmpty()) {
+                "This wallet is not yet on this terminal's Beamio card admin list. The app checks for access automatically."
+            } else {
+                "Sending a secure CoNET message to your workspace parent. You can use this terminal when they approve."
+            },
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        )
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = onResendApprovalCoNet,
+            enabled = !resendCoNetInProgress,
+            colors = ButtonDefaults.buttonColors(containerColor = brandBlue),
+            modifier = Modifier.fillMaxWidth(0.92f)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+            ) {
+                if (resendCoNetInProgress) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                }
+                Text("Resend approval request")
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = onChangeWorkspaceParent,
+            modifier = Modifier.fillMaxWidth(0.92f)
+        ) { Text("Change workspace parent") }
+        Spacer(Modifier.height(48.dp))
     }
 }
 

@@ -12,6 +12,10 @@
 
 -keep class org.bouncycastle.** { *; }
 -dontwarn org.bouncycastle.**
+
+# --- PGPainless (CoNET chat route + gossip encrypt) ---
+-keep class org.pgpainless.** { *; }
+-dontwarn org.pgpainless.**
 -dontwarn javax.naming.**
 
 # --- ZXing (embedded scanner) ---

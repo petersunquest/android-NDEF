@@ -22,7 +22,7 @@ android {
         applicationId = "com.beamio.android_ntag"
         minSdk = 24
         targetSdk = 35
-        versionCode = 6
+        versionCode = 7
         versionName = "1.0.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -88,6 +88,8 @@ dependencies {
     implementation("org.web3j:core:4.10.3")
     implementation("org.web3j:crypto:4.10.3")
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpg-jdk18on:1.78.1")
+    implementation("org.pgpainless:pgpainless-core:1.6.7")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
