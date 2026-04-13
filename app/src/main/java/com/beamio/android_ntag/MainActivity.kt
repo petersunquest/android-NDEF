@@ -65,6 +65,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -123,9 +124,9 @@ import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AttachMoney
 import androidx.compose.material.icons.filled.CreditCard
-import androidx.compose.material.icons.filled.WifiTethering
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Memory
@@ -189,7 +190,9 @@ import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.min
 import kotlin.math.roundToInt
+import java.math.BigDecimal
 import java.math.BigInteger
+import java.math.RoundingMode
 import java.text.NumberFormat
 import java.util.concurrent.CountDownLatch
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -209,6 +212,63 @@ import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
+
+/** iOS `AppStorage("pos.topup.lastPaymentMethod")`；prefs 文件与 [MainActivity] `PREFS_PROFILE_CACHE` 一致 */
+private const val PREF_POS_TOPUP_LAST_PAYMENT_METHOD = "pos.topup.lastPaymentMethod"
+private const val PREFS_BEAMIO_PROFILE_CACHE = "beamio_profile_cache"
+
+/** `/api/myPosAddress` → `terminalMetadata.allowedTopupMethods`（与 bizSite onboarding 一致）。 */
+private data class BeamioPosTerminalPolicy(
+    val allowTopupCash: Boolean,
+    val allowTopupBankCard: Boolean,
+    val allowTopupUsdc: Boolean,
+    val allowTopupAirdrop: Boolean,
+) {
+    val allowPayerUsdcInCharge: Boolean get() = allowTopupUsdc
+
+    companion object {
+        val ALL = BeamioPosTerminalPolicy(true, true, true, true)
+
+        fun parseTerminalMetadata(meta: org.json.JSONObject?): BeamioPosTerminalPolicy {
+            if (meta == null) return ALL
+            if (!meta.has("allowedTopupMethods")) return ALL
+            val arr = meta.optJSONArray("allowedTopupMethods") ?: return ALL
+            val set = LinkedHashSet<String>()
+            for (i in 0 until arr.length()) {
+                val s = arr.optString(i)
+                if (s.isNotEmpty()) set.add(s)
+            }
+            if (set.isEmpty()) {
+                return BeamioPosTerminalPolicy(false, false, false, false)
+            }
+            return BeamioPosTerminalPolicy(
+                allowTopupCash = set.contains("cash"),
+                allowTopupBankCard = set.contains("bankCard"),
+                allowTopupUsdc = set.contains("usdc"),
+                allowTopupAirdrop = set.contains("airdrop"),
+            )
+        }
+    }
+}
+
+private data class MyPosInfraFetchResult(
+    val cardAddress: String?,
+    /** Null when HTTP/body error — do not overwrite cached policy. */
+    val policy: BeamioPosTerminalPolicy?,
+)
+
+private fun parseTerminalMetadataFromMyPosRoot(root: org.json.JSONObject): org.json.JSONObject? {
+    val raw = root.opt("terminalMetadata") ?: return null
+    if (raw is org.json.JSONObject) return raw
+    if (raw is String && raw.isNotBlank()) {
+        return try {
+            org.json.JSONObject(raw)
+        } catch (_: Exception) {
+            null
+        }
+    }
+    return null
+}
 
 /** getUIDAssets API 返回结构；多卡时使用 cards，兼容单卡 legacy 字段。cardBackground/cardImage 来自该卡用户拥有的最佳 NFT 的 tier metadata；tierName/tierDescription 来自 tier 或卡级 metadata。 */
 internal data class CardItem(
@@ -467,6 +527,11 @@ class MainActivity : ComponentActivity() {
     private var topupScreenMemberNo by mutableStateOf<String?>(null)
     /** Top-up 成功页 Pass 与 Balance Loaded 对齐：保留整卡快照（含 nfts / primaryMemberTokenId） */
     private var topupScreenPassCardSnapshot by mutableStateOf<CardItem?>(null)
+    /** 与 iOS `POSViewModel` pending topup：用于 `/api/nfcTopup` currency split 与重试 */
+    private var pendingTopupMethodRaw by mutableStateOf("")
+    private var pendingTopupBonusExpanded by mutableStateOf(false)
+    private var pendingTopupBonusRatePercent by mutableStateOf(20)
+    private var pendingTopupKeypadAmount by mutableStateOf("")
     private var topupArmed by mutableStateOf(false)
     private var topupViaQr by mutableStateOf(false)
 
@@ -543,6 +608,15 @@ class MainActivity : ComponentActivity() {
     @Volatile
     private var myPosInfraCardFetchInFlight: Boolean = false
 
+    /** From GET `/api/myPosAddress` `terminalMetadata.allowedTopupMethods`; on fetch failure keep last snapshot. */
+    @Volatile
+    private var posTerminalPolicy: BeamioPosTerminalPolicy = BeamioPosTerminalPolicy.ALL
+
+    private fun payerUsdcBalance6ForChargePolicy(assets: UIDAssets): Long {
+        val raw = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+        return if (posTerminalPolicy.allowPayerUsdcInCharge) raw.toLong() else 0L
+    }
+
     private fun infraCardAddress(): String = beamioUserCardAssetAddressRuntime
 
     /**
@@ -555,10 +629,12 @@ class MainActivity : ComponentActivity() {
         if (merchantInfraOnly) put("merchantInfraOnly", true)
     }
 
-    /** Cluster DB：已登记终端返回 `cardAddress` / `myPosAddress`。 */
-    private fun fetchMyPosInfraCardAddressSync(wallet: String): String? {
+    /** Cluster DB：已登记终端返回 `cardAddress` / `myPosAddress` / `terminalMetadata`。 */
+    private fun fetchMyPosInfraBindingSync(wallet: String): MyPosInfraFetchResult {
         val trimmed = wallet.trim()
-        if (trimmed.isEmpty() || !trimmed.startsWith("0x", ignoreCase = true)) return null
+        if (trimmed.isEmpty() || !trimmed.startsWith("0x", ignoreCase = true)) {
+            return MyPosInfraFetchResult(null, null)
+        }
         return try {
             val enc = java.net.URLEncoder.encode(trimmed, "UTF-8")
             val url = java.net.URL("$BEAMIO_API/api/myPosAddress?wallet=$enc")
@@ -574,16 +650,18 @@ class MainActivity : ComponentActivity() {
             conn.disconnect()
             if (code !in 200..299) {
                 Log.d("MyPosAddress", "HTTP $code body=${body.take(200)}")
-                return null
+                return MyPosInfraFetchResult(null, null)
             }
-            val root = parseBeamioApiJsonObject(body, code) ?: return null
-            if (!root.optBoolean("ok", false)) return null
+            val root = parseBeamioApiJsonObject(body, code) ?: return MyPosInfraFetchResult(null, null)
+            if (!root.optBoolean("ok", false)) return MyPosInfraFetchResult(null, null)
+            val metaObj = parseTerminalMetadataFromMyPosRoot(root)
+            val policy = BeamioPosTerminalPolicy.parseTerminalMetadata(metaObj)
             val addr = root.optString("cardAddress").takeIf { it.isNotEmpty() }
                 ?: root.optString("myPosAddress").takeIf { it.isNotEmpty() }
-            addr
+            MyPosInfraFetchResult(addr, policy)
         } catch (e: Exception) {
             Log.w("MyPosAddress", "fetch failed", e)
-            null
+            MyPosInfraFetchResult(null, null)
         }
     }
 
@@ -597,7 +675,9 @@ class MainActivity : ComponentActivity() {
         val w = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
         if (w.isEmpty()) return infraCardAddress()
         val prev = beamioUserCardAssetAddressRuntime
-        val resolved = fetchMyPosInfraCardAddressSync(w)
+        val fetch = fetchMyPosInfraBindingSync(w)
+        fetch.policy?.let { posTerminalPolicy = it }
+        val resolved = fetch.cardAddress
         if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
             if (!resolved.equals(prev, ignoreCase = true)) {
                 runOnUiThread { dashboardMerchantProgramCardName = null }
@@ -616,8 +696,10 @@ class MainActivity : ComponentActivity() {
         myPosInfraCardFetchInFlight = true
         Thread {
             try {
-                val resolved = fetchMyPosInfraCardAddressSync(w)
+                val fetch = fetchMyPosInfraBindingSync(w)
                 runOnUiThread {
+                    fetch.policy?.let { posTerminalPolicy = it }
+                    val resolved = fetch.cardAddress
                     if (!resolved.isNullOrBlank() && looksLikeEthereumAddress(resolved)) {
                         val prevInfra = beamioUserCardAssetAddressRuntime
                         if (!resolved.equals(prevInfra, ignoreCase = true)) {
@@ -1412,16 +1494,14 @@ class MainActivity : ComponentActivity() {
                             showAmountInputScreen = false
                             amountInput = "0"
                         },
+                        topupPolicy = posTerminalPolicy,
                         onContinue = {
                             val amt = amountInput.trim()
                             if (amt != "0" && amt != "0." && amt.toDoubleOrNull()?.let { it > 0 } == true) {
                                 showAmountInputScreen = false
                                 amountInput = "0"
                                 when (amountInputMode) {
-                                    "topup" -> {
-                                        // 与 Home Top-up 一致：金额 → 选方式（NFC / QR）→ 贴卡或扫码，不再从 Balance Loaded 直跳 execute
-                                        startTopup(amt)
-                                    }
+                                    "topup" -> { /* Top-up 由 onTopupContinue 完成 */ }
                                     "charge" -> {
                                         tipScreenSubtotal = amt
                                         selectedTipRate = 0.0
@@ -1430,6 +1510,23 @@ class MainActivity : ComponentActivity() {
                                     else -> startPayment(amt)
                                 }
                             }
+                        },
+                        onTopupContinue = { methodRaw, bonusExpanded, bonusRate, keypadAmount ->
+                            val split = nfcTopupCurrencySplitFromPosKeypad(
+                                keypadAmount = keypadAmount.trim(),
+                                methodRaw = methodRaw,
+                                bonusExpanded = bonusExpanded,
+                                selectedBonusRate = bonusRate,
+                            ) ?: return@ChargeAmountScreen
+                            showAmountInputScreen = false
+                            amountInput = "0"
+                            startTopup(
+                                currencyAmountTotal = split.currencyAmount,
+                                pendingMethodRaw = methodRaw,
+                                pendingBonusExpanded = bonusExpanded,
+                                pendingBonusRate = bonusRate,
+                                pendingKeypadAmount = keypadAmount.trim(),
+                            )
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1669,15 +1766,39 @@ class MainActivity : ComponentActivity() {
         readArmed = false
     }
 
-    private fun startTopup(amount: String) {
+    private fun startTopup(
+        currencyAmountTotal: String,
+        pendingMethodRaw: String,
+        pendingBonusExpanded: Boolean,
+        pendingBonusRate: Int,
+        pendingKeypadAmount: String,
+    ) {
         if (nfcAdapter == null) return
         if (nfcAdapter?.isEnabled != true) return
         resetTopupScreenState()
-        topupScreenAmount = amount
+        topupScreenAmount = currencyAmountTotal
+        pendingTopupMethodRaw = pendingMethodRaw
+        pendingTopupBonusExpanded = pendingBonusExpanded
+        pendingTopupBonusRatePercent = pendingBonusRate
+        pendingTopupKeypadAmount = pendingKeypadAmount
         pendingScanAction = "topup"
         scanMethodState = "nfc"
         showScanMethodScreen = true
         syncScanMethodEntryAndTabs()
+    }
+
+    /** 与 iOS `resolvedNfcTopupCurrencySplit`：每次提交 nfcTopup 时重建 split */
+    private fun resolvedNfcTopupCurrencySplit(forApiTotalAmount: String): NfcTopupCurrencySplit? {
+        val normalizedAmt = forApiTotalAmount.trim().replace(",", "")
+        val keypadStored = pendingTopupKeypadAmount.trim().replace(",", "")
+        val keypadBase = if (keypadStored.isEmpty()) normalizedAmt else keypadStored
+        val methodRaw = pendingTopupMethodRaw.trim().ifEmpty { TopupPaymentMethodOption.CREDIT_CARD.rawValue }
+        return nfcTopupCurrencySplitFromPosKeypad(
+            keypadAmount = keypadBase,
+            methodRaw = methodRaw,
+            bonusExpanded = pendingTopupBonusExpanded,
+            selectedBonusRate = pendingTopupBonusRatePercent,
+        ) ?: nfcTopupCurrencySplitAllCard(normalizedAmt)
     }
 
     private fun closeTopupScreen() {
@@ -2184,7 +2305,7 @@ class MainActivity : ComponentActivity() {
                 val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
                 val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
-                val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+                val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
                 val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
                 val rateQrPartial = getRateForCurrency(payCurrencyQr, oracle)
                 val balancePayCurBeforeQr = (totalBalance6 / 1_000_000.0) * rateQrPartial
@@ -2220,7 +2341,7 @@ class MainActivity : ComponentActivity() {
                     ccsaPoints6,
                     infraPoints6,
                     infraCards.firstOrNull()?.cardCurrency,
-                    usdcBalance6.toLong(),
+                    usdcBalance6,
                 )
                 var ccsaPointsWei = qrSplit.ccsaPointsWei
                 var infraPointsWei = qrSplit.infraPointsWei
@@ -2497,6 +2618,10 @@ class MainActivity : ComponentActivity() {
         topupScreenTierDescription = null
         topupScreenMemberNo = null
         topupScreenPassCardSnapshot = null
+        pendingTopupMethodRaw = ""
+        pendingTopupBonusExpanded = false
+        pendingTopupBonusRatePercent = 20
+        pendingTopupKeypadAmount = ""
     }
 
     /** 重置读取相关状态 */
@@ -3107,7 +3232,18 @@ class MainActivity : ComponentActivity() {
                     prepare.deadline!!,
                     prepare.nonce!!
                 )
-                val result = nfcTopup(uid, amount, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig, sunParams)
+                val split = resolvedNfcTopupCurrencySplit(amount)
+                val result = nfcTopup(
+                    uid,
+                    amount,
+                    prepare.cardAddr!!,
+                    prepare.data!!,
+                    prepare.deadline!!,
+                    prepare.nonce!!,
+                    adminSig,
+                    sunParams,
+                    currencySplit = split,
+                )
                 val keepOnScanUntilSuccess = fromScanMethodFlow
                 runOnUiThread {
                     nfcFetchingInfo = false
@@ -3335,7 +3471,16 @@ class MainActivity : ComponentActivity() {
                     prepare.deadline!!,
                     prepare.nonce!!
                 )
-                val result = nfcTopupWithWallet(wallet, prepare.cardAddr!!, prepare.data!!, prepare.deadline!!, prepare.nonce!!, adminSig)
+                val split = resolvedNfcTopupCurrencySplit(amount)
+                val result = nfcTopupWithWallet(
+                    wallet,
+                    prepare.cardAddr!!,
+                    prepare.data!!,
+                    prepare.deadline!!,
+                    prepare.nonce!!,
+                    adminSig,
+                    currencySplit = split,
+                )
                 runOnUiThread {
                     if (result.success) {
                         topupScreenPostBalance = null
@@ -3379,7 +3524,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun nfcTopupWithWallet(wallet: String, cardAddr: String, data: String, deadline: Long, nonce: String, adminSignature: String): NfcTopupResult {
+    private fun nfcTopupWithWallet(
+        wallet: String,
+        cardAddr: String,
+        data: String,
+        deadline: Long,
+        nonce: String,
+        adminSignature: String,
+        currencySplit: NfcTopupCurrencySplit? = null,
+    ): NfcTopupResult {
         val url = java.net.URL("$BEAMIO_API/api/nfcTopup")
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.requestMethod = "POST"
@@ -3396,6 +3549,12 @@ class MainActivity : ComponentActivity() {
             put("wallet", wallet)
             put("workflow", "adminTopup")
             put("topupMode", "admin")
+            currencySplit?.let { s ->
+                put("currencyAmount", s.currencyAmount)
+                put("cardCurrencyAmount", s.cardCurrencyAmount)
+                put("cashCurrencyAmount", s.cashCurrencyAmount)
+                put("bonusCurrencyAmount", s.bonusCurrencyAmount)
+            }
         }.toString()
         conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
@@ -3415,7 +3574,17 @@ class MainActivity : ComponentActivity() {
 
     private data class NfcTopupResult(val success: Boolean, val txHash: String?, val error: String?)
 
-    private fun nfcTopup(uid: String, amount: String, cardAddr: String, data: String, deadline: Long, nonce: String, adminSignature: String, sunParams: SunParams? = null): NfcTopupResult {
+    private fun nfcTopup(
+        uid: String,
+        amount: String,
+        cardAddr: String,
+        data: String,
+        deadline: Long,
+        nonce: String,
+        adminSignature: String,
+        sunParams: SunParams? = null,
+        currencySplit: NfcTopupCurrencySplit? = null,
+    ): NfcTopupResult {
         val url = java.net.URL("$BEAMIO_API/api/nfcTopup")
         val conn = url.openConnection() as java.net.HttpURLConnection
         conn.requestMethod = "POST"
@@ -3433,6 +3602,12 @@ class MainActivity : ComponentActivity() {
             sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             put("workflow", "adminTopup")
             put("topupMode", "admin")
+            currencySplit?.let { s ->
+                put("currencyAmount", s.currencyAmount)
+                put("cardCurrencyAmount", s.cardCurrencyAmount)
+                put("cashCurrencyAmount", s.cashCurrencyAmount)
+                put("bonusCurrencyAmount", s.bonusCurrencyAmount)
+            }
         }.toString()
         conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
@@ -3524,7 +3699,7 @@ class MainActivity : ComponentActivity() {
      * Smart Routing 仍用 [chargeableCards] + CCSA unit price 组装 items；此值仅用于是否不足额与 partial 封顶。
      */
     private fun chargePreflightTotalBalanceUsdc6(assets: UIDAssets, oracle: OracleRates): Long {
-        val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+        val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
         val cardsValueUsdc6 = assets.cards?.sumOf { card ->
             points6ToUsdc6(card.points6.toLongOrNull() ?: 0L, card.cardCurrency, oracle)
         } ?: run {
@@ -3532,7 +3707,7 @@ class MainActivity : ComponentActivity() {
             val cur = assets.cardCurrency ?: "CAD"
             points6ToUsdc6(pts6, cur, oracle)
         }
-        return usdcBalance6.toLong() + cardsValueUsdc6
+        return usdcBalance6 + cardsValueUsdc6
     }
 
     /** 从 UIDAssets 计算总余额（CAD） */
@@ -3976,7 +4151,7 @@ class MainActivity : ComponentActivity() {
                 val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
                 val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
                 val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
-                val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+                val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
                 val ccsaValueUsdc6 = if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) (ccsaPoints6 * unitPriceUSDC6) / 1_000_000 else 0L
                 val infraValueUsdc6 = infraCards.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
                 val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
@@ -4063,7 +4238,7 @@ class MainActivity : ComponentActivity() {
                     ccsaPoints6,
                     infraPoints6,
                     infraCards.firstOrNull()?.cardCurrency,
-                    usdcBalance6.toLong(),
+                    usdcBalance6,
                 )
                 var ccsaPointsWei = qrSplit.ccsaPointsWei
                 var infraPointsWei = qrSplit.infraPointsWei
@@ -4656,10 +4831,10 @@ class MainActivity : ComponentActivity() {
         val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
         val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
         val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
-        val usdcBalance6 = (assets.usdcBalance?.toDoubleOrNull() ?: 0.0) * 1_000_000
+        val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
         val ccsaValueUsdc6 = if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) (ccsaPoints6 * unitPriceUSDC6) / 1_000_000 else 0L
         val infraValueUsdc6 = infraCards.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
-        val totalBalance6 = ccsaValueUsdc6 + infraValueUsdc6 + usdcBalance6.toLong()
+        val totalBalance6 = ccsaValueUsdc6 + infraValueUsdc6 + usdcBalance6
         if (totalBalance6 < amountBig) {
             val shortfall6 = (amountBig - totalBalance6).coerceAtLeast(0L)
             return PayByNfcResult(false, null, "Insufficient balance (need ${String.format("%.2f", amountBig / 1_000_000.0)} USDC, total assets ${String.format("%.2f", totalBalance6 / 1_000_000.0)} USDC, shortfall ${String.format("%.2f", shortfall6 / 1_000_000.0)} USDC)")
@@ -4673,7 +4848,7 @@ class MainActivity : ComponentActivity() {
             ccsaPoints6,
             infraPoints6,
             infraCards.firstOrNull()?.cardCurrency,
-            usdcBalance6.toLong(),
+            usdcBalance6,
         )
         var ccsaPointsWei = split.ccsaPointsWei
         var infraPointsWei = split.infraPointsWei
@@ -12196,26 +12371,119 @@ fun TipSelectionScreen(
     }
 }
 
-/** Top-up payment method tiles (align iOS `TopupPaymentMethodOption`). Selection is UI-only; relay is still NFC/QR on the next screen. */
-private enum class TopupPaymentMethodOption {
-    CREDIT_CARD,
-    CASH,
-    AIRDROP,
-    USDC,
+/** `/api/nfcTopup` optional split; align iOS `NfcTopupCurrencySplit`. */
+private data class NfcTopupCurrencySplit(
+    val currencyAmount: String,
+    val cardCurrencyAmount: String,
+    val cashCurrencyAmount: String,
+    val bonusCurrencyAmount: String,
+)
+
+private fun formatDecimalTopupApi6(value: BigDecimal): String {
+    val rounded = value.setScale(6, RoundingMode.HALF_UP).stripTrailingZeros()
+    return rounded.toPlainString()
+}
+
+/** `methodRaw`: `creditCard` | `cash` | `bonus` —与 iOS `nfcTopupCurrencySplitFromPosKeypad` 一致 */
+private fun nfcTopupCurrencySplitFromPosKeypad(
+    keypadAmount: String,
+    methodRaw: String,
+    bonusExpanded: Boolean,
+    selectedBonusRate: Int,
+): NfcTopupCurrencySplit? {
+    val raw = keypadAmount.trim().replace(",", "")
+    val base = raw.toBigDecimalOrNull() ?: return null
+    if (base.compareTo(BigDecimal.ZERO) <= 0) return null
+    val z = formatDecimalTopupApi6(BigDecimal.ZERO)
+    return when (methodRaw) {
+        "creditCard", "usdc" -> {
+            if (bonusExpanded) {
+                val rate = BigDecimal(selectedBonusRate).divide(BigDecimal(100), 10, RoundingMode.HALF_UP)
+                val bonusPart = base.multiply(rate).setScale(6, RoundingMode.HALF_UP)
+                val total = base.add(bonusPart).setScale(6, RoundingMode.HALF_UP)
+                val baseR = base.setScale(6, RoundingMode.HALF_UP)
+                val bonusR = total.subtract(baseR).setScale(6, RoundingMode.HALF_UP)
+                NfcTopupCurrencySplit(
+                    currencyAmount = formatDecimalTopupApi6(total),
+                    cardCurrencyAmount = formatDecimalTopupApi6(baseR),
+                    cashCurrencyAmount = z,
+                    bonusCurrencyAmount = formatDecimalTopupApi6(bonusR),
+                )
+            } else {
+                val c = formatDecimalTopupApi6(base.setScale(6, RoundingMode.HALF_UP))
+                NfcTopupCurrencySplit(c, c, z, z)
+            }
+        }
+        "cash" -> {
+            if (bonusExpanded) {
+                val rate = BigDecimal(selectedBonusRate).divide(BigDecimal(100), 10, RoundingMode.HALF_UP)
+                val bonusPart = base.multiply(rate).setScale(6, RoundingMode.HALF_UP)
+                val total = base.add(bonusPart).setScale(6, RoundingMode.HALF_UP)
+                val baseR = base.setScale(6, RoundingMode.HALF_UP)
+                val bonusR = total.subtract(baseR).setScale(6, RoundingMode.HALF_UP)
+                NfcTopupCurrencySplit(
+                    currencyAmount = formatDecimalTopupApi6(total),
+                    cardCurrencyAmount = z,
+                    cashCurrencyAmount = formatDecimalTopupApi6(baseR),
+                    bonusCurrencyAmount = formatDecimalTopupApi6(bonusR),
+                )
+            } else {
+                val c = formatDecimalTopupApi6(base.setScale(6, RoundingMode.HALF_UP))
+                NfcTopupCurrencySplit(c, z, c, z)
+            }
+        }
+        "bonus" -> {
+            val b = formatDecimalTopupApi6(base.setScale(6, RoundingMode.HALF_UP))
+            NfcTopupCurrencySplit(b, z, z, b)
+        }
+        else -> null
+    }
+}
+
+private fun nfcTopupCurrencySplitAllCard(amount: String): NfcTopupCurrencySplit? =
+    nfcTopupCurrencySplitFromPosKeypad(amount.trim().replace(",", ""), "creditCard", false, 0)
+
+/** Top-up payment method；raw 与 iOS `TopupPaymentMethodOption` 一致 */
+private enum class TopupPaymentMethodOption(val rawValue: String) {
+    CREDIT_CARD("creditCard"),
+    USDC("usdc"),
+    CASH("cash"),
+    BONUS("bonus"),
 }
 
 private fun TopupPaymentMethodOption.displayTitle(): String = when (this) {
-    TopupPaymentMethodOption.CREDIT_CARD -> "Credit Card"
-    TopupPaymentMethodOption.CASH -> "Cash"
-    TopupPaymentMethodOption.AIRDROP -> "Airdrop"
+    TopupPaymentMethodOption.CREDIT_CARD -> "Card"
     TopupPaymentMethodOption.USDC -> "USDC"
+    TopupPaymentMethodOption.CASH -> "Cash"
+    TopupPaymentMethodOption.BONUS -> "Bonus"
+}
+
+private fun TopupPaymentMethodOption.accentColor(): Color = when (this) {
+    TopupPaymentMethodOption.CREDIT_CARD -> Color(0xFFD49B1F)
+    TopupPaymentMethodOption.USDC -> Color(0xFF2775CA)
+    TopupPaymentMethodOption.CASH -> Color(0xFF6B7280)
+    TopupPaymentMethodOption.BONUS -> Color(0xFFEC4899)
 }
 
 private fun TopupPaymentMethodOption.icon() = when (this) {
     TopupPaymentMethodOption.CREDIT_CARD -> Icons.Filled.CreditCard
-    TopupPaymentMethodOption.CASH -> Icons.Filled.AttachMoney
-    TopupPaymentMethodOption.AIRDROP -> Icons.Filled.WifiTethering
     TopupPaymentMethodOption.USDC -> Icons.Filled.AccountBalanceWallet
+    TopupPaymentMethodOption.CASH -> Icons.Filled.AttachMoney
+    TopupPaymentMethodOption.BONUS -> Icons.Filled.AutoAwesome
+}
+
+private val TOPUP_METHOD_CYCLE_ORDER = listOf(
+    TopupPaymentMethodOption.CREDIT_CARD,
+    TopupPaymentMethodOption.USDC,
+    TopupPaymentMethodOption.CASH,
+    TopupPaymentMethodOption.BONUS,
+)
+
+private fun BeamioPosTerminalPolicy.allowsTopupMethod(method: TopupPaymentMethodOption): Boolean = when (method) {
+    TopupPaymentMethodOption.CREDIT_CARD -> allowTopupBankCard
+    TopupPaymentMethodOption.USDC -> allowTopupUsdc
+    TopupPaymentMethodOption.CASH -> allowTopupCash
+    TopupPaymentMethodOption.BONUS -> allowTopupAirdrop
 }
 
 /** Integer part only: US thousands grouping. */
@@ -12285,11 +12553,16 @@ private fun TopupAmountWell(
     minAmountFontSize: TextUnit,
     amountStartInset: Dp,
     wellBackground: Color = BalanceDetailsSurfaceContainerLow,
+    bonusExpanded: Boolean = false,
+    newBalanceLine: String? = null,
+    newBalanceAmountColor: Color = Color(0xFF1562F0),
+    onMethodTap: (() -> Unit)? = null,
 ) {
     val amountDisplay = remember(amountRaw) { beamioAmountPadFormattedDisplay(amountRaw) }
     val textMeasurer = rememberTextMeasurer()
     val layoutDirection = LocalLayoutDirection.current
     val density = LocalDensity.current
+    val haptic = LocalHapticFeedback.current
 
     Row(
         modifier = Modifier
@@ -12300,14 +12573,13 @@ private fun TopupAmountWell(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .weight(1f)
                 .padding(start = amountStartInset),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
+            verticalArrangement = Arrangement.Center
         ) {
-            BoxWithConstraints(modifier = Modifier.weight(1f)) {
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val gapPx = with(density) { 4.dp.roundToPx() }
                 val maxWidthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(0)
                 val maxSp = maxAmountFontSize.value
@@ -12372,7 +12644,7 @@ private fun TopupAmountWell(
                 val dollarSp = (chosenMainSp * 0.55f).coerceAtLeast(11f)
                 Box(modifier = Modifier.fillMaxWidth()) {
                     Row(
-                        modifier = Modifier.align(Alignment.BottomEnd),
+                        modifier = Modifier.align(Alignment.BottomStart),
                         verticalAlignment = Alignment.Bottom,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
@@ -12394,73 +12666,71 @@ private fun TopupAmountWell(
                     }
                 }
             }
-        }
-        val method = selectedMethod
-        if (method != null) {
-            Box(
-                modifier = Modifier.size(methodIconSize),
-                contentAlignment = Alignment.Center
-            ) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .clip(CircleShape)
-                        .background(methodAccentColor.copy(alpha = 0.12f))
-                )
-                Icon(
-                    method.icon(),
-                    contentDescription = method.displayTitle(),
-                    modifier = Modifier.size((methodIconSize.value * 0.46f).dp),
-                    tint = methodAccentColor
-                )
+            if (bonusExpanded && newBalanceLine != null) {
+                Row(
+                    modifier = Modifier.padding(top = if (compact) 6.dp else 8.dp),
+                    verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        "New Balance",
+                        fontSize = if (compact) 12.sp else 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = BalanceDetailsOnSurface.copy(alpha = 0.82f)
+                    )
+                    Text(
+                        newBalanceLine,
+                        fontSize = if (compact) 14.sp else 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        color = newBalanceAmountColor,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Visible,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                }
             }
         }
-    }
-}
-
-@Composable
-private fun TopupSecondaryMethodGrid(
-    selectedMethod: TopupPaymentMethodOption,
-    compact: Boolean,
-    gridYPadding: Dp,
-    onSelect: (TopupPaymentMethodOption) -> Unit,
-    haptic: HapticFeedback,
-) {
-    val secondary = TopupPaymentMethodOption.entries.filter { it != selectedMethod }
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp)
-    ) {
-        secondary.forEach { m ->
+        val method = selectedMethod
+        if (method != null && onMethodTap != null) {
             Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(BalanceDetailsSurfaceContainerLow)
-                    .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSelect(m)
-                    }
-                    .padding(vertical = gridYPadding),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 4.dp)
+                verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
+                modifier = Modifier
+                    .widthIn(min = if (compact) 64.dp else 72.dp)
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onMethodTap()
+                    }
+                    .padding(horizontal = 4.dp, vertical = 2.dp)
             ) {
-                Icon(
-                    m.icon(),
-                    contentDescription = null,
-                    modifier = Modifier.size(if (compact) 18.dp else 21.dp),
-                    tint = BalanceDetailsOutline
-                )
                 Text(
-                    m.displayTitle(),
-                    fontSize = if (compact) 10.sp else 11.sp,
+                    method.displayTitle(),
+                    fontSize = if (compact) 11.sp else 12.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = BalanceDetailsOnSurface,
-                    textAlign = TextAlign.Center,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 4.dp)
+                    color = method.accentColor(),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+                Box(
+                    modifier = Modifier.size(methodIconSize),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .clip(CircleShape)
+                            .background(methodAccentColor.copy(alpha = 0.14f))
+                    )
+                    Icon(
+                        method.icon(),
+                        contentDescription = method.displayTitle(),
+                        modifier = Modifier.size((methodIconSize.value * 0.46f).dp),
+                        tint = methodAccentColor
+                    )
+                }
             }
         }
     }
@@ -12536,22 +12806,76 @@ private fun TopupNumericAmountKeypad(
 }
 
 /**
- * Top-up amount entry: align iOS `TopupAmountPadFullPage` — Balance Details surface, amount well + method icon,
- * secondary method row, expanding rounded-rect keypad, large Confirm Top-Up.
+ * Top-up amount entry: align iOS `TopupAmountPadFullPage` — well + payment method cycle, Activate Bonus, keypad, Confirm.
  */
 @Composable
 private fun TopupAmountPadFullPageContent(
     amount: String,
+    topupPolicy: BeamioPosTerminalPolicy,
     onPadClick: (String) -> Unit,
     onBack: () -> Unit,
-    onContinue: () -> Unit,
+    onContinue: (TopupPaymentMethodOption, Boolean, Int, String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var selectedMethod by remember { mutableStateOf(TopupPaymentMethodOption.CREDIT_CARD) }
+    val context = LocalContext.current
+    val allowedOrdered = remember(topupPolicy) {
+        TOPUP_METHOD_CYCLE_ORDER.filter { topupPolicy.allowsTopupMethod(it) }
+    }
+    var selectedMethod by remember {
+        val prefs = context.getSharedPreferences(PREFS_BEAMIO_PROFILE_CACHE, Context.MODE_PRIVATE)
+        val raw = prefs.getString(PREF_POS_TOPUP_LAST_PAYMENT_METHOD, TopupPaymentMethodOption.CREDIT_CARD.rawValue)
+        val initial = TopupPaymentMethodOption.entries.firstOrNull { it.rawValue == raw }
+            ?: TopupPaymentMethodOption.CREDIT_CARD
+        mutableStateOf(initial)
+    }
+    var bonusExpanded by remember { mutableStateOf(false) }
+    var selectedBonusRate by remember { mutableStateOf(20) }
     val view = LocalView.current
     val haptic = LocalHapticFeedback.current
     val topUpBlue = Color(0xFF1562F0)
-    val canContinue = beamioAmountPadCanContinue(amount)
+    val bonusPink = Color(0xFFEC4899)
+    val canContinue = beamioAmountPadCanContinue(amount) && allowedOrdered.isNotEmpty()
+
+    fun persistMethod(m: TopupPaymentMethodOption) {
+        context.getSharedPreferences(PREFS_BEAMIO_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+            .putString(PREF_POS_TOPUP_LAST_PAYMENT_METHOD, m.rawValue)
+            .apply()
+    }
+
+    fun setSelectedMethod(m: TopupPaymentMethodOption) {
+        selectedMethod = m
+        if (m == TopupPaymentMethodOption.BONUS) bonusExpanded = false
+        persistMethod(m)
+    }
+
+    fun nextSelectedMethod(): TopupPaymentMethodOption {
+        if (allowedOrdered.isEmpty()) return selectedMethod
+        val pool = if (bonusExpanded) {
+            allowedOrdered.filter { it != TopupPaymentMethodOption.BONUS }
+        } else {
+            allowedOrdered
+        }
+        if (pool.isEmpty()) return selectedMethod
+        val idx = pool.indexOf(selectedMethod)
+        val i = if (idx >= 0) idx else 0
+        return pool[(i + 1) % pool.size]
+    }
+
+    val bonusWorkflowEnabled = selectedMethod != TopupPaymentMethodOption.BONUS && topupPolicy.allowTopupAirdrop
+
+    LaunchedEffect(allowedOrdered, topupPolicy, selectedMethod) {
+        if (allowedOrdered.isEmpty()) return@LaunchedEffect
+        if (!topupPolicy.allowsTopupMethod(selectedMethod)) {
+            setSelectedMethod(allowedOrdered.first())
+            bonusExpanded = false
+        }
+    }
+
+    val parsedAmount = amount.trim().toDoubleOrNull() ?: 0.0
+    val totalWithBonus = parsedAmount * (1.0 + selectedBonusRate / 100.0)
+    val newBalanceLine =
+        if (bonusExpanded && bonusWorkflowEnabled) "$${formatUsdAmountWithGrouping(totalWithBonus)}" else null
+    val amountAccent = if (selectedMethod == TopupPaymentMethodOption.BONUS) bonusPink else topUpBlue
 
     BoxWithConstraints(
         modifier = modifier
@@ -12562,10 +12886,9 @@ private fun TopupAmountPadFullPageContent(
         val compact = maxHeight < 640.dp
         val sidePad = if (compact) 16.dp else 20.dp
         val gap = if (compact) 8.dp else 10.dp
+        val bonusOuterGap = gap
         val methodIconSize = if (compact) 36.dp else 42.dp
         val amtMain = if (compact) 52.sp else 64.sp
-        val gridY = if (compact) 6.dp else 9.dp
-        /** Clear overlaid back control (IconButton ~48dp) past screen edge; well inner starts at sidePad+14.dp. */
         val amountStartInset =
             (BACK_BUTTON_START_PADDING + 48.dp + 6.dp - sidePad - 14.dp).coerceAtLeast(0.dp)
 
@@ -12582,21 +12905,169 @@ private fun TopupAmountPadFullPageContent(
                         amountRaw = amount,
                         selectedMethod = selectedMethod,
                         compact = compact,
-                        dollarColor = topUpBlue,
-                        amountColor = topUpBlue,
-                        methodAccentColor = topUpBlue,
+                        dollarColor = amountAccent,
+                        amountColor = amountAccent,
+                        methodAccentColor = selectedMethod.accentColor(),
                         methodIconSize = methodIconSize,
                         maxAmountFontSize = amtMain,
                         minAmountFontSize = 11.sp,
                         amountStartInset = amountStartInset,
+                        bonusExpanded = bonusExpanded && bonusWorkflowEnabled,
+                        newBalanceLine = newBalanceLine,
+                        newBalanceAmountColor = topUpBlue,
+                        onMethodTap = {
+                            if (allowedOrdered.size > 1) {
+                                setSelectedMethod(nextSelectedMethod())
+                            }
+                        },
                     )
-                    TopupSecondaryMethodGrid(
-                        selectedMethod = selectedMethod,
-                        compact = compact,
-                        gridYPadding = gridY,
-                        onSelect = { selectedMethod = it },
-                        haptic = haptic,
-                    )
+                    if (allowedOrdered.isEmpty()) {
+                        Text(
+                            "No top-up methods are enabled for this terminal. Ask the merchant to update device settings.",
+                            fontSize = if (compact) 13.sp else 14.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = BalanceDetailsOutline,
+                            modifier = Modifier.padding(horizontal = 4.dp)
+                        )
+                    }
+                    if (bonusWorkflowEnabled) {
+                        Crossfade(targetState = bonusExpanded, label = "bonusPanel") { expanded ->
+                            if (!expanded) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(22.dp))
+                                        .background(BalanceDetailsSurfaceContainerLowest)
+                                        .border(1.dp, Color.Black.copy(alpha = 0.04f), RoundedCornerShape(22.dp))
+                                        .clickable {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            bonusExpanded = true
+                                        }
+                                        .padding(horizontal = 18.dp, vertical = if (compact) 14.dp else 16.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "Activate Bonus",
+                                            fontSize = if (compact) 15.sp else 16.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = BalanceDetailsOnSurface
+                                        )
+                                        Text(
+                                            "Get extra credits on your deposit",
+                                            fontSize = if (compact) 12.sp else 13.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = BalanceDetailsOutline
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .width(if (compact) 48.dp else 54.dp)
+                                            .height(if (compact) 28.dp else 32.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .matchParentSize()
+                                                .clip(RoundedCornerShape(50))
+                                                .background(BalanceDetailsOutline.copy(alpha = 0.28f))
+                                        )
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.CenterStart)
+                                                .padding(start = 3.dp)
+                                                .size(if (compact) 22.dp else 26.dp)
+                                                .clip(CircleShape)
+                                                .background(Color.White)
+                                        )
+                                    }
+                                }
+                            } else {
+                                Column(
+                                    verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 10.dp)
+                                ) {
+                                    val buttonHeight = if (compact) 34.dp else 36.dp
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        listOf(10, 20, 30).forEach { rate ->
+                                            val selected = selectedBonusRate == rate
+                                            Box(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .height(buttonHeight)
+                                                    .clip(RoundedCornerShape(16.dp))
+                                                    .background(if (selected) bonusPink else BalanceDetailsSurfaceContainerLow)
+                                                    .clickable {
+                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                        selectedBonusRate = rate
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Text(
+                                                    "$rate%",
+                                                    fontSize = if (compact) 14.sp else 15.sp,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = if (selected) Color.White else BalanceDetailsOnSurface
+                                                )
+                                            }
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(buttonHeight)
+                                                .clip(RoundedCornerShape(16.dp))
+                                                .background(topUpBlue)
+                                                .clickable {
+                                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                    bonusExpanded = false
+                                                }
+                                        ) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.CenterEnd)
+                                                    .padding(end = 3.dp)
+                                                    .size(if (compact) 16.dp else 18.dp)
+                                                    .clip(CircleShape)
+                                                    .background(Color.White)
+                                            )
+                                        }
+                                    }
+                                    val totalBonusVal = parsedAmount * (selectedBonusRate / 100.0)
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(22.dp))
+                                            .background(BalanceDetailsSurfaceContainerLowest)
+                                            .border(1.dp, Color.Black.copy(alpha = 0.04f), RoundedCornerShape(22.dp))
+                                            .padding(horizontal = if (compact) 14.dp else 16.dp, vertical = if (compact) 8.dp else 10.dp)
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.Bottom,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                "Total Bonus",
+                                                fontSize = if (compact) 12.sp else 13.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                color = BalanceDetailsOnSurface.copy(alpha = 0.8f)
+                                            )
+                                            Text(
+                                                "$${formatUsdAmountWithGrouping(totalBonusVal)}",
+                                                fontSize = if (compact) 15.sp else 16.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = bonusPink
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 BackButtonIcon(
                     onClick = onBack,
@@ -12611,7 +13082,7 @@ private fun TopupAmountPadFullPageContent(
                     .weight(1f)
                     .fillMaxWidth()
                     .padding(horizontal = sidePad)
-                    .padding(top = if (compact) 10.dp else 12.dp)
+                    .padding(top = bonusOuterGap)
             ) {
                 TopupNumericAmountKeypad(
                     compact = compact,
@@ -12625,7 +13096,16 @@ private fun TopupAmountPadFullPageContent(
             val padV = if (compact) 17.dp else 19.dp
             val padH = 24.dp
             Button(
-                onClick = onContinue,
+                onClick = {
+                    if (nfcTopupCurrencySplitFromPosKeypad(
+                            keypadAmount = amount.trim(),
+                            methodRaw = selectedMethod.rawValue,
+                            bonusExpanded = bonusExpanded,
+                            selectedBonusRate = selectedBonusRate,
+                        ) == null
+                    ) return@Button
+                    onContinue(selectedMethod, bonusExpanded, selectedBonusRate, amount)
+                },
                 enabled = canContinue,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -12761,20 +13241,26 @@ private fun ChargeAmountPadFullPageContent(
 }
 
 @Composable
-fun ChargeAmountScreen(
+private fun ChargeAmountScreen(
     mode: String, // "charge" | "topup"
     amount: String,
     onPadClick: (String) -> Unit,
     onBack: () -> Unit,
     onContinue: () -> Unit,
+    /** `methodRaw`: `creditCard` | `cash` | `bonus` | `usdc` —与 iOS 一致 */
+    onTopupContinue: (String, Boolean, Int, String) -> Unit = { _, _, _, _ -> },
+    topupPolicy: BeamioPosTerminalPolicy = BeamioPosTerminalPolicy.ALL,
     modifier: Modifier = Modifier
 ) {
     if (mode == "topup") {
         TopupAmountPadFullPageContent(
             amount = amount,
+            topupPolicy = topupPolicy,
             onPadClick = onPadClick,
             onBack = onBack,
-            onContinue = onContinue,
+            onContinue = { method, bonusExpanded, bonusRate, keypad ->
+                onTopupContinue(method.rawValue, bonusExpanded, bonusRate, keypad)
+            },
             modifier = modifier
         )
         return
