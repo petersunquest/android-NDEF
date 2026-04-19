@@ -32,7 +32,7 @@ object BeamioConetTerminalMessaging {
     /** `adb logcat -s BeamioConetPOS` 排查终端权限 gossip / regiestChatRoute / searchKey */
     private const val LOG_TAG = "BeamioConetPOS"
 
-    private const val CONET_MAINNET_RPC = "https://mainnet-rpc.conet.network"
+    private const val CONET_MAINNET_RPC = "https://rpc1.conet.network"
     private const val CONET_PGP_MANAGER = "0x13a96bcd6ab010619d1004a1cb4f5fe149e0f4c4"
     private const val BEAMIO_API = "https://beamio.app"
     private const val SEARCH_KEY_SELECTOR = "052f2778"

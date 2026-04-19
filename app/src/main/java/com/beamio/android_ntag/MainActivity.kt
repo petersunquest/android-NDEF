@@ -113,7 +113,6 @@ import androidx.compose.material.icons.filled.Store
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Nfc
 import androidx.compose.material.icons.filled.Layers
-import androidx.compose.material.icons.filled.Percent
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Print
@@ -135,6 +134,7 @@ import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Contactless
+import androidx.compose.material.icons.filled.CardGiftcard
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -181,7 +181,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -268,6 +267,89 @@ private fun parseTerminalMetadataFromMyPosRoot(root: org.json.JSONObject): org.j
         }
     }
     return null
+}
+
+/**
+ * Program card metadata `bonusRules` / `bonusRule`（发卡 Sign & Deploy）；与 iOS `RechargeBonusRule` / `fetchProgramRechargeBonusRules` 对齐。
+ */
+data class RechargeBonusRule(
+    val paymentAmount: Double,
+    val bonusValue: Double,
+    /** Biz “Percentage” / `shareTokenMetadata.bonusProportional`: bonus = principal * (bonusValue / paymentAmount). */
+    val bonusProportional: Boolean = false,
+)
+
+/** Home / receipt：整数不显示小数，否则两位小数（与 iOS `formatHomeBonusAmount` 一致） */
+internal fun formatHomeBonusAmount(v: Double): String {
+    val r = kotlin.math.round(v * 100.0) / 100.0
+    val iv = kotlin.math.round(r).toLong()
+    return if (kotlin.math.abs(r - iv.toDouble()) < 1e-9) iv.toString() else String.format(Locale.US, "%.2f", r)
+}
+
+/** 比例档位奖励：`bonusValue / paymentAmount` 为百分比展示（与 iOS `homeRechargeBonusTierPercentLabel` 一致） */
+private fun homeRechargeBonusTierPercentLabel(rule: RechargeBonusRule): String {
+    if (rule.paymentAmount <= 1e-9) return "0"
+    val p = (rule.bonusValue / rule.paymentAmount) * 100.0
+    val r = kotlin.math.round(p * 100.0) / 100.0
+    val rounded = kotlin.math.round(r).toLong().toDouble()
+    return if (kotlin.math.abs(r - rounded) < 0.01) {
+        kotlin.math.round(r).toLong().toString()
+    } else {
+        String.format(Locale.US, "%.2f", r)
+    }
+}
+
+/** 折扣百分比四舍五入为整数并去掉 `0%`；与 iOS `homeDashboardFormatDiscountSummaryForDisplay` 一致 */
+private fun homeDashboardFormatDiscountSummaryForDisplay(summary: String?): String? {
+    var s = summary?.trim().orEmpty()
+    if (s.isEmpty()) return null
+    val re = Regex("(\\d+(?:\\.\\d+)?)\\s*%")
+    val sb = StringBuilder(s)
+    val matchList = re.findAll(s).toList().sortedByDescending { it.range.first }
+    for (m in matchList) {
+        val numStr = m.groupValues.getOrNull(1) ?: continue
+        val v = numStr.toDoubleOrNull() ?: continue
+        val intPct = kotlin.math.round(v).toInt()
+        val replacement = if (intPct <= 0) "" else "$intPct%"
+        sb.replace(m.range.first, m.range.last + 1, replacement)
+    }
+    var t = sb.toString().trim()
+    val trimChars = setOf('+', '/', ',', '·', '•')
+    while (t.isNotEmpty() && t.first() in trimChars) {
+        t = t.drop(1).trim()
+    }
+    while (t.isNotEmpty() && t.last() in trimChars) {
+        t = t.dropLast(1).trim()
+    }
+    t = t.replace(Regex("\\s+"), " ").trim()
+    return t.takeIf { it.isNotEmpty() }
+}
+
+/** 至少有一处 `…%` 四舍五入为大于 0 的整数时才显示 tier 折扣（与 iOS `homeDashboardShowsTierDiscountRow` 一致） */
+private fun homeDashboardShowsTierDiscountRow(summary: String?): Boolean {
+    val raw = summary?.trim().orEmpty()
+    if (raw.isEmpty()) return false
+    if (raw == "—" || raw == "–" || raw == "-") return false
+    val re = Regex("(\\d+(?:\\.\\d+)?)\\s*%")
+    val matches = re.findAll(raw)
+    if (matches.none()) return false
+    var maxIntPct = 0
+    for (m in matches) {
+        val v = m.groupValues.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        maxIntPct = maxOf(maxIntPct, kotlin.math.round(v).toInt())
+    }
+    return maxIntPct > 0
+}
+
+// 首页右上角管理员胶囊：有 @handle 或 display name 才展示（与 iOS `homeAdminCapsuleHasPresentableIdentity` 一致）
+private fun homeAdminCapsuleHasPresentableIdentity(profile: TerminalProfile): Boolean {
+    val tag = sanitizeProfileNamePart(profile.accountName)
+    if (tag.isNotEmpty()) return true
+    val f = sanitizeProfileNamePart(profile.first_name)
+    val lastRaw = profile.last_name?.trim()?.split("\r\n")?.firstOrNull() ?: ""
+    val l0 = if (lastRaw.startsWith("{")) "" else sanitizeProfileNamePart(lastRaw)
+    val both = "$f $l0".trim()
+    return both.isNotEmpty()
 }
 
 /** getUIDAssets API 返回结构；多卡时使用 cards，兼容单卡 legacy 字段。cardBackground/cardImage 来自该卡用户拥有的最佳 NFT 的 tier metadata；tierName/tierDescription 来自 tier 或卡级 metadata。 */
@@ -617,6 +699,164 @@ class MainActivity : ComponentActivity() {
         return if (posTerminalPolicy.allowPayerUsdcInCharge) raw.toLong() else 0L
     }
 
+    private fun org.json.JSONObject.optBonusProportional(): Boolean {
+        val keys = arrayOf("bonusProportional", "bonusIsProportional", "percentBased", "proportionalBonus", "percentage")
+        for (k in keys) {
+            when (val v = this.opt(k)) {
+                is Boolean -> if (v) return true
+                is Number -> if (v.toInt() != 0) return true
+                is String -> {
+                    val s = v.trim().lowercase(Locale.US)
+                    if (s == "true" || s == "1") return true
+                }
+            }
+        }
+        return false
+    }
+
+    private fun parseOneRechargeBonusRule(o: org.json.JSONObject): RechargeBonusRule? {
+        val pay = when (val v = o.opt("paymentAmount")) {
+            is Number -> v.toDouble()
+            is String -> v.trim().replace(",", ".").toDoubleOrNull() ?: return null
+            else -> return null
+        }
+        val bonus = when (val v = o.opt("bonusValue")) {
+            is Number -> v.toDouble()
+            is String -> v.trim().replace(",", ".").toDoubleOrNull() ?: return null
+            else -> return null
+        }
+        if (!pay.isFinite() || pay <= 0.0) return null
+        if (!bonus.isFinite() || bonus < 0.0) return null
+        if (bonus <= 0.0) return null
+        val prop = o.optBonusProportional()
+        return RechargeBonusRule(
+            paymentAmount = kotlin.math.round(pay * 100.0) / 100.0,
+            bonusValue = kotlin.math.round(bonus * 100.0) / 100.0,
+            bonusProportional = prop,
+        )
+    }
+
+    /** Card issuance: tiers live in `metadata.shareTokenMetadata` or top-level `metadata` (biz `createBeamioCard`). */
+    private fun parseRechargeBonusRulesFromMetadata(meta: org.json.JSONObject): List<RechargeBonusRule> {
+        val direct = parseRechargeBonusRulesDirect(meta)
+        if (direct.isNotEmpty()) return direct.sortedBy { it.paymentAmount }
+        val stm = meta.optJSONObject("shareTokenMetadata") ?: return emptyList()
+        return parseRechargeBonusRulesDirect(stm).sortedBy { it.paymentAmount }
+    }
+
+    private fun parseRechargeBonusRulesDirect(meta: org.json.JSONObject): List<RechargeBonusRule> {
+        val out = mutableListOf<RechargeBonusRule>()
+        val arr = meta.optJSONArray("bonusRules")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val row = arr.optJSONObject(i) ?: continue
+                parseOneRechargeBonusRule(row)?.let { out.add(it) }
+            }
+        } else {
+            val single = meta.optJSONObject("bonusRule")
+            if (single != null) parseOneRechargeBonusRule(single)?.let { out.add(it) }
+        }
+        return out
+    }
+
+    /** `GET /api/cardMetadata?cardAddress=` → `metadata` or `metadata.shareTokenMetadata` bonus fields；失败返回空列表 */
+    private fun fetchProgramRechargeBonusRulesSync(programCardAddress: String): List<RechargeBonusRule> {
+        val key = programCardAddress.trim()
+        if (key.isEmpty() || !looksLikeEthereumAddress(key)) return emptyList()
+        return try {
+            val enc = java.net.URLEncoder.encode(key, "UTF-8")
+            val url = java.net.URL("$BEAMIO_API/api/cardMetadata?cardAddress=$enc")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            if (code !in 200..299) return emptyList()
+            val root = org.json.JSONObject(body)
+            val meta = root.optJSONObject("metadata") ?: return emptyList()
+            parseRechargeBonusRulesFromMetadata(meta)
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    /** 与 iOS `posTopupMethodRawAllowed`：Terminal Onboarding `allowedTopupMethods` */
+    private fun posTopupMethodRawAllowed(methodRaw: String): Boolean {
+        val m = methodRaw.trim().lowercase(Locale.US)
+        return when (m) {
+            "creditcard", "credit_card" -> posTerminalPolicy.allowTopupBankCard
+            "usdc" -> posTerminalPolicy.allowTopupUsdc
+            "cash" -> posTerminalPolicy.allowTopupCash
+            "bonus" -> posTerminalPolicy.allowTopupAirdrop
+            else -> false
+        }
+    }
+
+    private fun resolveTopupMethodRawForSplit(): String {
+        val raw = pendingTopupMethodRaw.trim().ifEmpty { TopupPaymentMethodOption.CREDIT_CARD.rawValue }
+        return when (raw.lowercase(Locale.US)) {
+            "creditcard", "credit_card" -> "creditCard"
+            else -> raw
+        }
+    }
+
+    private fun topupKeypadPrincipalForBonusMatch(keypadAmount: String): Double {
+        val keypadStored = pendingTopupKeypadAmount.trim().replace(",", "")
+        val base = if (keypadStored.isEmpty()) keypadAmount.trim().replace(",", "") else keypadStored
+        return base.toDoubleOrNull() ?: 0.0
+    }
+
+    /**
+     * 多档命中取 `paymentAmount` 最大的一档；实付 principal **≥** 该档即命中（与 iOS `selectProgramRechargeBonusRule` 一致）。
+     */
+    private fun selectProgramRechargeBonusRule(principal: Double): RechargeBonusRule? {
+        if (principal <= 0.0 || programRechargeBonusRules.isEmpty()) return null
+        var best: RechargeBonusRule? = null
+        for (r in programRechargeBonusRules) {
+            if (principal + 1e-9 >= r.paymentAmount) {
+                if (best == null || r.paymentAmount > best.paymentAmount) best = r
+            }
+        }
+        return best
+    }
+
+    /**
+     * @return Pair(apiAmountString, precomputedSplit or null)。Activate Bonus 或 `bonus` 方式不叠 program 档 bonus。
+     */
+    private fun resolveTopupApiAmountAndSplit(keypadAmountString: String, methodRaw: String): Pair<String, NfcTopupCurrencySplit?> {
+        val normalized = keypadAmountString.trim().replace(",", "")
+        val mlow = methodRaw.trim().lowercase(Locale.US)
+        val skipProgramBonus = pendingTopupBonusExpanded || mlow == "bonus"
+        val principal = topupKeypadPrincipalForBonusMatch(normalized)
+        val rule = if (skipProgramBonus) null else selectProgramRechargeBonusRule(principal)
+        if (rule == null) {
+            val split = resolvedNfcTopupCurrencySplit(normalized)
+            return Pair(normalized, split)
+        }
+        val programBonus = if (rule.bonusProportional && rule.paymentAmount > 1e-9) {
+            kotlin.math.round(principal * rule.bonusValue / rule.paymentAmount * 100.0) / 100.0
+        } else {
+            rule.bonusValue
+        }
+        val total = principal + programBonus
+        if (total <= 0.0) {
+            val split = resolvedNfcTopupCurrencySplit(normalized)
+            return Pair(normalized, split)
+        }
+        val apiStr = String.format(Locale.US, "%.2f", kotlin.math.round(total * 100.0) / 100.0)
+        // Program bonus is already folded into apiStr; do not stack Activate Bonus / UI percent here (iOS parity).
+        val split = nfcTopupCurrencySplitFromPosKeypad(
+            keypadAmount = apiStr,
+            methodRaw = methodRaw,
+            bonusExpanded = false,
+            selectedBonusRate = 0,
+        ) ?: nfcTopupCurrencySplitAllCard(apiStr)
+        return Pair(apiStr, split)
+    }
+
     private fun infraCardAddress(): String = beamioUserCardAssetAddressRuntime
 
     /**
@@ -810,6 +1050,8 @@ class MainActivity : ComponentActivity() {
     private var dashboardInfraDiscountSummary by mutableStateOf<String?>(null)
     /** 当前 POS `merchantInfraCard` 对应行的 `cardName`（BeamioUserCard JSON metadata `name`）；与 iOS `homeMerchantProgramCardName` 对齐 */
     private var dashboardMerchantProgramCardName by mutableStateOf<String?>(null)
+    /** `GET /api/cardMetadata` → `metadata.bonusRules` / `bonusRule`；与 iOS `programRechargeBonusRules` 对齐 */
+    private var programRechargeBonusRules by mutableStateOf<List<RechargeBonusRule>>(emptyList())
 
     private val cardStatsVerifyLock = Any()
     @Volatile private var cardStatsVerifyThreadRunning = false
@@ -1645,12 +1887,6 @@ class MainActivity : ComponentActivity() {
                         topUpAmount = cardTopUpAmount,
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
-                        onCopyWalletClick = {
-                            if (BeamioWeb3Wallet.isInitialized()) {
-                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                cm?.setPrimaryClip(ClipData.newPlainText("wallet", BeamioWeb3Wallet.getAddress()))
-                            }
-                        },
                         onLinkAppClick = { startLinkAppFlow() },
                         onReadClick = { startReadUid() },
                         onTopupClick = {
@@ -1669,8 +1905,8 @@ class MainActivity : ComponentActivity() {
                         },
                         contentAboveCharge = { WelcomePanelNoAA(modifier = Modifier.fillMaxWidth(), compact = true) },
                         merchantProgramCardName = dashboardMerchantProgramCardName,
-                        infraRoutingTaxPercent = dashboardInfraTaxPercent,
                         infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
+                        rechargeBonusRules = programRechargeBonusRules,
                         modifier = Modifier.fillMaxSize()
                     )
                     else -> NdefScreen(
@@ -1685,14 +1921,8 @@ class MainActivity : ComponentActivity() {
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
                         merchantProgramCardName = dashboardMerchantProgramCardName,
-                        infraRoutingTaxPercent = dashboardInfraTaxPercent,
                         infraRoutingDiscountSummary = dashboardInfraDiscountSummary,
-                        onCopyWalletClick = {
-                            if (BeamioWeb3Wallet.isInitialized()) {
-                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                cm?.setPrimaryClip(ClipData.newPlainText("wallet", BeamioWeb3Wallet.getAddress()))
-                            }
-                        },
+                        rechargeBonusRules = programRechargeBonusRules,
                         onLinkAppClick = { startLinkAppFlow() },
                         onReadClick = { startReadUid() },
                         onTopupClick = {
@@ -1792,7 +2022,7 @@ class MainActivity : ComponentActivity() {
         val normalizedAmt = forApiTotalAmount.trim().replace(",", "")
         val keypadStored = pendingTopupKeypadAmount.trim().replace(",", "")
         val keypadBase = if (keypadStored.isEmpty()) normalizedAmt else keypadStored
-        val methodRaw = pendingTopupMethodRaw.trim().ifEmpty { TopupPaymentMethodOption.CREDIT_CARD.rawValue }
+        val methodRaw = resolveTopupMethodRawForSplit()
         return nfcTopupCurrencySplitFromPosKeypad(
             keypadAmount = keypadBase,
             methodRaw = methodRaw,
@@ -3143,6 +3373,21 @@ class MainActivity : ComponentActivity() {
             try {
                 Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid fromScanMethodFlow=$fromScanMethodFlow")
                 refreshMerchantInfraCardFromDbSync()
+                val methodRaw = resolveTopupMethodRawForSplit()
+                if (!posTopupMethodRawAllowed(methodRaw)) {
+                    val err = "This top-up method is not enabled for this terminal. Ask the merchant to update Terminal Onboarding."
+                    runOnUiThread {
+                        topupNfcExecuteInProgress = false
+                        topupScreenStatus = TopupStatus.Error
+                        topupScreenError = err
+                        if (fromScanMethodFlow) {
+                            nfcFetchingInfo = false
+                            nfcFetchError = err
+                        }
+                    }
+                    return@Thread
+                }
+                val (apiAmount, split) = resolveTopupApiAmountAndSplit(amount, methodRaw)
                 val sunParams = readSunParamsFromNdef(tag)
                 // NFC 格式（14 位 hex uid）必须提供 SUN 参数，不符合 SUN 或无法推导 tagID 的不予受理
                 val isNfcUid = uid.length == 14 && uid.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
@@ -3178,7 +3423,7 @@ class MainActivity : ComponentActivity() {
                 // Admin mint 路径由服务端 nfcTopupPrepare 支持首发/普通充值（MemberCard: 不再在 prepare 层阻断无会员卡用户）；
                 // 不得以 getUIDAssets 的 cards/nfts 为空做本地拦截（客户尚无点数/卡行未展开时易误判）。
 
-                val prepare = nfcTopupPrepare(uid, amount, sunParams, topupPrepareCurrencyFromInfraSync())
+                val prepare = nfcTopupPrepare(uid, apiAmount, sunParams, topupPrepareCurrencyFromInfraSync())
                 if (prepare.error != null) {
                     runOnUiThread {
                         topupNfcExecuteInProgress = false
@@ -3197,7 +3442,7 @@ class MainActivity : ComponentActivity() {
                 val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
                 val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
                 val memberNo = memberNoFromCardItem(topupCard)
-                validateTopupMeetsMinimumTierForNonMemberSync(amount, cardAddr, topupCard, preCurrency, preAssets.aaAddress)?.let { err ->
+                validateTopupMeetsMinimumTierForNonMemberSync(apiAmount, cardAddr, topupCard, preCurrency, preAssets.aaAddress)?.let { err ->
                     runOnUiThread {
                         topupNfcExecuteInProgress = false
                         topupScreenStatus = TopupStatus.Error
@@ -3232,10 +3477,9 @@ class MainActivity : ComponentActivity() {
                     prepare.deadline!!,
                     prepare.nonce!!
                 )
-                val split = resolvedNfcTopupCurrencySplit(amount)
                 val result = nfcTopup(
                     uid,
-                    amount,
+                    apiAmount,
                     prepare.cardAddr!!,
                     prepare.data!!,
                     prepare.deadline!!,
@@ -3382,7 +3626,14 @@ class MainActivity : ComponentActivity() {
             try {
                 Log.d("Topup", "[Topup Debug] executeTopupWithBeamioTag entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | beamioTag=$beamioTag")
                 refreshMerchantInfraCardFromDbSync()
-                val prepare = nfcTopupPrepareWithBeamioTag(beamioTag, amount, topupPrepareCurrencyFromInfraSync())
+                val methodRaw = resolveTopupMethodRawForSplit()
+                if (!posTopupMethodRawAllowed(methodRaw)) {
+                    val err = "This top-up method is not enabled for this terminal. Ask the merchant to update Terminal Onboarding."
+                    runOnUiThread { applyTopupQrScanScreenError(err) }
+                    return@Thread
+                }
+                val (apiAmount, split) = resolveTopupApiAmountAndSplit(amount, methodRaw)
+                val prepare = nfcTopupPrepareWithBeamioTag(beamioTag, apiAmount, topupPrepareCurrencyFromInfraSync())
                 if (prepare.error != null) {
                     runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
                     return@Thread
@@ -3393,7 +3644,7 @@ class MainActivity : ComponentActivity() {
                     return@Thread
                 }
                 runOnUiThread { topupScreenWallet = wallet }
-                executeWalletTopupInternal(wallet, amount, prepare)
+                executeWalletTopupInternal(wallet, prepare, apiAmount, split)
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeTopupWithBeamioTag", e)
                 runOnUiThread { applyTopupQrScanScreenError(e.message ?: "Execution failed") }
@@ -3406,12 +3657,19 @@ class MainActivity : ComponentActivity() {
             try {
                 Log.d("Topup", "[Topup Debug] executeWalletTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | customerWallet=$wallet")
                 refreshMerchantInfraCardFromDbSync()
-                val prepare = nfcTopupPrepareWithWallet(wallet, amount, topupPrepareCurrencyFromInfraSync())
+                val methodRaw = resolveTopupMethodRawForSplit()
+                if (!posTopupMethodRawAllowed(methodRaw)) {
+                    val err = "This top-up method is not enabled for this terminal. Ask the merchant to update Terminal Onboarding."
+                    runOnUiThread { applyTopupQrScanScreenError(err) }
+                    return@Thread
+                }
+                val (apiAmount, split) = resolveTopupApiAmountAndSplit(amount, methodRaw)
+                val prepare = nfcTopupPrepareWithWallet(wallet, apiAmount, topupPrepareCurrencyFromInfraSync())
                 if (prepare.error != null) {
                     runOnUiThread { applyTopupQrScanScreenError(prepare.error!!) }
                     return@Thread
                 }
-                executeWalletTopupInternal(wallet, amount, prepare)
+                executeWalletTopupInternal(wallet, prepare, apiAmount, split)
             } catch (e: Exception) {
                 Log.e("MainActivity", "executeWalletTopup", e)
                 runOnUiThread { applyTopupQrScanScreenError(e.message ?: "Execution failed") }
@@ -3419,7 +3677,12 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    private fun executeWalletTopupInternal(wallet: String, amount: String, prepare: NfcTopupPrepareResult) {
+    private fun executeWalletTopupInternal(
+        wallet: String,
+        prepare: NfcTopupPrepareResult,
+        apiAmount: String,
+        split: NfcTopupCurrencySplit?,
+    ) {
         try {
                 refreshMerchantInfraCardFromDbSync()
                 // 1. Pull balance first; if EOA has no AA yet, ensure AA then retry once (QR / beamioTag topup).
@@ -3444,7 +3707,7 @@ class MainActivity : ComponentActivity() {
                 val preBalanceStr = topupCard?.points ?: preAssets.points ?: "0"
                 val preCurrency = topupCard?.cardCurrency ?: preAssets.cardCurrency ?: "CAD"
                 val memberNo = memberNoFromCardItem(topupCard)
-                validateTopupMeetsMinimumTierForNonMemberSync(amount, cardAddr, topupCard, preCurrency, preAssets.aaAddress)?.let { err ->
+                validateTopupMeetsMinimumTierForNonMemberSync(apiAmount, cardAddr, topupCard, preCurrency, preAssets.aaAddress)?.let { err ->
                     runOnUiThread { applyTopupQrScanScreenError(err) }
                     return
                 }
@@ -3471,7 +3734,6 @@ class MainActivity : ComponentActivity() {
                     prepare.deadline!!,
                     prepare.nonce!!
                 )
-                val split = resolvedNfcTopupCurrencySplit(amount)
                 val result = nfcTopupWithWallet(
                     wallet,
                     prepare.cardAddr!!,
@@ -5779,6 +6041,11 @@ class MainActivity : ComponentActivity() {
                 merchantProgramMetadataDisplayNameFromAssets(assets, infra)
             } else null
             val routing = if (detail?.allowed == true) fetchInfraRoutingForTerminalWalletSync(wTrim) else null
+            val rechargeBonusRules = if (detail?.allowed == true) {
+                fetchProgramRechargeBonusRulesSync(infra)
+            } else {
+                emptyList()
+            }
 
             runOnUiThread {
                 terminalProfile = mergeTerminalProfileWithRegisteredTag(wTrim, profile)
@@ -5796,6 +6063,7 @@ class MainActivity : ComponentActivity() {
                     dashboardInfraTaxPercent = routing.first
                     dashboardInfraDiscountSummary = routing.second
                 }
+                programRechargeBonusRules = rechargeBonusRules
             }
         } catch (_: Exception) {
             // best-effort
@@ -8037,7 +8305,30 @@ private fun TopupSuccessContent(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text("TX Hash", fontSize = 13.sp, color = Color(0xFF86868b))
-                            Text(shortTxHash, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
+                            val txUri = baseScanTransactionUri(txHash)
+                            if (txUri != null) {
+                                Surface(
+                                    modifier = Modifier.clickable {
+                                        try {
+                                            context.startActivity(Intent(Intent.ACTION_VIEW, txUri))
+                                        } catch (_: Exception) {
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(999.dp),
+                                    color = Color(0xFF1562f0).copy(alpha = 0.06f)
+                                ) {
+                                    Text(
+                                        shortTxHash,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color(0xFF1562f0),
+                                        fontFamily = FontFamily.Monospace,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
+                            } else {
+                                Text(shortTxHash, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color(0xFF1562f0))
+                            }
                         }
                     }
                     Row(
@@ -10667,98 +10958,125 @@ private fun HomeDashboardStatLoadingPlaceholder(
     }
 }
 
+/** Tier 折扣（左）与充值奖励（右）同一行；多条奖励时首行带折扣（与 iOS `homeDashboardBonusDiscountSection` 一致） */
 @Composable
-private fun HomeDashboardTaxAndTierRoutingRow(
-    taxPercent: Double?,
-    discountSummary: String?,
+private fun HomeDashboardBonusDiscountSection(
+    rechargeBonusRules: List<RechargeBonusRule>,
+    infraRoutingDiscountSummary: String?,
     modifier: Modifier = Modifier
 ) {
-    SubcomposeLayout(modifier = modifier.fillMaxWidth()) { constraints ->
-        val spacingPx = 8.dp.roundToPx()
-        val taxMeasurable = subcompose("tax") {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(24.dp)
-                        .background(Color(0xFFFFC107).copy(alpha = 0.22f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Filled.Percent,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = Color(0xFFFFC107)
-                    )
-                }
-                Text(
-                    taxPercent?.let { v ->
-                        String.format(java.util.Locale.US, "%.2f%%", v)
-                    } ?: "—",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.White.copy(alpha = 0.95f),
-                    maxLines = 1
-                )
-            }
-        }.first()
-        val taxPlaceable = taxMeasurable.measure(
-            Constraints(
-                minWidth = 0,
-                maxWidth = constraints.maxWidth,
-                minHeight = 0,
-                maxHeight = constraints.maxHeight
-            )
-        )
-        val tierMaxW = (constraints.maxWidth - taxPlaceable.width - spacingPx).coerceAtLeast(0)
-        val tierMeasurable = subcompose("tier") {
+    val brandBlue = Color(0xFF1562F0)
+    val formattedDiscount = homeDashboardFormatDiscountSummaryForDisplay(infraRoutingDiscountSummary)
+    val showDiscount =
+        homeDashboardShowsTierDiscountRow(infraRoutingDiscountSummary) && formattedDiscount != null
+    if (!showDiscount && rechargeBonusRules.isEmpty()) return
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (rechargeBonusRules.isEmpty() && showDiscount && formattedDiscount != null) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(24.dp)
-                        .background(Color(0xFF1562f0).copy(alpha = 0.22f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        Icons.Filled.Layers,
-                        contentDescription = null,
-                        modifier = Modifier.size(14.dp),
-                        tint = Color(0xFF1562f0)
-                    )
-                }
-                Text(
-                    discountSummary ?: "—",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.White.copy(alpha = 0.95f),
-                    maxLines = 1,
-                    softWrap = false,
-                    textAlign = TextAlign.End,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .basicMarquee()
-                )
+                HomeDashboardDiscountLeadingInline(displaySummary = formattedDiscount, brandBlue = brandBlue)
+                Spacer(Modifier.weight(1f))
             }
-        }.first()
-        val tierPlaceable = tierMeasurable.measure(
-            Constraints(
-                minWidth = 0,
-                maxWidth = tierMaxW,
-                minHeight = 0,
-                maxHeight = constraints.maxHeight
+        } else {
+            rechargeBonusRules.forEachIndexed { idx, r ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (idx == 0 && showDiscount && formattedDiscount != null) {
+                        HomeDashboardDiscountLeadingInline(displaySummary = formattedDiscount, brandBlue = brandBlue)
+                    }
+                    Spacer(Modifier.weight(1f))
+                    HomeDashboardSingleBonusLine(rule = r, brandBlue = brandBlue)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeDashboardDiscountLeadingInline(displaySummary: String, brandBlue: Color) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .background(brandBlue.copy(alpha = 0.22f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                Icons.Filled.Layers,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = brandBlue
             )
+        }
+        Text(
+            displaySummary,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.White.copy(alpha = 0.95f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
-        val h = maxOf(taxPlaceable.height, tierPlaceable.height)
-        layout(constraints.maxWidth, h) {
-            taxPlaceable.placeRelative(0, (h - taxPlaceable.height) / 2)
-            tierPlaceable.placeRelative(taxPlaceable.width + spacingPx, (h - tierPlaceable.height) / 2)
+    }
+}
+
+@Composable
+private fun HomeDashboardSingleBonusLine(rule: RechargeBonusRule, brandBlue: Color) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (rule.bonusProportional) {
+            Text(
+                "Start \$${formatHomeBonusAmount(rule.paymentAmount)}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White.copy(alpha = 0.92f)
+            )
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = Color.White.copy(alpha = 0.45f)
+            )
+            Text(
+                "Get ${homeRechargeBonusTierPercentLabel(rule)}%",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = brandBlue.copy(alpha = 0.98f)
+            )
+        } else {
+            Text(
+                "Pay \$${formatHomeBonusAmount(rule.paymentAmount)}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White.copy(alpha = 0.92f)
+            )
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = Color.White.copy(alpha = 0.45f)
+            )
+            Text(
+                "Get \$${formatHomeBonusAmount(rule.paymentAmount + rule.bonusValue)}",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = brandBlue.copy(alpha = 0.98f)
+            )
         }
     }
 }
@@ -10861,11 +11179,10 @@ fun NdefScreen(
     topUpStatsRpcWarning: Boolean = false,
     /** Program / infrastructure BeamioUserCard metadata `name` (`cards[].cardName`) for home black card */
     merchantProgramCardName: String? = null,
-    /** From on-chain admin metadata `tierRoutingDiscounts.taxRatePercent`; null until first successful 15s sync */
-    infraRoutingTaxPercent: Double? = null,
-    /** One line: all tier `discountPercent` in JSON order, e.g. `5% · 10% · 18%` */
+    /** One line: all tier `discountPercent` in JSON order, e.g. `5% · 10% · 18%`（首页黑卡与 iOS 一致：仅参与 tier 折扣行，不展示税率） */
     infraRoutingDiscountSummary: String? = null,
-    onCopyWalletClick: () -> Unit,
+    /** Program card `/api/cardMetadata` → `metadata.bonusRules` (Terminal Onboarding gate same as program line) */
+    rechargeBonusRules: List<RechargeBonusRule> = emptyList(),
     onLinkAppClick: () -> Unit,
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
@@ -10874,13 +11191,6 @@ fun NdefScreen(
     contentAboveCharge: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
-    var walletCopied by mutableStateOf(false)
-    LaunchedEffect(walletCopied) {
-        if (walletCopied) {
-            delay(2000)
-            walletCopied = false
-        }
-    }
     LaunchedEffect(walletAddress) {
         Log.d("Home", "[Home Debug] charge panel ID address (walletAddress)=${walletAddress ?: "null"}")
     }
@@ -10927,11 +11237,11 @@ fun NdefScreen(
                     Text(titleLine, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
                 }
             }
-            // Right: admin BeamioCapsule (avatar + displayName + @accountName)
-            if (adminProfile != null) {
+            // Right: admin BeamioCapsule（与 iOS 一致：有可展示身份时才显示；fallbackAddress 不传）
+            if (adminProfile != null && homeAdminCapsuleHasPresentableIdentity(adminProfile)) {
                 BeamioCapsuleCompact(
                     profile = adminProfile,
-                    fallbackAddress = adminProfile.address,
+                    fallbackAddress = null,
                     modifier = Modifier
                 )
             }
@@ -10960,7 +11270,7 @@ fun NdefScreen(
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalAlignment = Alignment.Top
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
@@ -10970,7 +11280,7 @@ fun NdefScreen(
                                 ) {
                                     Icon(Icons.Filled.ArrowDownward, null, Modifier.size(10.dp), tint = Color(0xFF1562f0))
                                 }
-                                Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                                Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.55f))
                                 Text("Today", fontSize = 9.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1562f0), modifier = Modifier.background(Color(0xFF1562f0).copy(alpha = 0.15f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
                             }
                             if (chargeAmount != null) {
@@ -10985,7 +11295,7 @@ fun NdefScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier.alignByBaseline()
                                     ) {
-                                        Text(decPart, fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                        Text(decPart, fontSize = 14.sp, color = Color.White.copy(alpha = 0.55f), modifier = Modifier.alignByBaseline())
                                         if (chargeStatsRpcWarning) {
                                             Spacer(modifier = Modifier.width(4.dp))
                                             Icon(
@@ -11008,14 +11318,21 @@ fun NdefScreen(
                                 .background(Color.White.copy(alpha = 0.1f))
                         )
                         Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Spacer(modifier = Modifier.weight(1f))
                                 Box(
                                     modifier = Modifier.size(18.dp).background(Color(0xFF34C759).copy(alpha = 0.2f), CircleShape),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Icon(Icons.Filled.ArrowUpward, null, Modifier.size(10.dp), tint = Color(0xFF34C759))
                                 }
-                                Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
+                                Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.55f))
                             }
                             if (topUpAmount != null) {
                                 Row(
@@ -11033,7 +11350,7 @@ fun NdefScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier.alignByBaseline()
                                     ) {
-                                        Text(decPart, fontSize = 14.sp, color = Color(0xFF86868b), modifier = Modifier.alignByBaseline())
+                                        Text(decPart, fontSize = 14.sp, color = Color.White.copy(alpha = 0.55f), modifier = Modifier.alignByBaseline())
                                         if (topUpStatsRpcWarning) {
                                             Spacer(modifier = Modifier.width(4.dp))
                                             Icon(
@@ -11063,50 +11380,10 @@ fun NdefScreen(
                                 .padding(top = 10.dp)
                         )
                     }
-                    HomeDashboardTaxAndTierRoutingRow(
-                        taxPercent = infraRoutingTaxPercent,
-                        discountSummary = infraRoutingDiscountSummary,
-                        modifier = Modifier.padding(top = 6.dp)
+                    HomeDashboardBonusDiscountSection(
+                        rechargeBonusRules = rechargeBonusRules,
+                        infraRoutingDiscountSummary = infraRoutingDiscountSummary
                     )
-                    // Bottom row: ID + SECURED (compact)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        if (walletAddress != null) {
-                            Row(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable {
-                                        onCopyWalletClick()
-                                        walletCopied = true
-                                    },
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                val shortAddr = if (walletAddress.length >= 10) {
-                                    walletAddress.take(5) + "..." + walletAddress.takeLast(5)
-                                } else walletAddress
-                                Text("ID: $shortAddr", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color.White)
-                                Icon(
-                                    if (walletCopied) Icons.Filled.Check else Icons.Filled.ContentCopy,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(14.dp),
-                                    tint = if (walletCopied) Color(0xFF34C759) else Color.White.copy(alpha = 0.8f)
-                                )
-                            }
-                        }
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(Icons.Filled.Shield, null, Modifier.size(16.dp), tint = Color(0xFF1562f0))
-                            Text("SECURED", fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Color.White)
-                        }
-                    }
                 }
             }
 
@@ -13645,7 +13922,6 @@ fun GreetingPreview() {
             readUrlText = "https://api.beamio.app/api/sun?e=...&c=...&m=...",
             readParamText = "e=...\nc=000001 (counter=1)\nm=...",
             walletAddress = "0x1234567890abcdef1234567890abcdef12345678",
-            onCopyWalletClick = {},
             onLinkAppClick = {},
             onReadClick = {},
             onTopupClick = {},

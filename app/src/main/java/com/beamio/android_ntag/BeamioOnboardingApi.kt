@@ -21,8 +21,8 @@ object BeamioOnboardingApi {
     private const val TAG = "BeamioOnboarding"
     private const val BEAMIO_API = "https://beamio.app"
     /** iOS `BeamioConstants.beamioAccountRegistryAddress` */
-    private const val ACCOUNT_REGISTRY = "0x3E15607BCf98B01e6C7dF834a2CEc7B8B6aFb1BC"
-    private const val CONET_RPC = "https://mainnet-rpc.conet.network"
+    private const val ACCOUNT_REGISTRY = "0x46cBFC3f77b320Db545D1DC21138fa1ED2Fa3df3"
+    private const val CONET_RPC = "https://rpc1.conet.network"
 
     /**
      * `GET /api/search-users-by-card-owner-or-admin` — program card + issuers; no device wallet yet.
