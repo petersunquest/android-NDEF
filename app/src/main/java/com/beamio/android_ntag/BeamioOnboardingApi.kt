@@ -21,7 +21,7 @@ object BeamioOnboardingApi {
     private const val TAG = "BeamioOnboarding"
     private const val BEAMIO_API = "https://beamio.app"
     /** iOS `BeamioConstants.beamioAccountRegistryAddress` */
-    private const val ACCOUNT_REGISTRY = "0x2dF9c4c51564FfF861965572CE11ebe27d3C1B35"
+    private const val ACCOUNT_REGISTRY = "0x4afaca09cf8307070a83836223Ae129073eC92e5"
     private const val CONET_RPC = "https://rpc1.conet.network"
 
     /**
