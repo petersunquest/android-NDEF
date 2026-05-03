@@ -33,7 +33,8 @@ object BeamioConetTerminalMessaging {
     private const val LOG_TAG = "BeamioConetPOS"
 
     private const val CONET_MAINNET_RPC = "https://rpc1.conet.network"
-    private const val CONET_PGP_MANAGER = "0x13a96bcd6ab010619d1004a1cb4f5fe149e0f4c4"
+    /** CoNET AddressPGP（与 iOS `BeamioConstants.conetAddressPgpManager`、`x402sdk/db.addressPGP`、`deployments/conet-addresses.json` 一致）。 */
+    private const val CONET_PGP_MANAGER = "0xb2aABe52f476356AE638839A786EAE425A0c1b66"
     private const val BEAMIO_API = "https://beamio.app"
     private const val SEARCH_KEY_SELECTOR = "052f2778"
 

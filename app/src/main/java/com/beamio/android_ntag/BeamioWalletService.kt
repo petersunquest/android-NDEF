@@ -28,8 +28,6 @@ import java.io.File
 object BeamioWalletService {
     private const val TAG = "BeamioWalletService"
     private const val BEAMIO_API = "https://beamio.app"
-    private const val CONET_RPC = "https://rpc1.conet.network"
-    private const val ACCOUNT_REGISTRY = "0x4afaca09cf8307070a83836223Ae129073eC92e5"
 
     // Argon2id 参数：与 web defaultBrowserParams 一致（32MB, 3 iter, 1 parallel）
     private const val ARGON2_MEMORY_KB = 32 * 1024
@@ -129,11 +127,12 @@ object BeamioWalletService {
     /** 创建钱包并登记到 Beamio */
     fun createRecover(beamioName: String, pin: String): CreateRecoverResult? {
         return try {
-            val trimmedName = beamioName.trim().replace(Regex("^@+"), "")
+            val trimmedName = BeamioTagRules.normalizeInput(beamioName).trim()
             if (trimmedName.length < 3) return null
 
-            if (!checkBeamioAccountAvailable(trimmedName)) {
-                Log.e(TAG, "BeamioTag $trimmedName is already taken")
+            val availOk = BeamioOnboardingApi.isBeamioAccountNameAvailableSync(trimmedName)
+            if (availOk != true) {
+                Log.e(TAG, "BeamioTag $trimmedName not verified available on-chain (avail=$availOk)")
                 return null
             }
 
@@ -201,45 +200,6 @@ object BeamioWalletService {
             Log.e(TAG, "createRecover failed", e)
             null
         }
-    }
-
-    fun checkBeamioAccountAvailable(accountName: String): Boolean {
-        return try {
-            val conn = URL(CONET_RPC).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.doOutput = true
-            conn.connectTimeout = 15000
-            conn.readTimeout = 15000
-            val data = encodeIsAccountNameAvailable(accountName)
-            val payload = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"$ACCOUNT_REGISTRY","data":"0x$data"},"latest"],"id":1}"""
-            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-            val body = (if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
-            conn.disconnect()
-            val json = JSONObject(body)
-            val result = json.optString("result", "")
-            if (result.isEmpty() || result == "0x") return true
-            val hex = result.removePrefix("0x").padStart(64, '0').takeLast(64)
-            BigInteger(hex, 16) == BigInteger.ONE
-        } catch (e: Exception) {
-            Log.e(TAG, "checkBeamioAccountAvailable failed", e)
-            true
-        }
-    }
-
-    private fun encodeIsAccountNameAvailable(accountName: String): String {
-        val selector = Numeric.toHexStringNoPrefix(Hash.sha3("isAccountNameAvailable(string)".toByteArray(Charsets.UTF_8))).take(8)
-        val encodedParam = encodeAbiString(accountName)
-        return selector + encodedParam
-    }
-
-    private fun encodeAbiString(s: String): String {
-        val bytes = s.toByteArray(Charsets.UTF_8)
-        val offset = "0000000000000000000000000000000000000000000000000000000000000020"
-        val lenHex = bytes.size.toString(16).padStart(64, '0')
-        val dataPadded = (bytes.size + 31) / 32 * 32
-        val dataHex = bytes.joinToString("") { "%02x".format(it) }.padEnd(dataPadded * 2, '0')
-        return offset + lenHex + dataHex
     }
 
     private fun newUser(accountName: String, recoverData: JSONArray, privateKeyHex: String): Boolean {

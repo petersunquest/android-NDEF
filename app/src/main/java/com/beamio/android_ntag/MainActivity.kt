@@ -119,16 +119,21 @@ import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.automirrored.filled.Subject
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CalendarMonth
+import androidx.compose.material.icons.filled.Receipt
 import androidx.compose.material.icons.filled.AttachMoney
 import androidx.compose.material.icons.filled.CreditCard
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Payments
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.automirrored.filled.Label
 import androidx.compose.material.icons.filled.Verified
 import androidx.compose.material.icons.filled.Info
@@ -167,6 +172,9 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
@@ -248,6 +256,59 @@ private data class BeamioPosTerminalPolicy(
             )
         }
     }
+}
+
+private data class PosLedgerItem(
+    val id: String,
+    val originalPaymentHash: String?,
+    val type: String,
+    val txCategory: String,
+    val timestamp: Long,
+    val payer: String,
+    val payee: String,
+    val amountUSDC6: String,
+    val amountFiat6: String,
+    val currencyFiat: Int,
+    val displayJson: String,
+    val topAdmin: String?,
+    val subordinate: String?,
+    val note: String?,
+    /** Cluster `/api/posLedger`：付款方 AccountRegistry `accountName`（无 `@`）。 */
+    val payerBeamioTag: String? = null,
+    /** `USDC` / `Card` / `Cash` / `Bonus`（top-up/charge 行为）。 */
+    val paymentMethodLabel: String? = null,
+)
+
+private data class PosLedgerTerminalResetMarker(
+    val txId: String,
+    val timestamp: Long,
+    val payer: String,
+)
+
+private data class PosLedgerSnapshot(
+    val topUpFromClear6: String,
+    val chargeFromClear6: String,
+    val items: List<PosLedgerItem>,
+    /** Newest Settlement clear (`TX_Terminal_RESET`); client filters `items` to `timestamp > marker` as a safety net (server may pre-clip). */
+    val lastTerminalReset: PosLedgerTerminalResetMarker? = null,
+) {
+    fun itemsInTerminalStatsPeriod(): List<PosLedgerItem> {
+        val m = lastTerminalReset ?: return items
+        return items.filter { it.timestamp > m.timestamp }
+    }
+}
+
+private data class PosLedgerTipAmount(
+    val value: Double,
+    val currencyCode: String,
+)
+
+private data class PosLedgerDisplayItem(
+    val tx: PosLedgerItem,
+    val tips: List<PosLedgerItem>,
+    val embeddedTip: PosLedgerTipAmount?,
+) {
+    val id: String get() = tx.id
 }
 
 private data class MyPosInfraFetchResult(
@@ -509,7 +570,7 @@ private fun chargeTipFromRequestAndRate(requestAmount: Double, tipRateFraction: 
 private fun chargeTipFromRequestAndBps(requestAmount: Double, tipRateBps: Int): Double =
     requestAmount * (tipRateBps.coerceIn(0, 10000) / 10000.0)
 
-/** Insufficient-balance full screen (see verra-home home1.html). */
+/** Insufficient-balance full screen (layout reference: POS web SPA home1.html). */
 private data class InsufficientBalanceUiModel(
     val totalChargeFormatted: String,
     val currentBalanceFormatted: String,
@@ -524,7 +585,7 @@ private data class InsufficientBalanceUiModel(
     val availableBalanceUsdc6: Long = 0L,
 )
 
-/** PARTIAL APPROVAL：客户余额不足但已扣完全部可用资产后，展示剩余未付差额（verra-home home1.html）。 */
+/** PARTIAL APPROVAL：客户余额不足但已扣完全部可用资产后，展示剩余未付差额（同 home1.html 布局参考）。 */
 internal data class PartialApprovalUiModel(
     val payCurrency: String,
     val chargedPayCur: Double,
@@ -559,6 +620,11 @@ class MainActivity : ComponentActivity() {
         const val SUN_BASE_URL = "https://api.beamio.app/api/sun"
         /** 与 SilentPassUI utils/constants.ts beamioApi 一致 */
         const val BEAMIO_API = "https://beamio.app"
+        /**
+         * 顾客扫码打开的 USDC Charge 页（verra-home `/usdc-charge`）公网 host。
+         * 与 [BEAMIO_API]（Cluster API）不同；须与 iOS `POSViewModel.buildUsdcChargeQrUrl*` 一致。
+         */
+        private const val USDC_CHARGE_PUBLIC_PAGE_HOST = "verra.network"
         /** USDC on Base */
         const val USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
         /**
@@ -667,6 +733,29 @@ class MainActivity : ComponentActivity() {
     private var insufficientPartialRetryContext: InsufficientPartialRetryContext? = null
     /** 扣完全部余额后仍有短款的 PARTIAL APPROVAL 页；与 [PaymentStatus.Success] 同时有效 */
     private var paymentPartialApprovalUi by mutableStateOf<PartialApprovalUiModel?>(null)
+    /** Charge payment method selected on the amount pad: "nfcCard" (default) or "usdc". */
+    private var pendingChargeMethodRaw by mutableStateOf("nfcCard")
+    private var chargeUsdcEnabled by mutableStateOf(false)
+    /** USDC charge: null = show payer method picker; `qr` = Beamio app / other wallet (HTTPS QR); `nfc` = tap Beamio NFC card (AA USDC + points routing). */
+    private var usdcChargePayerMode by mutableStateOf<String?>(null)
+    private var chargeUsdcDeepLinkUrl by mutableStateOf("")
+    private var chargeUsdcQrGenerating by mutableStateOf(false)
+    private var chargeUsdcSessionId by mutableStateOf("")
+    private var chargeUsdcSessionProgressLabel by mutableStateOf("")
+    private val chargeUsdcTopupAuthSubmittedSids = mutableSetOf<String>()
+    private val chargeUsdcTopupAuthInflightSids = mutableSetOf<String>()
+    /**
+     * USDC top-up：`https://verra.network/usdc-topup` 裸链 QR（与 Charge `/usdc-charge` 一致，不经 metamask.app.link）+
+     * `/api/nfcUsdcChargeSession` 轮询；贴卡完成 mint 时 POST `/api/nfcTopup` 带 `usdcTopupSessionId`（与 iOS `POSViewModel` 一致）。
+     */
+    private var topupUsdcDeepLinkUrl by mutableStateOf("")
+    private var topupUsdcQrGenerating by mutableStateOf(false)
+    private var topupUsdcSessionId by mutableStateOf("")
+    private var topupUsdcSessionProgressLabel by mutableStateOf("")
+    /** 顾客已链上付 USDC、等待贴卡 mint 时覆盖 NFC 中央提示文案 */
+    private var topupUsdcNfcSubtitle by mutableStateOf("")
+    private val topupUsdcTopupAuthSubmittedSids = mutableSetOf<String>()
+    private val topupUsdcTopupAuthInflightSids = mutableSetOf<String>()
     /**
      * 用户在「余额不足」页选择按当前可用余额扣款时置 true；下一次 NFC/QR execute 在链上按 min(应收, 客户总资产) 扣款，随后 PARTIAL APPROVAL。
      * 一次性消费，成功进入 partial 分支或重新打开 insufficient 时清除。
@@ -712,6 +801,185 @@ class MainActivity : ComponentActivity() {
             }
         }
         return false
+    }
+
+    private fun posLedgerCacheKey(wallet: String, infraCard: String): String {
+        val w = wallet.trim().lowercase(Locale.US)
+        val c = infraCard.trim().lowercase(Locale.US)
+        return "android.posLedger.$w.$c"
+    }
+
+    private fun posLedgerItemFromJson(raw: org.json.JSONObject): PosLedgerItem? {
+        val id = raw.optString("id").trim()
+        val type = raw.optString("type").trim()
+        if (id.isEmpty() || type.isEmpty()) return null
+        return PosLedgerItem(
+            id = id,
+            originalPaymentHash = raw.optString("originalPaymentHash").trim().takeIf { it.isNotEmpty() },
+            type = type,
+            txCategory = raw.optString("txCategory"),
+            timestamp = raw.optLong("timestamp", 0L),
+            payer = raw.optString("payer"),
+            payee = raw.optString("payee"),
+            amountUSDC6 = raw.optString("amountUSDC6", "0").ifBlank { "0" },
+            amountFiat6 = raw.optString("amountFiat6", "0").ifBlank { "0" },
+            currencyFiat = raw.optInt("currencyFiat", 0),
+            displayJson = raw.optString("displayJson"),
+            topAdmin = raw.optString("topAdmin").trim().takeIf { it.isNotEmpty() },
+            subordinate = raw.optString("subordinate").trim().takeIf { it.isNotEmpty() },
+            note = raw.optString("note").trim().takeIf { it.isNotEmpty() },
+            payerBeamioTag = raw.optString("payerBeamioTag").trim().takeIf { it.isNotEmpty() },
+            paymentMethodLabel = raw.optString("paymentMethodLabel").trim().takeIf { it.isNotEmpty() },
+        )
+    }
+
+    private fun posLedgerSnapshotFromJson(root: org.json.JSONObject): PosLedgerSnapshot {
+        val fromClear = root.optJSONObject("fromClear") ?: org.json.JSONObject()
+        val arr = root.optJSONArray("items") ?: org.json.JSONArray()
+        val items = mutableListOf<PosLedgerItem>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.let { posLedgerItemFromJson(it) }?.let { items.add(it) }
+        }
+        val reset = root.optJSONObject("lastTerminalReset")?.takeIf { it.length() > 0 }?.let { o ->
+            val tid = o.optString("txId").trim()
+            val ts = o.optLong("timestamp", 0L)
+            val payer = o.optString("payer").trim()
+            if (tid.isNotEmpty() && ts > 0L) PosLedgerTerminalResetMarker(txId = tid, timestamp = ts, payer = payer)
+            else null
+        }
+        return PosLedgerSnapshot(
+            topUpFromClear6 = fromClear.optString("topUp6", "0").ifBlank { "0" },
+            chargeFromClear6 = fromClear.optString("charge6", "0").ifBlank { "0" },
+            items = items.sortedWith(compareByDescending<PosLedgerItem> { it.timestamp }.thenByDescending { it.id }),
+            lastTerminalReset = reset,
+        )
+    }
+
+    private fun posLedgerSnapshotToJson(snapshot: PosLedgerSnapshot): String {
+        val items = org.json.JSONArray()
+        snapshot.items.forEach { item ->
+            items.put(org.json.JSONObject().apply {
+                put("id", item.id)
+                put("originalPaymentHash", item.originalPaymentHash ?: "")
+                put("type", item.type)
+                put("txCategory", item.txCategory)
+                put("timestamp", item.timestamp)
+                put("payer", item.payer)
+                put("payee", item.payee)
+                put("amountUSDC6", item.amountUSDC6)
+                put("amountFiat6", item.amountFiat6)
+                put("currencyFiat", item.currencyFiat)
+                put("displayJson", item.displayJson)
+                put("topAdmin", item.topAdmin ?: "")
+                put("subordinate", item.subordinate ?: "")
+                put("note", item.note ?: "")
+                put("payerBeamioTag", item.payerBeamioTag ?: "")
+                put("paymentMethodLabel", item.paymentMethodLabel ?: "")
+            })
+        }
+        return org.json.JSONObject().apply {
+            put("ok", true)
+            put("fromClear", org.json.JSONObject().apply {
+                put("topUp6", snapshot.topUpFromClear6)
+                put("charge6", snapshot.chargeFromClear6)
+            })
+            snapshot.lastTerminalReset?.let { r ->
+                put(
+                    "lastTerminalReset",
+                    org.json.JSONObject().apply {
+                        put("txId", r.txId)
+                        put("timestamp", r.timestamp)
+                        put("payer", r.payer)
+                    },
+                )
+            }
+            put("items", items)
+        }.toString()
+    }
+
+    private fun loadPosLedgerCache(wallet: String, infraCard: String): PosLedgerSnapshot? {
+        return try {
+            val raw = getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
+                .getString(posLedgerCacheKey(wallet, infraCard), null)
+                ?: return null
+            posLedgerSnapshotFromJson(org.json.JSONObject(raw))
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun savePosLedgerCache(wallet: String, infraCard: String, snapshot: PosLedgerSnapshot) {
+        try {
+            getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE).edit()
+                .putString(posLedgerCacheKey(wallet, infraCard), posLedgerSnapshotToJson(snapshot))
+                .apply()
+        } catch (_: Exception) {
+            // Trusted cache is best-effort only.
+        }
+    }
+
+    private fun openPosTransactionsScreen() {
+        val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+        val infra = infraCardAddress().trim()
+        showTransactionsScreen = true
+        showPosSalesOverview = false
+        showPosTopUpOverview = false
+        val key = if (wallet.isNotEmpty() && looksLikeEthereumAddress(infra)) posLedgerCacheKey(wallet, infra) else ""
+        if (key.isNotEmpty() && (posLedgerSnapshot == null || posLedgerSnapshotKey != key)) {
+            posLedgerSnapshot = loadPosLedgerCache(wallet, infra)
+            posLedgerSnapshotKey = key
+        }
+        refreshPosLedgerTrustedOnly()
+    }
+
+    private fun refreshPosLedgerTrustedOnly() {
+        val wallet = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+        val infra = infraCardAddress().trim()
+        if (wallet.isEmpty() || !looksLikeEthereumAddress(infra) || posLedgerRefreshInFlight) return
+        posLedgerRefreshInFlight = true
+        val hadCached = posLedgerSnapshot != null
+        posLedgerLoading = !hadCached
+        posLedgerRefreshing = hadCached
+        Thread {
+            val snap = fetchPosLedgerSync(wallet, infra)
+            runOnUiThread {
+                if (snap != null) {
+                    posLedgerSnapshot = snap
+                    posLedgerSnapshotKey = posLedgerCacheKey(wallet, infra)
+                    posLedgerLastError = null
+                    savePosLedgerCache(wallet, infra, snap)
+                    applyHomeDashboardFromPosLedger(snap)
+                } else {
+                    posLedgerLastError = "Could not refresh transactions. Showing last known list."
+                }
+                posLedgerLoading = false
+                posLedgerRefreshing = false
+                posLedgerRefreshInFlight = false
+            }
+        }.start()
+    }
+
+    private fun fetchPosLedgerSync(wallet: String, infraCard: String): PosLedgerSnapshot? {
+        return try {
+            val eoaEnc = java.net.URLEncoder.encode(wallet.trim(), "UTF-8")
+            val cardEnc = java.net.URLEncoder.encode(infraCard.trim(), "UTF-8")
+            val conn = java.net.URL("$BEAMIO_API/api/posLedger?eoa=$eoaEnc&infraCard=$cardEnc")
+                .openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 20_000
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            if (code !in 200..299) return null
+            val root = org.json.JSONObject(resp)
+            if (!root.optBoolean("ok", false)) return null
+            posLedgerSnapshotFromJson(root)
+        } catch (e: Exception) {
+            Log.w("PosLedger", "fetch failed", e)
+            null
+        }
     }
 
     private fun parseOneRechargeBonusRule(o: org.json.JSONObject): RechargeBonusRule? {
@@ -791,6 +1059,16 @@ class MainActivity : ComponentActivity() {
             "usdc" -> posTerminalPolicy.allowTopupUsdc
             "cash" -> posTerminalPolicy.allowTopupCash
             "bonus" -> posTerminalPolicy.allowTopupAirdrop
+            else -> false
+        }
+    }
+
+    /** Charge method permission: "nfcCard" is the default; USDC follows the terminal top-up USDC policy. */
+    private fun posChargeMethodRawAllowed(methodRaw: String): Boolean {
+        val m = methodRaw.trim()
+        return when {
+            m.isEmpty() || m == "nfcCard" -> true
+            m.equals("usdc", ignoreCase = true) -> posTerminalPolicy.allowPayerUsdcInCharge
             else -> false
         }
     }
@@ -1035,6 +1313,9 @@ class MainActivity : ComponentActivity() {
     /** 卡统计：Charge=periodTransferAmount，Top-Up=redeemMintCounterFromClear */
     private var cardChargeAmount by mutableStateOf<Double?>(null)
     private var cardTopUpAmount by mutableStateOf<Double?>(null)
+    private var cardTipsAmount by mutableStateOf<Double?>(null)
+    private var homeUpstreamBUnitBalance by mutableStateOf<Double?>(null)
+    private var homeUpstreamBUnitLoaded by mutableStateOf(false)
 
     /** Top-up / Charge 成功后等待链上统计更新；与 baseline 比较，直到变化或放弃 */
     private var pendingVerifyChargeStats by mutableStateOf(false)
@@ -1052,6 +1333,17 @@ class MainActivity : ComponentActivity() {
     private var dashboardMerchantProgramCardName by mutableStateOf<String?>(null)
     /** `GET /api/cardMetadata` → `metadata.bonusRules` / `bonusRule`；与 iOS `programRechargeBonusRules` 对齐 */
     private var programRechargeBonusRules by mutableStateOf<List<RechargeBonusRule>>(emptyList())
+    private var showTransactionsScreen by mutableStateOf(false)
+    /** History → Sales Overview（全屏）；依赖 [showTransactionsScreen]。 */
+    private var showPosSalesOverview by mutableStateOf(false)
+    /** History → Top-Up Overview（全屏）；依赖 [showTransactionsScreen]。 */
+    private var showPosTopUpOverview by mutableStateOf(false)
+    private var posLedgerSnapshot by mutableStateOf<PosLedgerSnapshot?>(null)
+    private var posLedgerLoading by mutableStateOf(false)
+    private var posLedgerRefreshing by mutableStateOf(false)
+    private var posLedgerLastError by mutableStateOf<String?>(null)
+    private var posLedgerSnapshotKey: String = ""
+    @Volatile private var posLedgerRefreshInFlight = false
 
     private val cardStatsVerifyLock = Any()
     @Volatile private var cardStatsVerifyThreadRunning = false
@@ -1061,7 +1353,7 @@ class MainActivity : ComponentActivity() {
 
     /** 与 iOS `POSViewModel.showAwaitingParentPermissionGate`：未可信加入 program 卡 admin 树前不进入 Home */
     private var showAwaitingParentPermissionGate by mutableStateOf(false)
-    /** 小写无 @，与 iOS `permissionGateParentTagLine` 一致 */
+    /** Trim、去 @（与 iOS `normalizeParentBeamioTag` / `permissionGateParentTagLine` 一致）；保留 BeamioTag 原始大小写。 */
     private var permissionGateParentTagLine by mutableStateOf("")
     private var showChangeParentWorkspaceDialog by mutableStateOf(false)
     private var changeParentTagDraft by mutableStateOf("")
@@ -1476,9 +1768,15 @@ class MainActivity : ComponentActivity() {
                 val linkAppQrBitmap = androidx.compose.runtime.remember(linkAppDeepLinkUrl) {
                     if (linkAppDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(linkAppDeepLinkUrl)
                 }
+                val chargeUsdcQrBitmap = androidx.compose.runtime.remember(chargeUsdcDeepLinkUrl) {
+                    if (chargeUsdcDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(chargeUsdcDeepLinkUrl)
+                }
+                val topupUsdcQrBitmap = androidx.compose.runtime.remember(topupUsdcDeepLinkUrl) {
+                    if (topupUsdcDeepLinkUrl.isEmpty()) null else encodeLinkAppQrBitmap(topupUsdcDeepLinkUrl)
+                }
                 val posAtPrimaryHome = !showWelcomePage && !showOnboardingScreen && !showTopupScreen && !showReadScreen &&
                     !showScanMethodScreen && !showAmountInputScreen && !showTipScreen && !showPaymentScreen && !showInitFlowScreen &&
-                    insufficientBalanceUi == null
+                    insufficientBalanceUi == null && !showTransactionsScreen
                 when {
                     insufficientBalanceUi != null -> InsufficientBalanceScreen(
                         model = insufficientBalanceUi!!,
@@ -1488,6 +1786,42 @@ class MainActivity : ComponentActivity() {
                         onCancel = { onInsufficientBalanceCancelFromScreen() },
                         modifier = Modifier.fillMaxSize()
                     )
+                    showTransactionsScreen -> when {
+                        showPosSalesOverview -> PosSalesOverviewScreen(
+                            snapshot = posLedgerSnapshot,
+                            terminalProfile = terminalProfile,
+                            adminProfile = terminalAdminProfile,
+                            onClose = { showPosSalesOverview = false },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                        showPosTopUpOverview -> PosTopUpOverviewScreen(
+                            snapshot = posLedgerSnapshot,
+                            terminalProfile = terminalProfile,
+                            adminProfile = terminalAdminProfile,
+                            onClose = { showPosTopUpOverview = false },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                        else -> POSTransactionsScreen(
+                            snapshot = posLedgerSnapshot,
+                            loading = posLedgerLoading,
+                            refreshing = posLedgerRefreshing,
+                            error = posLedgerLastError,
+                            onClose = {
+                                showPosSalesOverview = false
+                                showPosTopUpOverview = false
+                                showTransactionsScreen = false
+                            },
+                            onSalesOverviewClick = {
+                                showPosTopUpOverview = false
+                                showPosSalesOverview = true
+                            },
+                            onTopUpOverviewClick = {
+                                showPosSalesOverview = false
+                                showPosTopUpOverview = true
+                            },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
                     showWelcomePage -> WelcomePage(
                         versionName = BuildConfig.VERSION_NAME ?: "1.0",
                         programCardAddressForSearch = infraCardAddress(),
@@ -1519,8 +1853,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                     showAwaitingParentPermissionGate = true
                                     persistRegisteredTerminalBeamioTag(addr, registeredBeamioAccountName)
-                                    val tagLine = registeredBeamioAccountName.trim().lowercase(Locale.US)
-                                        .let { t -> var x = t; while (x.startsWith("@")) x = x.removePrefix("@").trim(); x }
+                                    val tagLine = BeamioTagRules.normalizeInput(registeredBeamioAccountName)
                                     tagLineForConet = tagLine
                                     if (tagLine.isNotEmpty()) {
                                         terminalProfile = TerminalProfile(
@@ -1584,7 +1917,8 @@ class MainActivity : ComponentActivity() {
                         scanWaitingForNfc = scanWaitingForNfc,
                         nfcFetchingInfo = nfcFetchingInfo,
                         nfcFetchError = nfcFetchError,
-                        hideMethodToggle = pendingScanAction == "linkApp",
+                        hideMethodToggle = pendingScanAction == "linkApp" || (pendingScanAction == "payment" && pendingChargeMethodRaw == "usdc") ||
+                            (pendingScanAction == "topup" && pendingTopupMethodRaw.trim().lowercase(Locale.US) == "usdc"),
                         linkAppDeepLinkUrl = linkAppDeepLinkUrl,
                         linkAppQrBitmap = linkAppQrBitmap,
                         onCopyLinkAppUrl = {
@@ -1596,6 +1930,33 @@ class MainActivity : ComponentActivity() {
                         linkAppLockedShowCancel = pendingScanAction == "linkApp" && linkAppLastSunForCancel != null && nfcFetchError.isNotEmpty(),
                         linkAppCancelInProgress = linkAppCancelInProgress,
                         onLinkAppCancelLock = { runLinkAppCancelLock() },
+                        chargeUsdcDeepLinkUrl = chargeUsdcDeepLinkUrl,
+                        chargeUsdcQrBitmap = chargeUsdcQrBitmap,
+                        chargeUsdcQrGenerating = chargeUsdcQrGenerating,
+                        chargeUsdcSessionProgressLabel = chargeUsdcSessionProgressLabel,
+                        onCopyChargeUsdcUrl = {
+                            if (chargeUsdcDeepLinkUrl.isNotEmpty()) {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("verra-usdc-charge", chargeUsdcDeepLinkUrl))
+                            }
+                        },
+                        paymentChargeMethodRaw = pendingChargeMethodRaw,
+                        usdcChargePayerMode = usdcChargePayerMode,
+                        nfcAdapterReady = nfcAdapter != null && nfcAdapter?.isEnabled == true,
+                        onUsdcPickBeamioApp = { startUsdcChargeQrFromPicker() },
+                        onUsdcPickBeamioNfc = { startUsdcChargeNfcFromPicker() },
+                        onUsdcPickOtherWallet = { startUsdcChargeQrFromPicker() },
+                        topupUsdcDeepLinkUrl = topupUsdcDeepLinkUrl,
+                        topupUsdcQrBitmap = topupUsdcQrBitmap,
+                        topupUsdcQrGenerating = topupUsdcQrGenerating,
+                        topupUsdcSessionProgressLabel = topupUsdcSessionProgressLabel,
+                        onCopyTopupUsdcUrl = {
+                            if (topupUsdcDeepLinkUrl.isNotEmpty()) {
+                                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("verra-usdc-topup", topupUsdcDeepLinkUrl))
+                            }
+                        },
+                        nfcInstructionOverride = topupUsdcNfcSubtitle,
                         topupQrSigningInProgress = topupQrSigningInProgress,
                         topupNfcExecuteInProgress = topupNfcExecuteInProgress,
                         topupExecuteUidDisplay = topupScreenUid,
@@ -1637,6 +1998,7 @@ class MainActivity : ComponentActivity() {
                             "topup" -> topupScreenAmount
                             else -> ""
                         },
+                        topupCardCurrency = if (pendingScanAction == "topup") topupScreenCardCurrency else null,
                         paymentStatus = if (pendingScanAction == "payment") paymentScreenStatus else null,
                         paymentRoutingSteps = if (pendingScanAction == "payment") paymentScreenRoutingSteps else emptyList(),
                         paymentError = if (pendingScanAction == "payment") paymentScreenError else "",
@@ -1737,7 +2099,10 @@ class MainActivity : ComponentActivity() {
                             amountInput = "0"
                         },
                         topupPolicy = posTerminalPolicy,
-                        onContinue = {
+                        chargePolicy = posTerminalPolicy,
+                        chargeUsdcEnabled = chargeUsdcEnabled,
+                        onChargeUsdcEnabledChange = { chargeUsdcEnabled = it },
+                        onContinue = { methodRaw ->
                             val amt = amountInput.trim()
                             if (amt != "0" && amt != "0." && amt.toDoubleOrNull()?.let { it > 0 } == true) {
                                 showAmountInputScreen = false
@@ -1745,6 +2110,7 @@ class MainActivity : ComponentActivity() {
                                 when (amountInputMode) {
                                     "topup" -> { /* Top-up 由 onTopupContinue 完成 */ }
                                     "charge" -> {
+                                        pendingChargeMethodRaw = if (posChargeMethodRawAllowed(methodRaw)) methodRaw else "nfcCard"
                                         tipScreenSubtotal = amt
                                         selectedTipRate = 0.0
                                         showTipScreen = true
@@ -1795,7 +2161,7 @@ class MainActivity : ComponentActivity() {
                             showTipScreen = false
                             tipScreenSubtotal = "0"
                             selectedTipRate = 0.0
-                            startPayment("%.2f".format(total), "%.2f".format(subtotal), "%.2f".format(tip), tipBps)
+                            startPayment("%.2f".format(total), "%.2f".format(subtotal), "%.2f".format(tip), tipBps, pendingChargeMethodRaw)
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1885,6 +2251,9 @@ class MainActivity : ComponentActivity() {
                         adminProfile = terminalAdminProfile,
                         chargeAmount = cardChargeAmount,
                         topUpAmount = cardTopUpAmount,
+                        tipAmount = cardTipsAmount,
+                        bUnitBalance = homeUpstreamBUnitBalance,
+                        bUnitLoaded = homeUpstreamBUnitLoaded,
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
                         onLinkAppClick = { startLinkAppFlow() },
@@ -1899,6 +2268,7 @@ class MainActivity : ComponentActivity() {
                             amountInputMode = "charge"
                             showAmountInputScreen = true
                         },
+                        onHistoryClick = { openPosTransactionsScreen() },
                         onCopyUrlClick = {
                             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                             cm?.setPrimaryClip(ClipData.newPlainText("url", readUrlText))
@@ -1918,6 +2288,9 @@ class MainActivity : ComponentActivity() {
                         adminProfile = terminalAdminProfile,
                         chargeAmount = cardChargeAmount,
                         topUpAmount = cardTopUpAmount,
+                        tipAmount = cardTipsAmount,
+                        bUnitBalance = homeUpstreamBUnitBalance,
+                        bUnitLoaded = homeUpstreamBUnitLoaded,
                         chargeStatsRpcWarning = cardStatsChargeRpcWarning,
                         topUpStatsRpcWarning = cardStatsTopUpRpcWarning,
                         merchantProgramCardName = dashboardMerchantProgramCardName,
@@ -1935,6 +2308,7 @@ class MainActivity : ComponentActivity() {
                             amountInputMode = "charge"
                             showAmountInputScreen = true
                         },
+                        onHistoryClick = { openPosTransactionsScreen() },
                         onCopyUrlClick = {
                             val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                             cm?.setPrimaryClip(ClipData.newPlainText("url", readUrlText))
@@ -2014,6 +2388,18 @@ class MainActivity : ComponentActivity() {
         pendingScanAction = "topup"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+        val topupMethodTrim = pendingMethodRaw.trim().lowercase(Locale.US)
+        if (topupMethodTrim == "usdc") {
+            topupUsdcQrGenerating = true
+            topupUsdcDeepLinkUrl = ""
+            topupUsdcSessionId = ""
+            topupUsdcSessionProgressLabel = ""
+            topupUsdcNfcSubtitle = ""
+            topupUsdcTopupAuthSubmittedSids.clear()
+            topupUsdcTopupAuthInflightSids.clear()
+            Thread { presentUsdcTopupQrPhase1OnlySync() }.start()
+            return
+        }
         syncScanMethodEntryAndTabs()
     }
 
@@ -2101,6 +2487,14 @@ class MainActivity : ComponentActivity() {
         insufficientBalanceUi = null
         insufficientPartialRetryContext = null
         paymentPartialApprovalUi = null
+        pendingChargeMethodRaw = "nfcCard"
+        usdcChargePayerMode = null
+        chargeUsdcDeepLinkUrl = ""
+        chargeUsdcQrGenerating = false
+        chargeUsdcSessionId = ""
+        chargeUsdcSessionProgressLabel = ""
+        chargeUsdcTopupAuthSubmittedSids.clear()
+        chargeUsdcTopupAuthInflightSids.clear()
         chargeCapToCustomerAvailableBalance = false
         lastQrPaymentOpenRelayPayload = null
     }
@@ -2354,6 +2748,7 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
+                val chargedFiat6 = currencyToFiat6(chargedFiat)
                 val scaled = snap.scaledBillForChargedPayCur(chargedFiat)
                 val totalCurrency = snap.totalCurrency
                 val totalBalanceCad = (totalBalance6 / 1_000_000.0) * getRateForCurrency("CAD", oracle)
@@ -2382,14 +2777,13 @@ class MainActivity : ComponentActivity() {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = payByNfcUidWithContainer(
+                val result = payByNfcUidWithContainerFiat6(
                     uid,
-                    amountPartial.toString(),
+                    chargedFiat6,
                     payeeWallet,
                     assets,
                     oracle,
                     sunParams,
-                    chargeTotalInPayCurrency = chargedFiat,
                     nfcSubtotalCurrencyAmount = scaled.subtotalStr,
                     nfcTipCurrencyAmount = scaled.tipStr,
                     nfcTipRateBps = paymentScreenTipRateBps,
@@ -2398,6 +2792,7 @@ class MainActivity : ComponentActivity() {
                     nfcTaxRateBps = taxBpsResolved,
                     nfcDiscountAmountFiat6 = scaled.discFiat6,
                     nfcDiscountRateBps = discBpsResolved,
+                    nfcUsdcLane = pendingChargeMethodRaw == "usdc" && usdcChargePayerMode == "nfc",
                 )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
@@ -2531,10 +2926,18 @@ class MainActivity : ComponentActivity() {
                 val unitPriceStr = assets.unitPriceUSDC6
                 val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
                 val cards = chargeableCards(assets)
-                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
-                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
-                val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
-                val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val bucketsQrPartial = partitionPointsForMerchantCharge(cards)
+                val unitPoints6Partial = bucketsQrPartial.unitPricePoints6
+                val oracleInfraPartial = bucketsQrPartial.oracleInfraCards
+                val infraPoints6 = oracleInfraPartial.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val cardChainInfoPartial = if (unitPoints6Partial > 0L) fetchBeamioUserCardCurrencyCodeAndPointsUnitPriceE6Sync(infraCardAddress()) else null
+                if (unitPoints6Partial > 0L && cardChainInfoPartial == null) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Card price unavailable. Please refresh customer balance and try again."
+                    }
+                    return@Thread
+                }
                 val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
                 val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
                 val rateQrPartial = getRateForCurrency(payCurrencyQr, oracle)
@@ -2555,6 +2958,14 @@ class MainActivity : ComponentActivity() {
                     }
                     return@Thread
                 }
+                val chargedFiat6 = currencyToFiat6(chargedFiat).toLongOrNull() ?: 0L
+                if (chargedFiat6 <= 0L) {
+                    runOnUiThread {
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                    }
+                    return@Thread
+                }
                 val scaled = snap.scaledBillForChargedPayCur(chargedFiat)
                 val taxFiat6Bill = scaled.taxFiat6
                 val discFiat6Bill = scaled.discFiat6
@@ -2562,36 +2973,21 @@ class MainActivity : ComponentActivity() {
                 val discBpsQr = scaled.discBps
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success, "USDC sufficient")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
-                val qrSplit = computeChargeContainerSplit(
-                    amountPartial,
-                    chargedFiat,
-                    payCurrencyQr,
-                    oracle,
-                    unitPriceUSDC6,
-                    ccsaPoints6,
-                    infraPoints6,
-                    infraCards.firstOrNull()?.cardCurrency,
-                    usdcBalance6,
+                val qrSplit = computeChargeContainerSplitFiat6(
+                    amountFiat6 = chargedFiat6,
+                    payCurrency = payCurrencyQr,
+                    cardCurrency = cardChainInfoPartial?.first,
+                    pointsUnitPriceInCurrencyE6 = cardChainInfoPartial?.second?.toLong() ?: 0L,
+                    ccsaPoints6 = unitPoints6Partial,
+                    infraPoints6 = infraPoints6,
+                    infraCardCurrency = oracleInfraPartial.firstOrNull()?.cardCurrency,
+                    usdcBalance6 = usdcBalance6,
+                    oracle = oracle,
+                    unitPriceUSDC6Fallback = unitPriceUSDC6,
                 )
-                var ccsaPointsWei = qrSplit.ccsaPointsWei
-                var infraPointsWei = qrSplit.infraPointsWei
-                var usdcWei = qrSplit.usdcWei
-                val composedItems = mutableListOf<Map<String, Any>>()
-                if (usdcWei > 0) {
-                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
-                }
-                val beamio1155PointsWei = (ccsaPointsWei + infraPointsWei).coerceAtLeast(0L)
-                if (beamio1155PointsWei > 0) {
-                    composedItems.add(
-                        mapOf(
-                            "kind" to 1,
-                            "asset" to infraCardAddress(),
-                            "amount" to beamio1155PointsWei.toString(),
-                            "tokenId" to "0",
-                            "data" to "0x",
-                        ),
-                    )
-                }
+                val usdcWei = qrSplit.usdcWei
+                val beamio1155PointsWei = (qrSplit.ccsaPointsWei + qrSplit.infraPointsWei).coerceAtLeast(0L)
+                val composedItems = buildPayItemsFiat6(qrSplit).toMutableList()
                 if (composedItems.isEmpty()) {
                     composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to amountPartial.toString(), "tokenId" to "0", "data" to "0x"))
                 }
@@ -2852,6 +3248,13 @@ class MainActivity : ComponentActivity() {
         pendingTopupBonusExpanded = false
         pendingTopupBonusRatePercent = 20
         pendingTopupKeypadAmount = ""
+        topupUsdcDeepLinkUrl = ""
+        topupUsdcQrGenerating = false
+        topupUsdcSessionId = ""
+        topupUsdcSessionProgressLabel = ""
+        topupUsdcNfcSubtitle = ""
+        topupUsdcTopupAuthSubmittedSids.clear()
+        topupUsdcTopupAuthInflightSids.clear()
     }
 
     /** 重置读取相关状态 */
@@ -2865,10 +3268,49 @@ class MainActivity : ComponentActivity() {
         readScreenError = ""
     }
 
-    private fun startPayment(amount: String, subtotal: String? = null, tip: String? = null, tipRateBps: Int = 0) {
-        if (nfcAdapter == null) return
-        if (nfcAdapter?.isEnabled != true) return
+    /** USDC checkout: customer pays via HTTPS QR (Beamio app or any wallet browser). */
+    private fun startUsdcChargeQrFromPicker() {
+        usdcChargePayerMode = "qr"
+        chargeUsdcQrGenerating = true
+        Thread {
+            presentUsdcChargeQrNoNfcSync(paymentScreenSubtotal, paymentScreenTipRateBps)
+        }.start()
+    }
+
+    /** USDC checkout: customer taps Beamio NFC card — OpenContainer uses payer AA USDC + points ([/api/nfcUsdcChargeNfcPrepare] lane). */
+    private fun startUsdcChargeNfcFromPicker() {
+        if (nfcAdapter == null || nfcAdapter?.isEnabled != true) {
+            paymentScreenStatus = PaymentStatus.Error
+            paymentScreenError = "NFC is off or unavailable. Turn on NFC or choose QR payment."
+            return
+        }
+        usdcChargePayerMode = "nfc"
+        chargeUsdcDeepLinkUrl = ""
+        chargeUsdcQrGenerating = false
+        chargeUsdcSessionId = ""
+        chargeUsdcSessionProgressLabel = ""
+        chargeUsdcTopupAuthSubmittedSids.clear()
+        chargeUsdcTopupAuthInflightSids.clear()
+        scanMethodState = "nfc"
+        paymentScreenStatus = PaymentStatus.Waiting
+        paymentScreenError = ""
+        paymentScreenTxHash = ""
+        paymentScreenRoutingSteps = emptyList()
+        syncScanMethodEntryAndTabs()
+        scanWaitingForNfc = true
+        nfcFetchingInfo = false
+        nfcFetchError = ""
+        armForNfcScan()
+    }
+
+    private fun startPayment(amount: String, subtotal: String? = null, tip: String? = null, tipRateBps: Int = 0, methodRaw: String = "nfcCard") {
+        val normalizedMethod = methodRaw.trim().ifEmpty { "nfcCard" }
+        if (normalizedMethod != "usdc") {
+            if (nfcAdapter == null) return
+            if (nfcAdapter?.isEnabled != true) return
+        }
         resetPaymentScreenState()
+        pendingChargeMethodRaw = if (posChargeMethodRawAllowed(normalizedMethod)) normalizedMethod else "nfcCard"
         paymentScreenAmount = amount
         paymentScreenSubtotal = subtotal ?: amount
         paymentScreenTip = tip ?: "0"
@@ -2880,6 +3322,33 @@ class MainActivity : ComponentActivity() {
         pendingScanAction = "payment"
         scanMethodState = "nfc"
         showScanMethodScreen = true
+        if (pendingChargeMethodRaw == "usdc") {
+            usdcChargePayerMode = null
+            chargeUsdcDeepLinkUrl = ""
+            chargeUsdcQrGenerating = false
+            scanWaitingForNfc = false
+            paymentArmed = false
+            Thread {
+                try {
+                    val d = fetchTierRoutingDetailsForTerminalWalletSync(BeamioWeb3Wallet.getAddress()) ?: return@Thread
+                    val taxFromRouting = d.taxPercent
+                    runOnUiThread {
+                        paymentChargeBreakdownTaxPercent = taxFromRouting
+                        val sub = paymentScreenSubtotal.toDoubleOrNull() ?: 0.0
+                        val tipAmt = paymentScreenTip.toDoubleOrNull() ?: 0.0
+                        val disc = paymentChargeBreakdownTierDiscountPercent
+                        paymentScreenAmount = "%.2f".format(chargeTotalInCurrency(sub, taxFromRouting, disc, tipAmt))
+                    }
+                } catch (_: Exception) {
+                }
+            }.start()
+            return
+        }
+        if (normalizedMethod == "usdc") {
+            paymentScreenStatus = PaymentStatus.Error
+            paymentScreenError = "USDC charge is not enabled for this terminal."
+            return
+        }
         syncScanMethodEntryAndTabs()
         // 与 executePayment 一致：终端 metadata 的 tax 可能比 Home 的 dashboard 更早可用，用于底部 Total Amount（含稅）
         Thread {
@@ -2905,6 +3374,20 @@ class MainActivity : ComponentActivity() {
         nfcFetchError = ""
         paymentQrInterpreting = false
         paymentQrParseError = ""
+        if (pendingChargeMethodRaw == "usdc") {
+            paymentScreenStatus = PaymentStatus.Waiting
+            paymentScreenError = ""
+            paymentScreenRoutingSteps = emptyList()
+            if (usdcChargePayerMode == "nfc") {
+                startUsdcChargeNfcFromPicker()
+                return
+            }
+            chargeUsdcQrGenerating = true
+            Thread {
+                presentUsdcChargeQrNoNfcSync(paymentScreenSubtotal, paymentScreenTipRateBps)
+            }.start()
+            return
+        }
         if (scanMethodState == "qr") {
             scanWaitingForNfc = false
             paymentArmed = false
@@ -2951,6 +3434,7 @@ class MainActivity : ComponentActivity() {
     private fun shouldDeferAutoNfcArm(): Boolean {
         if (nfcFetchingInfo) return true
         if (pendingScanAction == "linkApp" && linkAppDeepLinkUrl.isNotEmpty()) return true
+        if (pendingScanAction == "topup" && (topupUsdcQrGenerating || topupUsdcDeepLinkUrl.isNotEmpty())) return true
         if (pendingScanAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) return true
         if (topupQrExecuteError.isNotEmpty()) return true
         if (pendingScanAction == "payment") {
@@ -2968,6 +3452,7 @@ class MainActivity : ComponentActivity() {
 
     /** QR 自动开相机：解析中/支付路由中等不抢焦点 */
     private fun shouldDeferAutoQrCamera(): Boolean {
+        if (pendingScanAction == "topup" && (topupUsdcQrGenerating || topupUsdcDeepLinkUrl.isNotEmpty())) return true
         if (pendingScanAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) return true
         if (topupQrExecuteError.isNotEmpty()) return true
         if (pendingScanAction == "payment") {
@@ -3370,6 +3855,7 @@ class MainActivity : ComponentActivity() {
 
     private fun executeNfcTopup(tag: Tag, uid: String, amount: String, fromScanMethodFlow: Boolean = false) {
         Thread {
+            var usdcTopupSidForPost: String? = null
             try {
                 Log.d("Topup", "[Topup Debug] executeNfcTopup entry: panel ID address=${BeamioWeb3Wallet.getAddress()} | uid=$uid fromScanMethodFlow=$fromScanMethodFlow")
                 refreshMerchantInfraCardFromDbSync()
@@ -3403,6 +3889,21 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     return@Thread
+                }
+                if (methodRaw == "usdc") {
+                    val sidTrim = topupUsdcSessionId.trim().lowercase(Locale.US)
+                    val awaitingMint = sidTrim.length == 36 && topupUsdcDeepLinkUrl.isEmpty()
+                    if (!awaitingMint) {
+                        runOnUiThread {
+                            topupNfcExecuteInProgress = false
+                            nfcFetchingInfo = false
+                            nfcFetchError = ""
+                        }
+                        val spForQr = sunParams ?: SunParams(uid = uid, e = "", c = "", m = "")
+                        presentUsdcTopupQrFromNfcSync(uid, spForQr, amount)
+                        return@Thread
+                    }
+                    usdcTopupSidForPost = sidTrim
                 }
                 // 1. Topup 之前先拉取余额，对齐后端返回码（避免 UID/QR 混淆时解析 HTML 报错）
                 val preAssets = fetchUidAssetsSync(sunParams?.uid ?: uid, sunParams, merchantInfraOnly = false)
@@ -3487,6 +3988,7 @@ class MainActivity : ComponentActivity() {
                     adminSig,
                     sunParams,
                     currencySplit = split,
+                    usdcTopupSessionId = usdcTopupSidForPost,
                 )
                 val keepOnScanUntilSuccess = fromScanMethodFlow
                 runOnUiThread {
@@ -3497,6 +3999,15 @@ class MainActivity : ComponentActivity() {
                         topupScreenError = ""
                         topupScreenUid = uid
                         topupViaQr = false
+                        if (usdcTopupSidForPost != null) {
+                            topupUsdcSessionId = ""
+                            topupUsdcDeepLinkUrl = ""
+                            topupUsdcSessionProgressLabel = ""
+                            topupUsdcNfcSubtitle = ""
+                            topupUsdcQrGenerating = false
+                            topupUsdcTopupAuthSubmittedSids.clear()
+                            topupUsdcTopupAuthInflightSids.clear()
+                        }
                         if (keepOnScanUntilSuccess) {
                             topupNfcExecuteInProgress = true
                         } else {
@@ -3846,6 +4357,7 @@ class MainActivity : ComponentActivity() {
         adminSignature: String,
         sunParams: SunParams? = null,
         currencySplit: NfcTopupCurrencySplit? = null,
+        usdcTopupSessionId: String? = null,
     ): NfcTopupResult {
         val url = java.net.URL("$BEAMIO_API/api/nfcTopup")
         val conn = url.openConnection() as java.net.HttpURLConnection
@@ -3864,6 +4376,7 @@ class MainActivity : ComponentActivity() {
             sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
             put("workflow", "adminTopup")
             put("topupMode", "admin")
+            usdcTopupSessionId?.trim()?.lowercase(Locale.US)?.takeIf { it.length == 36 }?.let { put("usdcTopupSessionId", it) }
             currencySplit?.let { s ->
                 put("currencyAmount", s.currencyAmount)
                 put("cardCurrencyAmount", s.cardCurrencyAmount)
@@ -3946,6 +4459,12 @@ class MainActivity : ComponentActivity() {
         if (rate <= 0) return "0"
         val usdcAmount = amount / rate
         return (usdcAmount * 1_000_000).toLong().toString()
+    }
+
+    /** Charge fiat6-only protocol: convert the display currency amount directly to 6 decimals, without oracle conversion. */
+    private fun currencyToFiat6(amount: Double): String {
+        if (amount <= 0) return "0"
+        return kotlin.math.round(amount * 1_000_000.0).toLong().toString()
     }
 
     /** [currencyToUsdc6] 的逆：USDC6 → 账单货币金额（与 iOS `usdc6ToCurrencyAmount` 一致） */
@@ -4046,14 +4565,28 @@ class MainActivity : ComponentActivity() {
                 val tipStrForNfc = "%.2f".format(tipPay)
                 val payCurrency = paymentCard?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrency = chargeTotalInCurrency(subtotalPay, taxPctResolved, tierDiscPct, tipPay)
-                val amountUsdc6 = currencyToUsdc6(totalCurrency, payCurrency, oracle)
-                if (amountUsdc6 == "0") {
+                val amountFiat6Str = currencyToFiat6(totalCurrency)
+                val amountFiat6Long = amountFiat6Str.toLongOrNull() ?: 0L
+                if (amountFiat6Long <= 0L) {
                     runOnUiThread {
                         val fromScan = nfcFetchingInfo
                         paymentScreenStatus = PaymentStatus.Error
                         paymentScreenError = "Amount conversion failed"
                         paymentScreenRoutingSteps = steps
                         if (fromScan) { nfcFetchingInfo = false; nfcFetchError = "Amount conversion failed" }
+                    }
+                    return@Thread
+                }
+                val prepareEstimate = payByNfcUidPrepareFiat6(effectiveUid, payee, amountFiat6Str, payCurrency, sunParams)
+                val unitPriceForEstimate = (prepareEstimate["unitPriceUSDC6"] as? String)?.toLongOrNull() ?: 0L
+                if (prepareEstimate["ok"] != true || unitPriceForEstimate <= 0L) {
+                    val msg = (prepareEstimate["error"] as? String) ?: "Prepare failed"
+                    runOnUiThread {
+                        val fromScan = nfcFetchingInfo
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = msg
+                        paymentScreenRoutingSteps = steps
+                        if (fromScan) { nfcFetchingInfo = false; nfcFetchError = msg }
                     }
                     return@Thread
                 }
@@ -4081,14 +4614,14 @@ class MainActivity : ComponentActivity() {
                 runOnUiThread {
                     paymentScreenPreBalance = "%.2f".format(totalBalanceCad)
                 }
-                val required6 = amountUsdc6.toLongOrNull() ?: 0L
+                val required6 = (amountFiat6Long * unitPriceForEstimate + 999_999L) / 1_000_000L
                 if (totalBalance6 >= required6) {
                     chargeCapToCustomerAvailableBalance = false
                 }
                 val ratePayForPartial = getRateForCurrency(payCurrency, oracle)
                 val balancePayCurBeforeNfc = (totalBalance6 / 1_000_000.0) * ratePayForPartial
                 var partialChargeNfc = false
-                var effectiveAmountUsdc6Str = amountUsdc6
+                var effectiveAmountFiat6Str = amountFiat6Str
                 var chargeTotalInPayForSplit = totalCurrency
                 var nfcSubtotalStrEff = paymentScreenSubtotal.trim().ifEmpty { "%.2f".format(subtotalPay) }
                 var nfcTipStrEff = tipStrForNfc
@@ -4139,7 +4672,7 @@ class MainActivity : ComponentActivity() {
                     chargeCapToCustomerAvailableBalance = false
                     partialChargeNfc = true
                     val ratioNfc = totalBalance6.toDouble() / required6.toDouble().coerceAtLeast(1.0)
-                    effectiveAmountUsdc6Str = totalBalance6.toString()
+                    effectiveAmountFiat6Str = kotlin.math.round(amountFiat6Long * ratioNfc).toLong().coerceAtLeast(1L).toString()
                     chargeTotalInPayForSplit = totalCurrency * ratioNfc
                     nfcSubtotalStrEff = "%.2f".format(subtotalPay * ratioNfc)
                     nfcTipStrEff = "%.2f".format(tipPay * ratioNfc)
@@ -4155,14 +4688,13 @@ class MainActivity : ComponentActivity() {
                     paymentScreenStatus = PaymentStatus.Submitting
                     paymentScreenRoutingSteps = updateStep(steps, "sendTx", StepStatus.loading)
                 }
-                val result = payByNfcUidWithContainer(
+                val result = payByNfcUidWithContainerFiat6(
                     effectiveUid,
-                    effectiveAmountUsdc6Str,
+                    effectiveAmountFiat6Str,
                     payee,
                     assets,
                     oracle,
                     sunParams,
-                    chargeTotalInPayCurrency = chargeTotalInPayForSplit,
                     nfcSubtotalCurrencyAmount = nfcSubtotalStrEff,
                     nfcTipCurrencyAmount = nfcTipStrEff,
                     nfcTipRateBps = paymentScreenTipRateBps,
@@ -4170,7 +4702,8 @@ class MainActivity : ComponentActivity() {
                     nfcTaxAmountFiat6 = nfcTaxFiat6Eff,
                     nfcTaxRateBps = taxBpsResolved,
                     nfcDiscountAmountFiat6 = nfcDiscFiat6Eff,
-                    nfcDiscountRateBps = discBpsResolved
+                    nfcDiscountRateBps = discBpsResolved,
+                    nfcUsdcLane = pendingChargeMethodRaw == "usdc" && usdcChargePayerMode == "nfc",
                 )
                 steps = updateStep(steps, "sendTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Sent" else (result.error ?: "Payment failed"))
                 steps = updateStep(steps, "waitTx", if (result.success) StepStatus.success else StepStatus.error, if (result.success) "Transaction complete" else (result.error ?: ""))
@@ -4322,7 +4855,7 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
-    /** QR 支付：与 SilentPassUI 一致。商户金额 → USDC6，链上查询客户资产，Smart Routing 组装 items，POST /api/AAtoEOA */
+    /** QR 支付：商户金额按 card currency 转 fiat6，链上查询客户资产，Smart Routing 组装 items，POST /api/AAtoEOA */
     private fun executeQrPayment(payload: org.json.JSONObject) {
         Thread {
             try {
@@ -4391,8 +4924,9 @@ class MainActivity : ComponentActivity() {
                 val discBpsQr = kotlin.math.round(tierDiscQr * 100.0).toInt().coerceIn(0, 10000)
                 val payCurrencyQr = paymentCardForQrCharge?.cardCurrency ?: assets.cardCurrency ?: "CAD"
                 val totalCurrencyQr = chargeTotalInCurrency(requestQr, taxPctQr, tierDiscQr, tipQr)
-                val enteredUsdc6 = currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
-                if (enteredUsdc6 <= 0) {
+                val amountFiat6QrStr = currencyToFiat6(totalCurrencyQr)
+                val amountFiat6Qr = amountFiat6QrStr.toLongOrNull() ?: 0L
+                if (amountFiat6Qr <= 0L) {
                     runOnUiThread {
                         nfcFetchingInfo = false
                         paymentScreenStatus = PaymentStatus.Error
@@ -4409,18 +4943,41 @@ class MainActivity : ComponentActivity() {
                 val unitPriceStr = assets.unitPriceUSDC6
                 val unitPriceUSDC6 = unitPriceStr?.toLongOrNull() ?: 0L
                 val cards = chargeableCards(assets)
-                val ccsaCards = cards.filter { it.cardType == "ccsa" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
-                val infraCards = cards.filter { it.cardType == "infrastructure" || it.cardAddress.equals(infraCardAddress(), ignoreCase = true) }
-                val ccsaPoints6 = ccsaCards.sumOf { it.points6.toLongOrNull() ?: 0L }
-                val infraPoints6 = infraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val bucketsQr = partitionPointsForMerchantCharge(cards)
+                val unitPoints6 = bucketsQr.unitPricePoints6
+                val oracleInfraCardsQr = bucketsQr.oracleInfraCards
+                val infraPoints6 = oracleInfraCardsQr.sumOf { it.points6.toLongOrNull() ?: 0L }
+                val cardChainInfoQr = if (unitPoints6 > 0L) fetchBeamioUserCardCurrencyCodeAndPointsUnitPriceE6Sync(infraCardAddress()) else null
+                if (unitPoints6 > 0L && cardChainInfoQr == null) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Card price unavailable. Please refresh customer balance and try again."
+                    }
+                    return@Thread
+                }
                 val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
-                val ccsaValueUsdc6 = if (ccsaPoints6 > 0 && unitPriceUSDC6 > 0) (ccsaPoints6 * unitPriceUSDC6) / 1_000_000 else 0L
-                val infraValueUsdc6 = infraCards.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
+                val enteredUsdc6 = if (unitPriceUSDC6 > 0L) {
+                    (amountFiat6Qr * unitPriceUSDC6 + 999_999L) / 1_000_000L
+                } else {
+                    currencyToUsdc6(totalCurrencyQr, payCurrencyQr, oracle).toLongOrNull() ?: 0L
+                }
+                if (enteredUsdc6 <= 0L) {
+                    runOnUiThread {
+                        nfcFetchingInfo = false
+                        paymentScreenStatus = PaymentStatus.Error
+                        paymentScreenError = "Amount conversion failed"
+                    }
+                    return@Thread
+                }
+                val ccsaValueUsdc6 = if (unitPoints6 > 0L && unitPriceUSDC6 > 0L) (unitPoints6 * unitPriceUSDC6) / 1_000_000L else 0L
+                val infraValueUsdc6 = oracleInfraCardsQr.sumOf { c -> points6ToUsdc6(c.points6.toLongOrNull() ?: 0L, c.cardCurrency, oracle) }
                 val totalBalance6 = chargePreflightTotalBalanceUsdc6(assets, oracle)
                 val rateQrPartial = getRateForCurrency(payCurrencyQr, oracle)
                 val balancePayCurBeforeQr = (totalBalance6 / 1_000_000.0) * rateQrPartial
                 var partialChargeQr = false
                 var effectiveUsdc6Final = enteredUsdc6
+                var effectiveAmountFiat6Qr = amountFiat6Qr
                 var chargeTotalForSplitQr = totalCurrencyQr
                 var tipQrEff = tipQr
                 var requestQrEff = requestQr
@@ -4478,6 +5035,7 @@ class MainActivity : ComponentActivity() {
                     partialChargeQr = true
                     val ratioQr = totalBalance6.toDouble() / enteredUsdc6.toDouble().coerceAtLeast(1.0)
                     effectiveUsdc6Final = totalBalance6
+                    effectiveAmountFiat6Qr = kotlin.math.round(amountFiat6Qr * ratioQr).toLong().coerceAtLeast(1L)
                     chargeTotalForSplitQr = totalCurrencyQr * ratioQr
                     requestQrEff = requestQr * ratioQr
                     tipQrEff = tipQr * ratioQr
@@ -4491,37 +5049,21 @@ class MainActivity : ComponentActivity() {
                 steps = updateStep(steps, "analyzingAssets", StepStatus.success,
                     if (ccsaValueUsdc6 >= effectiveUsdc6) "\$CCSA: (Sufficient)" else if (ccsaValueUsdc6 > 0) "\$CCSA: (Partial)" else "USDC sufficient")
                 runOnUiThread { paymentScreenRoutingSteps = updateStep(steps, "optimizingRoute", StepStatus.loading) }
-                val qrSplit = computeChargeContainerSplit(
-                    effectiveUsdc6,
-                    chargeTotalForSplitQr,
-                    payCurrencyQr,
-                    oracle,
-                    unitPriceUSDC6,
-                    ccsaPoints6,
-                    infraPoints6,
-                    infraCards.firstOrNull()?.cardCurrency,
-                    usdcBalance6,
+                val qrSplit = computeChargeContainerSplitFiat6(
+                    amountFiat6 = effectiveAmountFiat6Qr,
+                    payCurrency = payCurrencyQr,
+                    cardCurrency = cardChainInfoQr?.first,
+                    pointsUnitPriceInCurrencyE6 = cardChainInfoQr?.second?.toLong() ?: 0L,
+                    ccsaPoints6 = unitPoints6,
+                    infraPoints6 = infraPoints6,
+                    infraCardCurrency = oracleInfraCardsQr.firstOrNull()?.cardCurrency,
+                    usdcBalance6 = usdcBalance6,
+                    oracle = oracle,
+                    unitPriceUSDC6Fallback = unitPriceUSDC6,
                 )
-                var ccsaPointsWei = qrSplit.ccsaPointsWei
-                var infraPointsWei = qrSplit.infraPointsWei
-                var usdcWei = qrSplit.usdcWei
-                val composedItems = mutableListOf<Map<String, Any>>()
-                if (usdcWei > 0) {
-                    composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
-                }
-                // 与 NFC 相同 asset：合并为单条 kind 1，避免两条同 asset 的 container（与贴卡流程一致且利于预检）
-                val beamio1155PointsWei = (ccsaPointsWei + infraPointsWei).coerceAtLeast(0L)
-                if (beamio1155PointsWei > 0) {
-                    composedItems.add(
-                        mapOf(
-                            "kind" to 1,
-                            "asset" to infraCardAddress(),
-                            "amount" to beamio1155PointsWei.toString(),
-                            "tokenId" to "0",
-                            "data" to "0x"
-                        )
-                    )
-                }
+                val beamio1155PointsWei = (qrSplit.ccsaPointsWei + qrSplit.infraPointsWei).coerceAtLeast(0L)
+                val usdcWei = qrSplit.usdcWei
+                val composedItems = buildPayItemsFiat6(qrSplit).toMutableList()
                 if (composedItems.isEmpty()) {
                     composedItems.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to effectiveUsdc6.toString(), "tokenId" to "0", "data" to "0x"))
                 }
@@ -4978,6 +5520,29 @@ class MainActivity : ComponentActivity() {
         val usdcWei: Long,
     )
 
+    private data class ChargePointBuckets(
+        val unitPricePoints6: Long,
+        val oracleInfraCards: List<CardItem>,
+    )
+
+    private fun partitionPointsForMerchantCharge(cards: List<CardItem>): ChargePointBuckets {
+        val infraKey = infraCardAddress().trim()
+        var unitSum = 0L
+        val oracleInfra = mutableListOf<CardItem>()
+        cards.forEach { card ->
+            val points = card.points6.toLongOrNull() ?: 0L
+            if (points <= 0L) return@forEach
+            val type = card.cardType.trim().lowercase(Locale.US)
+            val sameTerminalInfra = infraKey.isNotEmpty() && card.cardAddress.equals(infraKey, ignoreCase = true)
+            if (type == "infrastructure" && !sameTerminalInfra) {
+                oracleInfra.add(card)
+            } else {
+                unitSum += points
+            }
+        }
+        return ChargePointBuckets(unitSum, oracleInfra)
+    }
+
     /**
      * Charge 路由：先 CCSA（按 unitPriceUSDC6），再基础设施点，最后 USDC。
      * 当账单币种与基础设施卡 [infraCardCurrency] 一致时，基础设施点按「找零」直接用本币 fiat6（与 charge 合计同一套 round）
@@ -5054,6 +5619,103 @@ class MainActivity : ComponentActivity() {
             }
         }
         return ChargeContainerSplit(ccsaPointsWei, infraPointsWei, usdcWei)
+    }
+
+    private fun computeChargeContainerSplitFiat6(
+        amountFiat6: Long,
+        payCurrency: String,
+        cardCurrency: String?,
+        pointsUnitPriceInCurrencyE6: Long,
+        ccsaPoints6: Long,
+        infraPoints6: Long,
+        infraCardCurrency: String?,
+        usdcBalance6: Long,
+        oracle: OracleRates,
+        unitPriceUSDC6Fallback: Long,
+    ): ChargeContainerSplit {
+        if (amountFiat6 <= 0L) return ChargeContainerSplit(0L, 0L, 0L)
+        val payCur = payCurrency.trim().uppercase(Locale.US)
+        val cardCur = cardCurrency?.trim()?.uppercase(Locale.US).orEmpty()
+        val priceE6 = if (pointsUnitPriceInCurrencyE6 > 0L) pointsUnitPriceInCurrencyE6 else unitPriceUSDC6Fallback
+        var remainingFiat6 = amountFiat6
+        var ccsaPointsWei = 0L
+        if (ccsaPoints6 > 0L && priceE6 > 0L && cardCur.isNotEmpty() && payCur == cardCur) {
+            val needCeil = (remainingFiat6 * 1_000_000L + priceE6 - 1L) / priceE6
+            ccsaPointsWei = minOf(needCeil, ccsaPoints6)
+            val consumedFiat6 = (ccsaPointsWei * priceE6) / 1_000_000L
+            remainingFiat6 = (remainingFiat6 - consumedFiat6).coerceAtLeast(0L)
+        }
+
+        var infraPointsWei = 0L
+        val infraCur = infraCardCurrency?.trim()?.uppercase(Locale.US).orEmpty()
+        if (remainingFiat6 > 0L && infraPoints6 > 0L && infraCur.isNotEmpty()) {
+            if (infraCur == payCur && priceE6 > 0L) {
+                val needCeil = (remainingFiat6 * 1_000_000L + priceE6 - 1L) / priceE6
+                infraPointsWei = minOf(needCeil, infraPoints6)
+                val consumedFiat6 = (infraPointsWei * priceE6) / 1_000_000L
+                remainingFiat6 = (remainingFiat6 - consumedFiat6).coerceAtLeast(0L)
+            } else {
+                val payRate = getRateForCurrency(payCur, oracle)
+                val infraRate = getRateForCurrency(infraCur, oracle)
+                if (payRate > 0.0 && infraRate > 0.0) {
+                    val remainingUsdc6 = (remainingFiat6 / payRate).toLong()
+                    val infraValueUsdc6 = points6ToUsdc6(infraPoints6, infraCur, oracle)
+                    val needUsdc6 = minOf(remainingUsdc6, infraValueUsdc6)
+                    infraPointsWei = kotlin.math.ceil(needUsdc6 * infraRate).toLong().coerceIn(0L, infraPoints6)
+                    val usedUsdc6 = points6ToUsdc6(infraPointsWei, infraCur, oracle)
+                    val usedFiat6 = (usedUsdc6 * payRate).toLong()
+                    remainingFiat6 = (remainingFiat6 - usedFiat6).coerceAtLeast(0L)
+                }
+            }
+        }
+
+        var usdcWei = 0L
+        if (remainingFiat6 > 0L) {
+            val payRate = getRateForCurrency(payCur, oracle)
+            if (payRate > 0.0) {
+                usdcWei = kotlin.math.ceil(remainingFiat6 / payRate).toLong().coerceIn(0L, usdcBalance6.coerceAtLeast(0L))
+            }
+        }
+        return ChargeContainerSplit(ccsaPointsWei, infraPointsWei, usdcWei)
+    }
+
+    private fun buildPayItemsFiat6(split: ChargeContainerSplit): List<Map<String, Any>> {
+        val items = mutableListOf<Map<String, Any>>()
+        if (split.usdcWei > 0L) {
+            items.add(mapOf("kind" to 0, "asset" to USDC_BASE, "amount" to split.usdcWei.toString(), "tokenId" to "0", "data" to "0x"))
+        }
+        if (split.ccsaPointsWei > 0L) {
+            items.add(mapOf("kind" to 1, "asset" to infraCardAddress(), "amount" to split.ccsaPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
+        }
+        if (split.infraPointsWei > 0L) {
+            items.add(mapOf("kind" to 1, "asset" to infraCardAddress(), "amount" to split.infraPointsWei.toString(), "tokenId" to "0", "data" to "0x"))
+        }
+        return mergeInfraKind1Items(items)
+    }
+
+    private fun mergeInfraKind1Items(items: List<Map<String, Any>>): List<Map<String, Any>> {
+        val infra = infraCardAddress()
+        var usdc: Map<String, Any>? = null
+        var infraSum = 0L
+        val others = mutableListOf<Map<String, Any>>()
+        items.forEach { item ->
+            val kind = (item["kind"] as? Number)?.toInt() ?: item["kind"].toString().toIntOrNull() ?: 0
+            val asset = item["asset"]?.toString().orEmpty()
+            if (kind == 0) {
+                usdc = item
+            } else if (kind == 1 && asset.equals(infra, ignoreCase = true)) {
+                infraSum += item["amount"]?.toString()?.toLongOrNull()?.coerceAtLeast(0L) ?: 0L
+            } else {
+                others.add(item)
+            }
+        }
+        val out = mutableListOf<Map<String, Any>>()
+        usdc?.let { out.add(it) }
+        if (infraSum > 0L) {
+            out.add(mapOf("kind" to 1, "asset" to infra, "amount" to infraSum.toString(), "tokenId" to "0", "data" to "0x"))
+        }
+        out.addAll(others)
+        return if (out.isEmpty()) items else out
     }
 
     /** 新流程：Android 自行 Smart Routing 构建 container，服务端仅签名并 relay。CCSA + 基础设施卡均可扣款。NFC 格式(14 位 hex uid)时需传 sunParams(e,c,m) 做 SUN 校验。 */
@@ -5177,6 +5839,84 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+    private fun payByNfcUidWithContainerFiat6(
+        uid: String,
+        amountFiat6: String,
+        payee: String,
+        assets: UIDAssets,
+        oracle: OracleRates,
+        sunParams: SunParams? = null,
+        nfcSubtotalCurrencyAmount: String? = null,
+        nfcTipCurrencyAmount: String? = null,
+        nfcTipRateBps: Int = 0,
+        nfcRequestCurrency: String = "CAD",
+        nfcTaxAmountFiat6: String? = null,
+        nfcTaxRateBps: Int? = null,
+        nfcDiscountAmountFiat6: String? = null,
+        nfcDiscountRateBps: Int? = null,
+        nfcUsdcLane: Boolean = false,
+    ): PayByNfcResult {
+        val amountFiat6Long = amountFiat6.toLongOrNull() ?: 0L
+        if (amountFiat6Long <= 0L) return PayByNfcResult(false, null, "Invalid amountFiat6")
+        val prepare = payByNfcUidPrepareFiat6(uid, payee, amountFiat6, nfcRequestCurrency, sunParams, nfcUsdcLane)
+        val ok = prepare["ok"] == true
+        val account = prepare["account"] as? String
+        val nonce = prepare["nonce"] as? String
+        val deadline = prepare["deadline"] as? String
+        val payeeAA = prepare["payeeAA"] as? String
+        val unitPriceStr = prepare["unitPriceUSDC6"] as? String
+        if (!ok || account == null || nonce == null || deadline == null || payeeAA == null || unitPriceStr == null) {
+            return PayByNfcResult(false, null, (prepare["error"] as? String) ?: "Prepare failed")
+        }
+        val unitPriceUSDC6 = unitPriceStr.toLongOrNull() ?: 0L
+        if (unitPriceUSDC6 <= 0L) return PayByNfcResult(false, null, "Unit price 0")
+        val cardCurrency = (prepare["cardCurrency"] as? String)?.uppercase(Locale.US)
+        val pointsPriceCurE6 = (prepare["pointsUnitPriceInCurrencyE6"] as? String)?.toLongOrNull() ?: 0L
+        val cards = chargeableCards(assets)
+        val buckets = partitionPointsForMerchantCharge(cards)
+        val oracleInfraCards = buckets.oracleInfraCards
+        val infraPoints6 = oracleInfraCards.sumOf { it.points6.toLongOrNull() ?: 0L }
+        val usdcBalance6 = payerUsdcBalance6ForChargePolicy(assets)
+        val split = computeChargeContainerSplitFiat6(
+            amountFiat6 = amountFiat6Long,
+            payCurrency = nfcRequestCurrency,
+            cardCurrency = cardCurrency,
+            pointsUnitPriceInCurrencyE6 = pointsPriceCurE6,
+            ccsaPoints6 = buckets.unitPricePoints6,
+            infraPoints6 = infraPoints6,
+            infraCardCurrency = oracleInfraCards.firstOrNull()?.cardCurrency,
+            usdcBalance6 = usdcBalance6,
+            oracle = oracle,
+            unitPriceUSDC6Fallback = unitPriceUSDC6,
+        )
+        val items = buildPayItemsFiat6(split)
+        if (items.isEmpty()) return PayByNfcResult(false, null, "No chargeable balance")
+        val itemsJson = org.json.JSONArray()
+        items.forEach { m -> itemsJson.put(org.json.JSONObject(m)) }
+        val containerPayload = org.json.JSONObject().apply {
+            put("account", account)
+            put("to", payeeAA)
+            put("items", itemsJson)
+            put("nonce", nonce)
+            put("deadline", deadline)
+        }
+        return payByNfcUidSignContainerFiat6(
+            uid = uid,
+            containerPayload = containerPayload,
+            amountFiat6 = amountFiat6,
+            currency = nfcRequestCurrency,
+            sunParams = sunParams,
+            nfcSubtotalCurrencyAmount = nfcSubtotalCurrencyAmount,
+            nfcTipCurrencyAmount = nfcTipCurrencyAmount,
+            nfcTipRateBps = nfcTipRateBps,
+            nfcTaxAmountFiat6 = nfcTaxAmountFiat6,
+            nfcTaxRateBps = nfcTaxRateBps,
+            nfcDiscountAmountFiat6 = nfcDiscountAmountFiat6,
+            nfcDiscountRateBps = nfcDiscountRateBps,
+            nfcUsdcLane = nfcUsdcLane,
+        )
+    }
+
     private fun payByNfcUidPrepare(uid: String, payee: String, amountUsdc6: String, sunParams: SunParams? = null): Map<String, Any?> {
         return try {
             val url = java.net.URL("$BEAMIO_API/api/payByNfcUidPrepare")
@@ -5208,6 +5948,45 @@ class MainActivity : ComponentActivity() {
             )
         } catch (e: Exception) {
             Log.e("MainActivity", "payByNfcUidPrepare", e)
+            mapOf("ok" to false, "error" to (e.message ?: "Prepare failed"))
+        }
+    }
+
+    private fun payByNfcUidPrepareFiat6(uid: String, payee: String, amountFiat6: String, currency: String, sunParams: SunParams? = null, nfcUsdcLane: Boolean = false): Map<String, Any?> {
+        return try {
+            val path = if (nfcUsdcLane) "/api/nfcUsdcChargeNfcPrepare" else "/api/payByNfcUidPrepare"
+            val url = java.net.URL("$BEAMIO_API$path")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            val body = org.json.JSONObject().apply {
+                put("uid", uid)
+                put("payee", payee)
+                put("amountFiat6", amountFiat6)
+                put("currency", currency.trim().ifEmpty { "CAD" }.uppercase(Locale.US))
+                sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+            }.toString()
+            conn.outputStream.use { os -> os.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            val root = org.json.JSONObject(resp)
+            mapOf(
+                "ok" to root.optBoolean("ok", false),
+                "account" to root.optString("account").takeIf { it.isNotEmpty() },
+                "nonce" to root.optString("nonce").takeIf { it.isNotEmpty() },
+                "deadline" to root.optString("deadline").takeIf { it.isNotEmpty() },
+                "payeeAA" to root.optString("payeeAA").takeIf { it.isNotEmpty() },
+                "unitPriceUSDC6" to root.optString("unitPriceUSDC6").takeIf { it.isNotEmpty() },
+                "cardCurrency" to root.optString("cardCurrency").takeIf { it.isNotEmpty() },
+                "pointsUnitPriceInCurrencyE6" to root.optString("pointsUnitPriceInCurrencyE6").takeIf { it.isNotEmpty() },
+                "error" to root.optString("error").takeIf { it.isNotEmpty() }
+            )
+        } catch (e: Exception) {
+            Log.e("MainActivity", "payByNfcUidPrepareFiat6", e)
             mapOf("ok" to false, "error" to (e.message ?: "Prepare failed"))
         }
     }
@@ -5269,6 +6048,70 @@ class MainActivity : ComponentActivity() {
             )
         } catch (e: Exception) {
             Log.e("MainActivity", "payByNfcUidSignContainer", e)
+            PayByNfcResult(false, null, e.message ?: "Sign failed")
+        }
+    }
+
+    private fun payByNfcUidSignContainerFiat6(
+        uid: String,
+        containerPayload: org.json.JSONObject,
+        amountFiat6: String,
+        currency: String,
+        sunParams: SunParams? = null,
+        nfcSubtotalCurrencyAmount: String? = null,
+        nfcTipCurrencyAmount: String? = null,
+        nfcTipRateBps: Int = 0,
+        nfcTaxAmountFiat6: String? = null,
+        nfcTaxRateBps: Int? = null,
+        nfcDiscountAmountFiat6: String? = null,
+        nfcDiscountRateBps: Int? = null,
+        nfcUsdcLane: Boolean = false,
+    ): PayByNfcResult {
+        return try {
+            val path = if (nfcUsdcLane) "/api/nfcUsdcChargeNfcSign" else "/api/payByNfcUidSignContainer"
+            val url = java.net.URL("$BEAMIO_API$path")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 30000
+            conn.readTimeout = 90000
+            val ccy = currency.trim().ifEmpty { "CAD" }.uppercase(Locale.US)
+            val body = org.json.JSONObject().apply {
+                put("uid", uid)
+                put("containerPayload", containerPayload)
+                put("amountFiat6", amountFiat6)
+                put("currency", ccy)
+                sunParams?.let { put("e", it.e); put("c", it.c); put("m", it.m) }
+                nfcSubtotalCurrencyAmount?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcSubtotalCurrencyAmount", it) }
+                nfcTipCurrencyAmount?.trim()?.takeIf { it.isNotEmpty() }?.let { tip ->
+                    val tipNum = tip.toDoubleOrNull() ?: 0.0
+                    if (tipNum > 0.0) {
+                        put("nfcTipCurrencyAmount", tip)
+                        if (nfcTipRateBps > 0) put("nfcTipRateBps", nfcTipRateBps)
+                    }
+                }
+                put("nfcRequestCurrency", ccy)
+                nfcTaxAmountFiat6?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcTaxAmountFiat6", it) }
+                nfcTaxRateBps?.takeIf { it in 0..10000 }?.let { put("nfcTaxRateBps", it) }
+                nfcDiscountAmountFiat6?.trim()?.takeIf { it.isNotEmpty() }?.let { put("nfcDiscountAmountFiat6", it) }
+                nfcDiscountRateBps?.takeIf { it in 0..10000 }?.let { put("nfcDiscountRateBps", it) }
+            }
+            try {
+                attachChargeOwnerChildBurnToRequestBody(body, containerPayload)
+            } catch (_: Exception) { /* skip burn attachment */ }
+            conn.outputStream.use { os -> os.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() } ?: "{}"
+            conn.disconnect()
+            val root = org.json.JSONObject(resp)
+            PayByNfcResult(
+                success = code in 200..299 && root.optBoolean("success", true),
+                txHash = root.optString("USDC_tx").takeIf { it.isNotEmpty() },
+                error = root.optString("error").takeIf { it.isNotEmpty() }
+            )
+        } catch (e: Exception) {
+            Log.e("MainActivity", "payByNfcUidSignContainerFiat6", e)
             PayByNfcResult(false, null, e.message ?: "Sign failed")
         }
     }
@@ -5428,6 +6271,738 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e("MainActivity", "encodeLinkAppQrBitmap", e)
             null
+        }
+    }
+
+    private data class UsdcChargeSessionResult(
+        val ok: Boolean,
+        val sid: String,
+        val state: String,
+        val error: String?,
+        val cardOwner: String?,
+        val pos: String?,
+        val currency: String?,
+        val subtotal: String?,
+        val tip: String?,
+        val total: String?,
+        val usdcTx: String?,
+        val payer: String?,
+        val chargeTxHash: String?,
+        val pendingTopupCardAddr: String?,
+        val pendingTopupData: String?,
+        val pendingTopupDeadline: Long?,
+        val pendingTopupNonce: String?,
+        val topupTxHash: String?,
+    )
+
+    private fun resolveInfraCardOwnerForUsdcChargeSync(infra: String, pos: String): String? {
+        fetchGetCardAdminInfoJsonSync(pos)?.optString("owner", "")?.trim()?.takeIf { looksLikeEthereumAddress(it) }?.let { return it }
+        val pre = fetchUsdcChargePreCheckSync(
+            cardAddress = infra,
+            pos = pos,
+            subtotal = "0.01",
+            tipBps = 0,
+            taxBps = 0,
+            discountBps = 0,
+            currency = null,
+        )
+        return pre?.optString("cardOwner", "")?.trim()?.takeIf { looksLikeEthereumAddress(it) }
+    }
+
+    private fun buildUsdcChargeQrUrlNoNfc(
+        cardAddress: String,
+        pos: String,
+        sid: String,
+        subtotal: Double,
+        discountBps: Int,
+        taxBps: Int,
+        tipBps: Int,
+    ): String {
+        val builder = Uri.Builder()
+            .scheme("https")
+            .authority(USDC_CHARGE_PUBLIC_PAGE_HOST)
+            .path("/usdc-charge")
+            .appendQueryParameter("card", cardAddress)
+            .appendQueryParameter("pos", pos)
+            .appendQueryParameter("sid", sid)
+            .appendQueryParameter("subtotal", "%.2f".format(subtotal.coerceAtLeast(0.0)))
+        if (tipBps > 0) builder.appendQueryParameter("tipBps", tipBps.toString())
+        if (taxBps > 0) builder.appendQueryParameter("taxBps", taxBps.toString())
+        if (discountBps > 0) builder.appendQueryParameter("discountBps", discountBps.toString())
+        return builder.build().toString()
+    }
+
+    /** 阶段 1：无 NFC 参数；直出 HTTPS（与 `buildUsdcChargeQrUrlNoNfc` / iOS `buildUsdcTopupQrUrlPhase1` 一致）。 */
+    private fun buildUsdcTopupQrUrlPhase1(
+        cardAddress: String,
+        cardOwner: String,
+        amount: String,
+        currency: String,
+        sid: String,
+        pos: String,
+    ): String =
+        Uri.Builder()
+            .scheme("https")
+            .authority(USDC_CHARGE_PUBLIC_PAGE_HOST)
+            .path("/usdc-topup")
+            .appendQueryParameter("card", cardAddress)
+            .appendQueryParameter("owner", cardOwner)
+            .appendQueryParameter("amount", amount)
+            .appendQueryParameter("currency", currency.uppercase(Locale.US))
+            .appendQueryParameter("sid", sid)
+            .appendQueryParameter("pos", pos)
+            .build()
+            .toString()
+
+    /** 含 SUN；契约对齐 `src/verra-home/src/pages/UsdcTopup.tsx`。 */
+    private fun buildUsdcTopupQrUrl(
+        cardAddress: String,
+        cardOwner: String,
+        uid: String,
+        sun: SunParams,
+        amount: String,
+        currency: String,
+        sid: String,
+        pos: String,
+    ): String =
+        Uri.Builder()
+            .scheme("https")
+            .authority(USDC_CHARGE_PUBLIC_PAGE_HOST)
+            .path("/usdc-topup")
+            .appendQueryParameter("card", cardAddress)
+            .appendQueryParameter("owner", cardOwner)
+            .appendQueryParameter("uid", uid)
+            .appendQueryParameter("e", sun.e)
+            .appendQueryParameter("c", sun.c)
+            .appendQueryParameter("m", sun.m)
+            .appendQueryParameter("amount", amount)
+            .appendQueryParameter("currency", currency.uppercase(Locale.US))
+            .appendQueryParameter("sid", sid)
+            .appendQueryParameter("pos", pos)
+            .build()
+            .toString()
+
+    private data class TopupUsdcSessionPollCtx(
+        val sid: String,
+        val uid: String,
+        val sun: SunParams?,
+        val cardAddress: String,
+        val currency: String,
+        val topupAmountString: String,
+    )
+
+    private fun presentUsdcTopupQrPhase1OnlySync() {
+        try {
+            if (!posTopupMethodRawAllowed("usdc")) {
+                runOnUiThread {
+                    topupUsdcQrGenerating = false
+                    nfcFetchError = "USDC top-up is not enabled for this terminal."
+                }
+                return
+            }
+            val amt = topupScreenAmount.trim().replace(",", "").toDoubleOrNull() ?: 0.0
+            if (amt <= 0.0) {
+                runOnUiThread {
+                    topupUsdcQrGenerating = false
+                    nfcFetchError = "Invalid amount"
+                }
+                return
+            }
+            val pos = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+            if (!looksLikeEthereumAddress(pos)) {
+                runOnUiThread {
+                    topupUsdcQrGenerating = false
+                    nfcFetchError = "Wallet not initialized."
+                }
+                return
+            }
+            refreshMerchantInfraCardFromDbSync()
+            val infra = infraCardAddress().trim()
+            if (!looksLikeEthereumAddress(infra)) {
+                runOnUiThread {
+                    topupUsdcQrGenerating = false
+                    nfcFetchError = "Merchant infrastructure card not configured."
+                }
+                return
+            }
+            val owner = resolveInfraCardOwnerForUsdcChargeSync(infra, pos).orEmpty()
+            if (!looksLikeEthereumAddress(owner)) {
+                runOnUiThread {
+                    topupUsdcQrGenerating = false
+                    nfcFetchError = "Cannot resolve card owner. Please retry."
+                }
+                return
+            }
+            val currency = fetchBeamioUserCardCurrencyCodeAndPointsUnitPriceE6Sync(infra)?.first?.uppercase(Locale.US) ?: "CAD"
+            val (apiAmountString, _) = resolveTopupApiAmountAndSplit(topupScreenAmount, "usdc")
+            val sid = java.util.UUID.randomUUID().toString().lowercase(Locale.US)
+            val url = buildUsdcTopupQrUrlPhase1(
+                cardAddress = infra,
+                cardOwner = owner,
+                amount = apiAmountString,
+                currency = currency,
+                sid = sid,
+                pos = pos,
+            )
+            runOnUiThread {
+                topupUsdcSessionId = sid
+                topupUsdcDeepLinkUrl = url
+                topupUsdcSessionProgressLabel = ""
+                topupUsdcQrGenerating = false
+                topupUsdcNfcSubtitle = ""
+                nfcFetchError = ""
+                syncScanMethodEntryAndTabs()
+            }
+            runTopupUsdcSessionPollLoop(
+                TopupUsdcSessionPollCtx(
+                    sid = sid,
+                    uid = "",
+                    sun = SunParams(uid = "", e = "", c = "", m = ""),
+                    cardAddress = infra,
+                    currency = currency,
+                    topupAmountString = apiAmountString,
+                )
+            )
+        } catch (e: Exception) {
+            Log.e("MainActivity", "presentUsdcTopupQrPhase1OnlySync", e)
+            runOnUiThread {
+                topupUsdcQrGenerating = false
+                nfcFetchError = e.message ?: "Failed to create USDC top-up QR"
+            }
+        }
+    }
+
+    /** 顾客先贴卡时再生成带 SUN 的 QR（新 sid，重启轮询）。在当前 Worker 线程调用。 */
+    private fun presentUsdcTopupQrFromNfcSync(uid: String, sun: SunParams, amount: String) {
+        try {
+            if (!posTopupMethodRawAllowed("usdc")) return
+            val pos = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+            if (!looksLikeEthereumAddress(pos)) return
+            refreshMerchantInfraCardFromDbSync()
+            val infra = infraCardAddress().trim()
+            if (!looksLikeEthereumAddress(infra)) return
+            val owner = resolveInfraCardOwnerForUsdcChargeSync(infra, pos).orEmpty()
+            if (!looksLikeEthereumAddress(owner)) return
+            val currency = fetchBeamioUserCardCurrencyCodeAndPointsUnitPriceE6Sync(infra)?.first?.uppercase(Locale.US) ?: "CAD"
+            val (apiAmountString, _) = resolveTopupApiAmountAndSplit(amount, "usdc")
+            val sid = java.util.UUID.randomUUID().toString().lowercase(Locale.US)
+            val url = buildUsdcTopupQrUrl(
+                cardAddress = infra,
+                cardOwner = owner,
+                uid = uid,
+                sun = sun,
+                amount = apiAmountString,
+                currency = currency,
+                sid = sid,
+                pos = pos,
+            )
+            runOnUiThread {
+                topupUsdcSessionId = sid
+                topupUsdcDeepLinkUrl = url
+                topupUsdcSessionProgressLabel = ""
+                topupUsdcNfcSubtitle = ""
+                nfcFetchError = ""
+                syncScanMethodEntryAndTabs()
+            }
+            runTopupUsdcSessionPollLoop(
+                TopupUsdcSessionPollCtx(
+                    sid = sid,
+                    uid = uid,
+                    sun = sun,
+                    cardAddress = infra,
+                    currency = currency,
+                    topupAmountString = apiAmountString,
+                )
+            )
+        } catch (e: Exception) {
+            Log.e("MainActivity", "presentUsdcTopupQrFromNfcSync", e)
+            runOnUiThread { nfcFetchError = e.message ?: "Failed to build USDC top-up link" }
+        }
+    }
+
+    private fun runTopupUsdcSessionPollLoop(ctx: TopupUsdcSessionPollCtx) {
+        Thread {
+            try {
+                Thread.sleep(1500)
+                while (true) {
+                    if (topupUsdcSessionId != ctx.sid) return@Thread
+                    val result = fetchUsdcChargeSessionSync(ctx.sid)
+                    if (result == null) {
+                        Thread.sleep(1500)
+                        continue
+                    }
+                    when (result.state) {
+                        "success" -> {
+                            val tx = result.topupTxHash?.takeIf { it.isNotBlank() }
+                                ?: result.usdcTx?.takeIf { it.isNotBlank() }
+                                ?: result.chargeTxHash.orEmpty()
+                            runOnUiThread {
+                                if (topupUsdcSessionId != ctx.sid) return@runOnUiThread
+                                topupUsdcQrGenerating = false
+                                topupUsdcDeepLinkUrl = ""
+                                topupUsdcSessionProgressLabel = ""
+                                topupUsdcSessionId = ""
+                                topupUsdcNfcSubtitle = ""
+                                topupUsdcTopupAuthSubmittedSids.clear()
+                                topupUsdcTopupAuthInflightSids.clear()
+                                showScanMethodScreen = false
+                                topupViaQr = true
+                                topupScreenUid = ctx.uid.ifBlank { topupScreenUid }
+                                topupScreenAmount = ctx.topupAmountString
+                                topupScreenStatus = TopupStatus.Loading
+                                topupScreenTxHash = tx
+                                topupScreenError = ""
+                                topupScreenPreBalance = null
+                                topupScreenPostBalance = null
+                                topupScreenCardCurrency = ctx.currency
+                                showTopupScreen = true
+                            }
+                            Thread.sleep(3000)
+                            val postAssets = fetchUidAssetsSync(
+                                ctx.sun?.uid?.takeIf { it.isNotBlank() } ?: ctx.uid,
+                                ctx.sun,
+                                merchantInfraOnly = false,
+                            )
+                            runOnUiThread {
+                                val cardAddr = ctx.cardAddress.trim()
+                                if (postAssets != null && postAssets.ok) {
+                                    val postCard = postAssets.cards?.firstOrNull { it.cardAddress.equals(cardAddr, ignoreCase = true) }
+                                    topupScreenPostBalance = postCard?.points ?: postAssets.points ?: "—"
+                                    topupScreenBeamioTag = postAssets.beamioTag?.trim()?.removePrefix("@")?.takeIf { it.isNotBlank() }
+                                    topupScreenAddress = postAssets.address
+                                    topupScreenMemberNo = memberNoFromCardItem(postCard).ifEmpty { null }
+                                    topupScreenPassCardSnapshot = postCard
+                                    topupScreenCardBackground = postCard?.cardBackground
+                                    topupScreenCardImage = postCard?.cardImage
+                                    topupScreenTierName = postCard?.tierName
+                                    topupScreenTierDescription = postCard?.tierDescription
+                                } else {
+                                    topupScreenPostBalance = "—"
+                                }
+                                topupScreenStatus = TopupStatus.Success
+                                scheduleCardStatsRefetchUntilChanged(expectChargeChange = false, expectTopUpChange = true)
+                                scheduleElasticHomeDataPullAfterTxSuccess()
+                            }
+                            return@Thread
+                        }
+                        "error" -> {
+                            runOnUiThread {
+                                if (topupUsdcSessionId != ctx.sid) return@runOnUiThread
+                                topupUsdcQrGenerating = false
+                                topupUsdcDeepLinkUrl = ""
+                                topupUsdcSessionProgressLabel = ""
+                                topupUsdcSessionId = ""
+                                topupUsdcNfcSubtitle = ""
+                                nfcFetchError = result.error ?: "USDC top-up failed. Please ask the customer to retry."
+                            }
+                            return@Thread
+                        }
+                        "awaiting_beneficiary" -> {
+                            runOnUiThread {
+                                if (topupUsdcSessionId != ctx.sid) return@runOnUiThread
+                                topupUsdcDeepLinkUrl = ""
+                                topupUsdcSessionProgressLabel = ""
+                                topupUsdcNfcSubtitle = "USDC paid. Ask the customer to tap their Beamio card."
+                                syncScanMethodEntryAndTabs()
+                                armForNfcScan()
+                                scanWaitingForNfc = true
+                            }
+                            return@Thread
+                        }
+                        "awaiting_topup_auth" -> submitTopupUsdcTopupAuthIfNeeded(ctx.sid, result)
+                        else -> runOnUiThread {
+                            if (topupUsdcSessionId == ctx.sid) {
+                                topupUsdcSessionProgressLabel = when (result.state) {
+                                    "verifying" -> "Verifying payment…"
+                                    "settling" -> "Settling USDC…"
+                                    "awaiting_topup_auth" -> "Authorizing top-up…"
+                                    "topup_pending" -> "Crediting card…"
+                                    "topup_confirmed", "charge_pending" -> "Finalizing…"
+                                    else -> ""
+                                }
+                            }
+                        }
+                    }
+                    Thread.sleep(1500)
+                }
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+        }.start()
+    }
+
+    private fun submitTopupUsdcTopupAuthIfNeeded(sid: String, result: UsdcChargeSessionResult) {
+        synchronized(topupUsdcTopupAuthSubmittedSids) {
+            if (topupUsdcTopupAuthSubmittedSids.contains(sid) || topupUsdcTopupAuthInflightSids.contains(sid)) return
+            topupUsdcTopupAuthInflightSids.add(sid)
+        }
+        val cardAddr = result.pendingTopupCardAddr
+        val data = result.pendingTopupData
+        val deadline = result.pendingTopupDeadline
+        val nonce = result.pendingTopupNonce
+        if (cardAddr.isNullOrBlank() || data.isNullOrBlank() || deadline == null || nonce.isNullOrBlank()) {
+            synchronized(topupUsdcTopupAuthSubmittedSids) { topupUsdcTopupAuthInflightSids.remove(sid) }
+            return
+        }
+        val signature = try {
+            BeamioWeb3Wallet.signExecuteForAdmin(cardAddr, data, deadline, nonce)
+        } catch (e: Exception) {
+            synchronized(topupUsdcTopupAuthSubmittedSids) { topupUsdcTopupAuthInflightSids.remove(sid) }
+            runOnUiThread {
+                if (topupUsdcSessionId == sid) {
+                    topupUsdcQrGenerating = false
+                    topupUsdcDeepLinkUrl = ""
+                    topupUsdcSessionProgressLabel = ""
+                    topupUsdcSessionId = ""
+                    topupUsdcNfcSubtitle = ""
+                    nfcFetchError = "Failed to sign top-up authorization: ${e.message ?: "wallet error"}"
+                }
+            }
+            return
+        }
+        val submitted = submitUsdcChargeTopupAuthSync(sid, signature)
+        synchronized(topupUsdcTopupAuthSubmittedSids) {
+            topupUsdcTopupAuthInflightSids.remove(sid)
+            if (submitted?.first == true) topupUsdcTopupAuthSubmittedSids.add(sid)
+        }
+        if (submitted != null && !submitted.first) {
+            runOnUiThread {
+                if (topupUsdcSessionId == sid) {
+                    topupUsdcQrGenerating = false
+                    topupUsdcDeepLinkUrl = ""
+                    topupUsdcSessionProgressLabel = ""
+                    topupUsdcSessionId = ""
+                    topupUsdcNfcSubtitle = ""
+                    nfcFetchError = submitted.second ?: "Server rejected top-up authorization."
+                }
+            }
+        }
+    }
+
+    private fun fetchUsdcChargePreCheckSync(
+        cardAddress: String,
+        pos: String?,
+        subtotal: String,
+        tipBps: Int,
+        taxBps: Int,
+        discountBps: Int,
+        currency: String?,
+    ): org.json.JSONObject? {
+        return try {
+            val q = StringBuilder()
+            q.append("card=").append(java.net.URLEncoder.encode(cardAddress, "UTF-8"))
+            q.append("&subtotal=").append(java.net.URLEncoder.encode(subtotal, "UTF-8"))
+            q.append("&tipBps=").append(tipBps.coerceAtLeast(0))
+            q.append("&taxBps=").append(taxBps.coerceAtLeast(0))
+            q.append("&discountBps=").append(discountBps.coerceAtLeast(0))
+            pos?.trim()?.takeIf { looksLikeEthereumAddress(it) }?.let {
+                q.append("&pos=").append(java.net.URLEncoder.encode(it, "UTF-8"))
+            }
+            currency?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                q.append("&currency=").append(java.net.URLEncoder.encode(it.uppercase(Locale.US), "UTF-8"))
+            }
+            val conn = java.net.URL("$BEAMIO_API/api/nfcUsdcChargePreCheck?$q").openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            val root = org.json.JSONObject(body.ifEmpty { "{}" })
+            if (code in 200..299 || root.has("error")) root else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun fetchUsdcChargeSessionSync(sid: String): UsdcChargeSessionResult? {
+        val sidTrim = sid.trim().lowercase(Locale.US)
+        if (sidTrim.length != 36) return null
+        return try {
+            val enc = java.net.URLEncoder.encode(sidTrim, "UTF-8")
+            val conn = java.net.URL("$BEAMIO_API/api/nfcUsdcChargeSession?sid=$enc").openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.setRequestProperty("Accept", "application/json")
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            if (body.isBlank()) return null
+            val root = org.json.JSONObject(body)
+            if (code !in 200..299 && !root.has("error")) return null
+            val deadlineValue = root.opt("pendingTopupDeadline")
+            val deadline = when (deadlineValue) {
+                is Number -> deadlineValue.toLong()
+                is String -> deadlineValue.toLongOrNull()
+                else -> null
+            }
+            UsdcChargeSessionResult(
+                ok = root.optBoolean("ok", false),
+                sid = root.optString("sid", sidTrim),
+                state = root.optString("state", if (code in 200..299) "awaiting_payment" else "error"),
+                error = root.optString("error", "").takeIf { it.isNotBlank() },
+                cardOwner = root.optString("cardOwner", "").takeIf { it.isNotBlank() },
+                pos = root.optString("pos", "").takeIf { it.isNotBlank() },
+                currency = root.optString("currency", "").takeIf { it.isNotBlank() },
+                subtotal = root.optString("subtotal", "").takeIf { it.isNotBlank() },
+                tip = root.optString("tip", "").takeIf { it.isNotBlank() },
+                total = root.optString("total", "").takeIf { it.isNotBlank() },
+                usdcTx = root.optString("USDC_tx", "").takeIf { it.isNotBlank() },
+                payer = root.optString("payer", "").takeIf { it.isNotBlank() },
+                chargeTxHash = root.optString("chargeTxHash", "").takeIf { it.isNotBlank() },
+                pendingTopupCardAddr = root.optString("pendingTopupCardAddr", "").takeIf { it.isNotBlank() },
+                pendingTopupData = root.optString("pendingTopupData", "").takeIf { it.isNotBlank() },
+                pendingTopupDeadline = deadline,
+                pendingTopupNonce = root.optString("pendingTopupNonce", "").takeIf { it.isNotBlank() },
+                topupTxHash = root.optString("topupTxHash", "").takeIf { it.isNotBlank() },
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun submitUsdcChargeTopupAuthSync(sid: String, signature: String): Pair<Boolean, String?>? {
+        return try {
+            val conn = java.net.URL("$BEAMIO_API/api/nfcUsdcChargeTopupAuth").openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json")
+            conn.doOutput = true
+            conn.connectTimeout = 15000
+            conn.readTimeout = 15000
+            val body = org.json.JSONObject()
+                .put("sid", sid.trim().lowercase(Locale.US))
+                .put("signature", signature.trim())
+                .toString()
+            conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val resp = (if (code in 200..299) conn.inputStream else conn.errorStream)?.use { it.bufferedReader().readText() }.orEmpty()
+            conn.disconnect()
+            val root = org.json.JSONObject(resp.ifEmpty { "{}" })
+            val ok = code in 200..299 && root.optBoolean("success", false)
+            ok to root.optString("error", "").takeIf { it.isNotBlank() }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun presentUsdcChargeQrNoNfcSync(subtotalString: String, tipBps: Int) {
+        try {
+            if (!posChargeMethodRawAllowed("usdc")) {
+                runOnUiThread {
+                    chargeUsdcQrGenerating = false
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = "USDC charge is not enabled for this terminal."
+                }
+                return
+            }
+            val subtotal = subtotalString.trim().replace(",", "").toDoubleOrNull() ?: 0.0
+            if (subtotal <= 0.0) {
+                runOnUiThread {
+                    chargeUsdcQrGenerating = false
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = "Invalid amount"
+                }
+                return
+            }
+            val pos = BeamioWeb3Wallet.getAddress()?.trim().orEmpty()
+            if (!looksLikeEthereumAddress(pos)) {
+                runOnUiThread {
+                    chargeUsdcQrGenerating = false
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = "Wallet not initialized."
+                }
+                return
+            }
+            refreshMerchantInfraCardFromDbSync()
+            val infra = infraCardAddress().trim()
+            if (!looksLikeEthereumAddress(infra)) {
+                runOnUiThread {
+                    chargeUsdcQrGenerating = false
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = "Merchant infrastructure card not configured."
+                }
+                return
+            }
+            val owner = resolveInfraCardOwnerForUsdcChargeSync(infra, pos).orEmpty()
+            val currency = fetchBeamioUserCardCurrencyCodeAndPointsUnitPriceE6Sync(infra)?.first?.uppercase(Locale.US) ?: "CAD"
+            val taxP = fetchTierRoutingDetailsForTerminalWalletSync(pos)?.taxPercent ?: (dashboardInfraTaxPercent ?: 0.0)
+            val taxBps = kotlin.math.round(taxP * 100.0).toInt().coerceAtLeast(0)
+            val subtotalFormatted = "%.2f".format(subtotal)
+            val pre = fetchUsdcChargePreCheckSync(
+                cardAddress = infra,
+                pos = pos,
+                subtotal = subtotalFormatted,
+                tipBps = tipBps.coerceAtLeast(0),
+                taxBps = taxBps,
+                discountBps = 0,
+                currency = currency,
+            )
+            if (pre != null && !pre.optBoolean("ok", false)) {
+                runOnUiThread {
+                    chargeUsdcQrGenerating = false
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = pre.optString(
+                        "error",
+                        "Pre-check failed. Please top up B-Units or raise the POS admin mint limit."
+                    )
+                }
+                return
+            }
+            val sid = java.util.UUID.randomUUID().toString().lowercase(Locale.US)
+            val url = buildUsdcChargeQrUrlNoNfc(
+                cardAddress = infra,
+                pos = pos,
+                sid = sid,
+                subtotal = subtotal,
+                discountBps = 0,
+                taxBps = taxBps,
+                tipBps = tipBps.coerceAtLeast(0),
+            )
+            runOnUiThread {
+                chargeUsdcSessionId = sid
+                chargeUsdcDeepLinkUrl = url
+                chargeUsdcSessionProgressLabel = ""
+                chargeUsdcQrGenerating = false
+                paymentScreenStatus = PaymentStatus.Waiting
+                paymentScreenError = ""
+                paymentChargeBreakdownTaxPercent = taxP
+                paymentChargeBreakdownTierDiscountPercent = null
+                paymentScreenCardCurrency = currency
+                paymentScreenPayee = owner.ifEmpty { pos }
+            }
+            runChargeUsdcSessionPollLoop(sid, infra, owner, pos, currency, subtotal, taxBps, tipBps.coerceAtLeast(0))
+        } catch (e: Exception) {
+            Log.e("MainActivity", "presentUsdcChargeQrNoNfcSync", e)
+            runOnUiThread {
+                chargeUsdcQrGenerating = false
+                paymentScreenStatus = PaymentStatus.Error
+                paymentScreenError = e.message ?: "Failed to create USDC charge QR"
+            }
+        }
+    }
+
+    private fun runChargeUsdcSessionPollLoop(
+        sid: String,
+        cardAddress: String,
+        cardOwner: String,
+        posOperator: String,
+        currency: String,
+        subtotalAmount: Double,
+        taxBps: Int,
+        tipBps: Int,
+    ) {
+        try {
+            Thread.sleep(1500)
+            while (true) {
+                if (chargeUsdcSessionId != sid || chargeUsdcDeepLinkUrl.isEmpty()) return
+                val result = fetchUsdcChargeSessionSync(sid)
+                if (result == null) {
+                    Thread.sleep(1500)
+                    continue
+                }
+                when (result.state) {
+                    "success" -> {
+                        runOnUiThread {
+                            if (chargeUsdcSessionId != sid) return@runOnUiThread
+                            paymentScreenAmount = result.total ?: "%.2f".format(subtotalAmount)
+                            paymentScreenPayee = result.cardOwner ?: cardOwner.ifEmpty { posOperator }
+                            paymentScreenTxHash = result.usdcTx ?: result.chargeTxHash.orEmpty()
+                            paymentScreenSubtotal = result.subtotal ?: "%.2f".format(subtotalAmount)
+                            paymentScreenTip = result.tip ?: paymentScreenTip
+                            paymentScreenCardCurrency = result.currency ?: currency
+                            paymentScreenPayerAddress = result.payer
+                            paymentScreenRoutingSteps = emptyList()
+                            paymentScreenStatus = PaymentStatus.Success
+                            paymentScreenError = ""
+                            paymentViaQr = true
+                            chargeUsdcQrGenerating = false
+                            chargeUsdcSessionProgressLabel = ""
+                            chargeUsdcSessionId = ""
+                            scheduleCardStatsRefetchUntilChanged(expectChargeChange = true, expectTopUpChange = false)
+                            scheduleElasticHomeDataPullAfterTxSuccess()
+                        }
+                        return
+                    }
+                    "error" -> {
+                        runOnUiThread {
+                            if (chargeUsdcSessionId != sid) return@runOnUiThread
+                            paymentScreenStatus = PaymentStatus.Error
+                            paymentScreenError = result.error ?: "USDC payment failed. Please ask the customer to retry."
+                            chargeUsdcQrGenerating = false
+                            chargeUsdcDeepLinkUrl = ""
+                            chargeUsdcSessionProgressLabel = ""
+                            chargeUsdcSessionId = ""
+                        }
+                        return
+                    }
+                    "awaiting_topup_auth" -> submitChargeUsdcTopupAuthIfNeeded(sid, result)
+                    else -> runOnUiThread {
+                        if (chargeUsdcSessionId == sid) {
+                            chargeUsdcSessionProgressLabel = when (result.state) {
+                                "verifying" -> "Verifying payment…"
+                                "settling" -> "Settling USDC…"
+                                "topup_pending" -> "Crediting merchant card…"
+                                "topup_confirmed", "charge_pending" -> "Recording charge…"
+                                else -> ""
+                            }
+                        }
+                    }
+                }
+                Thread.sleep(1500)
+            }
+        } catch (_: InterruptedException) {
+            return
+        }
+    }
+
+    private fun submitChargeUsdcTopupAuthIfNeeded(sid: String, result: UsdcChargeSessionResult) {
+        synchronized(chargeUsdcTopupAuthSubmittedSids) {
+            if (chargeUsdcTopupAuthSubmittedSids.contains(sid) || chargeUsdcTopupAuthInflightSids.contains(sid)) return
+            chargeUsdcTopupAuthInflightSids.add(sid)
+        }
+        val cardAddr = result.pendingTopupCardAddr
+        val data = result.pendingTopupData
+        val deadline = result.pendingTopupDeadline
+        val nonce = result.pendingTopupNonce
+        if (cardAddr.isNullOrBlank() || data.isNullOrBlank() || deadline == null || nonce.isNullOrBlank()) {
+            synchronized(chargeUsdcTopupAuthSubmittedSids) { chargeUsdcTopupAuthInflightSids.remove(sid) }
+            return
+        }
+        val signature = try {
+            BeamioWeb3Wallet.signExecuteForAdmin(cardAddr, data, deadline, nonce)
+        } catch (e: Exception) {
+            synchronized(chargeUsdcTopupAuthSubmittedSids) { chargeUsdcTopupAuthInflightSids.remove(sid) }
+            runOnUiThread {
+                if (chargeUsdcSessionId == sid) {
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = "Failed to sign top-up authorization: ${e.message ?: "wallet error"}"
+                    chargeUsdcQrGenerating = false
+                    chargeUsdcDeepLinkUrl = ""
+                    chargeUsdcSessionProgressLabel = ""
+                    chargeUsdcSessionId = ""
+                }
+            }
+            return
+        }
+        val submitted = submitUsdcChargeTopupAuthSync(sid, signature)
+        synchronized(chargeUsdcTopupAuthSubmittedSids) {
+            chargeUsdcTopupAuthInflightSids.remove(sid)
+            if (submitted?.first == true) chargeUsdcTopupAuthSubmittedSids.add(sid)
+        }
+        if (submitted != null && !submitted.first) {
+            runOnUiThread {
+                if (chargeUsdcSessionId == sid) {
+                    paymentScreenStatus = PaymentStatus.Error
+                    paymentScreenError = submitted.second ?: "Server rejected top-up authorization."
+                    chargeUsdcQrGenerating = false
+                    chargeUsdcDeepLinkUrl = ""
+                    chargeUsdcSessionProgressLabel = ""
+                    chargeUsdcSessionId = ""
+                }
+            }
         }
     }
 
@@ -5635,11 +7210,10 @@ class MainActivity : ComponentActivity() {
         return "${PREF_KEY_PREFIX_REGISTERED_BEAMIO_TAG}$w"
     }
 
-    /** Onboarding `addUser` 成功后的 handle（小写无 @）；search-users 尚无 username 时首页标题用此对齐 iOS `terminalProfile`。 */
+    /** Onboarding `addUser` 成功后的 handle（与链上/注册一致，不强制小写）；search-users 尚无 username 时首页标题对齐 iOS `terminalProfile`。 */
     private fun persistRegisteredTerminalBeamioTag(wallet: String, accountNameFromOnboarding: String) {
         try {
-            var t = accountNameFromOnboarding.trim().lowercase(Locale.US)
-            while (t.startsWith("@")) t = t.removePrefix("@").trim()
+            val t = BeamioTagRules.normalizeInput(accountNameFromOnboarding)
             if (t.isEmpty()) return
             val w = wallet.trim()
             if (w.isEmpty()) return
@@ -5656,8 +7230,7 @@ class MainActivity : ComponentActivity() {
             getSharedPreferences(PREFS_PROFILE_CACHE, Context.MODE_PRIVATE)
                 .getString(prefsKeyRegisteredBeamioTag(w), null)
                 ?.trim()
-                ?.lowercase(Locale.US)
-                ?.let { s -> var x = s; while (x.startsWith("@")) x = x.removePrefix("@").trim(); x }
+                ?.let { s -> BeamioTagRules.normalizeInput(s) }
                 ?.takeIf { it.isNotEmpty() }
         } catch (_: Exception) {
             null
@@ -5690,11 +7263,12 @@ class MainActivity : ComponentActivity() {
     private fun prefsKeyPendingParentWorkspaceTag(walletLower: String) =
         "pending_parent_workspace_tag:$walletLower"
 
+    /** 与 iOS `POSViewModel.normalizeParentBeamioTag`：只规范化空白与 `@`，不改变大小写。 */
     private fun normalizeParentWorkspaceTag(raw: String): String {
         var s = raw.trim()
         while (s.startsWith("@")) s = s.removePrefix("@").trim()
         s = s.replace("@", "")
-        return s.trim().lowercase(Locale.US)
+        return s.trim()
     }
 
     private fun loadLastTrustedInfraPosHomeAccess(walletLower: String): Boolean? {
@@ -5865,10 +7439,8 @@ class MainActivity : ComponentActivity() {
 
     private fun terminalChildBeamioTagForCoNet(wallet0x: String): String {
         val raw = terminalProfile?.accountName?.trim().orEmpty()
-        var x = raw
-        while (x.startsWith("@")) x = x.removePrefix("@").trim()
-        x = x.replace("@", "")
-        if (x.isNotEmpty()) return x.lowercase(Locale.US)
+        val fromProfile = if (raw.isNotEmpty()) BeamioTagRules.normalizeInput(raw) else ""
+        if (fromProfile.isNotEmpty()) return fromProfile
         return loadRegisteredTerminalBeamioTag(wallet0x).orEmpty()
     }
 
@@ -5983,6 +7555,16 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Home dashboard **Total Due / Top-Ups / Tip** from `/api/posLedger`: **current settlement window only**
+     * (`itemsInTerminalStatsPeriod` after last clear), aligned with POSTransactionsScreen / iOS [POSViewModel.refreshHomeProfiles].
+     */
+    private fun applyHomeDashboardFromPosLedger(snapshot: PosLedgerSnapshot) {
+        cardChargeAmount = posLedgerChargeAndTipGrossDisplayTotalInTerminalStatsPeriod(snapshot)
+        cardTopUpAmount = posLedgerTopUpDisplayTotalInTerminalStatsPeriod(snapshot)
+        cardTipsAmount = posLedgerTipsDisplayTotalInTerminalStatsPeriod(snapshot)
+    }
+
+    /**
      * 与 iOS [POSViewModel.refreshHomeProfiles] 同序：先 reconcile program 卡准入，再仅 `upperAdmin` → search-users 解析右侧胶囊（无 owner 回退）。
      */
     private fun runHomeDashboardBackgroundRefreshSync(wallet: String) {
@@ -6023,8 +7605,27 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            // Ledger local-first → Home KPIs reflect last Settlement clear even before HTTP returns.
+            val infraTrim = infra.trim()
+            if (looksLikeEthereumAddress(infraTrim)) {
+                val cachedLedger = loadPosLedgerCache(wTrim, infraTrim)
+                if (cachedLedger != null) {
+                    runOnUiThread {
+                        posLedgerSnapshot = cachedLedger
+                        posLedgerSnapshotKey = posLedgerCacheKey(wTrim, infraTrim)
+                        applyHomeDashboardFromPosLedger(cachedLedger)
+                    }
+                }
+            }
+
             val rootForAdmin = if (detail?.allowed == true) {
                 detail.httpRoot ?: fetchGetCardAdminInfoJsonSync(wTrim)
+            } else {
+                null
+            }
+            // iOS `refreshHomeProfiles`: B-Unit 读 **upperAdmin，否则 owner**（付费方/上游），不是 POS 终端 EOA。
+            val rootForBUnit = rootForAdmin ?: if (looksLikeEthereumAddress(infra.trim()) && looksLikeEthereumAddress(wTrim)) {
+                fetchGetCardAdminInfoJsonSync(wTrim)
             } else {
                 null
             }
@@ -6037,6 +7638,19 @@ class MainActivity : ComponentActivity() {
 
             val assets = fetchWalletAssetsSync(wTrim, forPostPayment = false, merchantInfraOnly = false)
             val (charge, topUp) = fetchCardStatsSync(wTrim)
+            val infraForLedger = infraCardAddress().trim()
+            val ledgerSnap =
+                if (looksLikeEthereumAddress(infraForLedger)) fetchPosLedgerSync(wTrim, infraForLedger) else null
+            val upperForBUnit = rootForBUnit?.optString("upperAdmin")
+                ?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim().orEmpty()
+            val ownerForBUnit = rootForBUnit?.optString("owner")
+                ?.takeIf { it.isNotEmpty() && !it.equals("null", true) }?.trim().orEmpty()
+            val upstreamBUnitEoa = when {
+                upperForBUnit.isNotEmpty() && looksLikeEthereumAddress(upperForBUnit) -> upperForBUnit
+                ownerForBUnit.isNotEmpty() && looksLikeEthereumAddress(ownerForBUnit) -> ownerForBUnit
+                else -> null
+            }
+            val bUnitBalance = upstreamBUnitEoa?.let { fetchHomeBUnitBalanceSync(it) }
             val programName = if (assets != null && assets.ok) {
                 merchantProgramMetadataDisplayNameFromAssets(assets, infra)
             } else null
@@ -6051,8 +7665,23 @@ class MainActivity : ComponentActivity() {
                 terminalProfile = mergeTerminalProfileWithRegisteredTag(wTrim, profile)
                 terminalAdminProfile = adminProfile
                 saveProfileCache(wTrim, profile, adminProfile)
-                if (charge != null) cardChargeAmount = charge
-                if (topUp != null) cardTopUpAmount = topUp
+                if (ledgerSnap != null) {
+                    posLedgerSnapshot = ledgerSnap
+                    posLedgerSnapshotKey = posLedgerCacheKey(wTrim, infraForLedger)
+                    savePosLedgerCache(wTrim, infraForLedger, ledgerSnap)
+                    applyHomeDashboardFromPosLedger(ledgerSnap)
+                } else {
+                    if (charge != null) cardChargeAmount = charge
+                    if (topUp != null) cardTopUpAmount = topUp
+                }
+                // Match iOS: no upstream EOA ⇒ show "—" (loaded=true, balance=null); RPC/API fail ⇒ keep prior value (do not flip loaded alone).
+                if (upstreamBUnitEoa == null) {
+                    homeUpstreamBUnitBalance = null
+                    homeUpstreamBUnitLoaded = true
+                } else if (bUnitBalance != null) {
+                    homeUpstreamBUnitBalance = bUnitBalance
+                    homeUpstreamBUnitLoaded = true
+                }
                 if (assets != null && assets.ok) {
                     hasAAAccount = !assets.aaAddress.isNullOrEmpty()
                     dashboardMerchantProgramCardName = programName
@@ -6599,6 +8228,31 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    /** Home B-Units：仅可信 HTTP 2xx + 可解析 total 时更新；失败保留上次可信值。 */
+    private fun fetchHomeBUnitBalanceSync(wallet: String): Double? {
+        val w = wallet.trim()
+        if (!looksLikeEthereumAddress(w)) return null
+        return try {
+            val encoded = java.net.URLEncoder.encode(w, "UTF-8")
+            val url = java.net.URL("$BEAMIO_API/api/getBUnitBalance?address=$encoded")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.requestMethod = "GET"
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.use { it.bufferedReader().readText() }
+                ?: "{}"
+            conn.disconnect()
+            if (code !in 200..299) return null
+            val root = org.json.JSONObject(body)
+            val total = root.optDouble("total", Double.NaN)
+            if (total.isFinite()) total else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     private fun applyCardStatsFetchForVerify(charge: Double?, topUp: Double?) {
         val rpcFail = charge == null && topUp == null
         if (rpcFail) {
@@ -6641,11 +8295,20 @@ class MainActivity : ComponentActivity() {
                     iter++
                     val wallet = BeamioWeb3Wallet.getAddress()?.takeIf { it.isNotEmpty() } ?: break
                     val pair = fetchCardStatsSync(wallet)
+                    val infraV = infraCardAddress().trim()
+                    val ledgerV =
+                        if (looksLikeEthereumAddress(infraV)) fetchPosLedgerSync(wallet, infraV) else null
                     val latch = CountDownLatch(1)
                     val continueLoop = booleanArrayOf(false)
                     runOnUiThread {
                         try {
                             applyCardStatsFetchForVerify(pair.first, pair.second)
+                            if (ledgerV != null) {
+                                posLedgerSnapshot = ledgerV
+                                posLedgerSnapshotKey = posLedgerCacheKey(wallet, infraV)
+                                savePosLedgerCache(wallet, infraV, ledgerV)
+                                applyHomeDashboardFromPosLedger(ledgerV)
+                            }
                             continueLoop[0] = pendingVerifyChargeStats || pendingVerifyTopUpStats
                         } finally {
                             latch.countDown()
@@ -10969,6 +12632,7 @@ private fun HomeDashboardBonusDiscountSection(
     val formattedDiscount = homeDashboardFormatDiscountSummaryForDisplay(infraRoutingDiscountSummary)
     val showDiscount =
         homeDashboardShowsTierDiscountRow(infraRoutingDiscountSummary) && formattedDiscount != null
+    val discountText = if (showDiscount) formattedDiscount else null
     if (!showDiscount && rechargeBonusRules.isEmpty()) return
     Column(
         modifier = modifier
@@ -10976,13 +12640,13 @@ private fun HomeDashboardBonusDiscountSection(
             .padding(top = 10.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        if (rechargeBonusRules.isEmpty() && showDiscount && formattedDiscount != null) {
+        if (rechargeBonusRules.isEmpty() && discountText != null) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                HomeDashboardDiscountLeadingInline(displaySummary = formattedDiscount, brandBlue = brandBlue)
+                HomeDashboardDiscountLeadingInline(displaySummary = discountText, brandBlue = brandBlue)
                 Spacer(Modifier.weight(1f))
             }
         } else {
@@ -10992,8 +12656,8 @@ private fun HomeDashboardBonusDiscountSection(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (idx == 0 && showDiscount && formattedDiscount != null) {
-                        HomeDashboardDiscountLeadingInline(displaySummary = formattedDiscount, brandBlue = brandBlue)
+                    if (idx == 0 && discountText != null) {
+                        HomeDashboardDiscountLeadingInline(displaySummary = discountText, brandBlue = brandBlue)
                     }
                     Spacer(Modifier.weight(1f))
                     HomeDashboardSingleBonusLine(rule = r, brandBlue = brandBlue)
@@ -11165,6 +12829,1244 @@ internal fun AwaitingParentWorkspacePermissionScreen(
     }
 }
 
+private fun posLedgerMergedDisplayItems(rawItems: List<PosLedgerItem>): List<PosLedgerDisplayItem> {
+    val visible = rawItems.filter { !posLedgerMergedDisplayHiddenCategories().contains(it.txCategory.trim().lowercase(Locale.US)) }
+    val tips = visible.filter { it.type == "tip" }
+    val absorbedTipIds = mutableSetOf<String>()
+    val out = mutableListOf<PosLedgerDisplayItem>()
+    visible.filter { it.type != "tip" }.forEach { tx ->
+        val matchedTips = if (tx.type == "charge") {
+            tips.filter { tip -> posLedgerTipRowMatchesChargeParent(tip, tx) }
+        } else {
+            emptyList()
+        }
+        matchedTips.forEach { absorbedTipIds.add(it.id.lowercase(Locale.US)) }
+        out.add(
+            PosLedgerDisplayItem(
+                tx = tx,
+                tips = matchedTips,
+                embeddedTip = if (tx.type == "charge" && matchedTips.isEmpty()) posLedgerEmbeddedTip(tx) else null,
+            )
+        )
+    }
+    tips.filter { !absorbedTipIds.contains(it.id.lowercase(Locale.US)) }
+        .forEach { out.add(PosLedgerDisplayItem(tx = it, tips = emptyList(), embeddedTip = null)) }
+    return out.sortedWith(compareByDescending<PosLedgerDisplayItem> { it.tx.timestamp }.thenByDescending { it.tx.id })
+}
+
+private fun posLedgerTipRowMatchesChargeParent(tip: PosLedgerItem, charge: PosLedgerItem): Boolean {
+    val tipKeys = posLedgerTipParentLinkKeys(tip)
+    if (tipKeys.isEmpty()) return false
+    val chargeKeys = posLedgerChargeParentKeys(charge)
+    return tipKeys.any { chargeKeys.contains(it) }
+}
+
+private fun posLedgerChargeParentKeys(tx: PosLedgerItem): Set<String> {
+    val out = mutableSetOf<String>()
+    posLedgerAddNormalized(tx.id, out)
+    posLedgerAddNormalized(tx.originalPaymentHash, out)
+    posLedgerDisplayJsonHashes(tx.displayJson, listOf("finishedHash", "baseRelayTxHash", "requestHash", "originalPaymentHash"))
+        .forEach { posLedgerAddNormalized(it, out) }
+    return out
+}
+
+private fun posLedgerTipParentLinkKeys(tx: PosLedgerItem): Set<String> {
+    val out = mutableSetOf<String>()
+    posLedgerAddNormalized(tx.originalPaymentHash, out)
+    posLedgerDisplayJsonHashes(tx.displayJson, listOf("finishedHash", "originalPaymentHash", "baseRelayTxHash"))
+        .forEach { posLedgerAddNormalized(it, out) }
+    return out
+}
+
+private fun posLedgerAddNormalized(raw: String?, out: MutableSet<String>) {
+    val n = posLedgerNormalizeBytes32Hex(raw) ?: return
+    out.add(n)
+}
+
+private fun posLedgerNormalizeBytes32Hex(raw: String?): String? {
+    var s = raw?.trim().orEmpty()
+    if (s.isEmpty()) return null
+    if (!s.startsWith("0x", ignoreCase = true) && Regex("^[0-9a-fA-F]{64}$").matches(s)) {
+        s = "0x$s"
+    }
+    if (!Regex("^0x[0-9a-fA-F]{64}$").matches(s)) return null
+    val lower = s.lowercase(Locale.US)
+    return if (lower == "0x" + "0".repeat(64)) null else lower
+}
+
+private fun posLedgerDisplayJsonHashes(displayJson: String, keys: List<String>): List<String> {
+    return try {
+        val obj = org.json.JSONObject(displayJson)
+        keys.mapNotNull { obj.optString(it).trim().takeIf { s -> s.isNotEmpty() } }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun posLedgerEmbeddedTip(tx: PosLedgerItem): PosLedgerTipAmount? {
+    return try {
+        val obj = org.json.JSONObject(tx.displayJson)
+        val breakdown = obj.optJSONObject("chargeBreakdown") ?: return null
+        val rawTip = breakdown.optString("tipCurrencyAmount")
+            .replace(",", "")
+            .trim()
+        val tip = rawTip.toDoubleOrNull() ?: return null
+        if (tip <= 0.0) return null
+        val ccy = breakdown.optString("requestCurrency", "CAD")
+            .trim()
+            .uppercase(Locale.US)
+            .ifBlank { "CAD" }
+        PosLedgerTipAmount(tip, ccy)
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun posLedgerCurrencyCodeForCurrencyFiat(id: Int): String = when (id) {
+    1 -> "USD"
+    2 -> "JPY"
+    3 -> "CNY"
+    4 -> "USDC"
+    5 -> "HKD"
+    6 -> "EUR"
+    7 -> "SGD"
+    8 -> "TWD"
+    else -> "CAD"
+}
+
+private fun posLedgerPreferredDisplayAmount(tx: PosLedgerItem): PosLedgerTipAmount {
+    val fiat6 = tx.amountFiat6.toDoubleOrNull() ?: 0.0
+    val usdc6 = tx.amountUSDC6.toDoubleOrNull() ?: 0.0
+    return if (fiat6 > 0.0) {
+        PosLedgerTipAmount(fiat6 / 1_000_000.0, posLedgerCurrencyCodeForCurrencyFiat(tx.currencyFiat))
+    } else {
+        PosLedgerTipAmount(usdc6 / 1_000_000.0, "USDC")
+    }
+}
+
+private fun posLedgerTipTotalsByCurrency(item: PosLedgerDisplayItem): Map<String, Double> {
+    val totals = linkedMapOf<String, Double>()
+    item.tips.forEach { tip ->
+        val amt = posLedgerPreferredDisplayAmount(tip)
+        totals[amt.currencyCode] = (totals[amt.currencyCode] ?: 0.0) + amt.value
+    }
+    item.embeddedTip?.let { tip ->
+        totals[tip.currencyCode] = (totals[tip.currencyCode] ?: 0.0) + tip.value
+    }
+    return totals
+}
+
+private fun posLedgerTipsDisplayTotalFromWindow(visibleWindow: List<PosLedgerItem>): Double {
+    val charges = visibleWindow.filter { it.type == "charge" }
+    val tips = visibleWindow.filter { it.type == "tip" }
+    val absorbedTipIds = mutableSetOf<String>()
+    var total = 0.0
+    for (charge in charges) {
+        val matched = tips.filter { tip -> posLedgerTipRowMatchesChargeParent(tip, charge) }
+        if (matched.isEmpty()) {
+            posLedgerEmbeddedTip(charge)?.let { total += it.value }
+        } else {
+            for (tip in matched) {
+                absorbedTipIds.add(tip.id.lowercase(Locale.US))
+                total += posLedgerPreferredDisplayAmount(tip).value
+            }
+        }
+    }
+    for (tip in tips) {
+        if (!absorbedTipIds.contains(tip.id.lowercase(Locale.US))) {
+            total += posLedgerPreferredDisplayAmount(tip).value
+        }
+    }
+    return total
+}
+
+private fun posLedgerTipsDisplayTotalInTerminalStatsPeriod(snapshot: PosLedgerSnapshot): Double {
+    val period = snapshot.itemsInTerminalStatsPeriod()
+    val visible = period.filter { !posLedgerIsHiddenInternalCategory(it.txCategory) }
+    return posLedgerTipsDisplayTotalFromWindow(visible)
+}
+
+/** Same gross as transaction row `amountLine` for Charges (base + tips in base currency) plus standalone tip rows — iOS `chargeAndTipGrossDisplayTotalInTerminalStatsPeriod`. */
+private fun posLedgerGrossChargeRowDisplayTotal(charge: PosLedgerItem, matchedTips: List<PosLedgerItem>): Double {
+    val base = posLedgerPreferredDisplayAmount(charge)
+    val tipByCurrency = linkedMapOf<String, Double>()
+    for (t in matchedTips) {
+        val a = posLedgerPreferredDisplayAmount(t)
+        tipByCurrency[a.currencyCode] = (tipByCurrency[a.currencyCode] ?: 0.0) + a.value
+    }
+    if (matchedTips.isEmpty()) {
+        posLedgerEmbeddedTip(charge)?.let { emb ->
+            tipByCurrency[emb.currencyCode] = (tipByCurrency[emb.currencyCode] ?: 0.0) + emb.value
+        }
+    }
+    return base.value + (tipByCurrency[base.currencyCode] ?: 0.0)
+}
+
+private fun posLedgerChargeAndTipGrossDisplayTotalInTerminalStatsPeriod(snapshot: PosLedgerSnapshot): Double {
+    val period = snapshot.itemsInTerminalStatsPeriod()
+    val visible = period.filter { !posLedgerIsHiddenInternalCategory(it.txCategory) }
+    val charges = visible.filter { it.type == "charge" }
+    val tips = visible.filter { it.type == "tip" }
+    val absorbedTipIds = mutableSetOf<String>()
+    var gross = 0.0
+    for (charge in charges) {
+        val matched = tips.filter { tip -> posLedgerTipRowMatchesChargeParent(tip, charge) }
+        matched.forEach { absorbedTipIds.add(it.id.lowercase(Locale.US)) }
+        gross += posLedgerGrossChargeRowDisplayTotal(charge, matched)
+    }
+    for (tip in tips) {
+        if (!absorbedTipIds.contains(tip.id.lowercase(Locale.US))) {
+            gross += posLedgerPreferredDisplayAmount(tip).value
+        }
+    }
+    return gross
+}
+
+private fun posLedgerTopUpDisplayTotalInTerminalStatsPeriod(snapshot: PosLedgerSnapshot): Double {
+    var sum = 0.0
+    for (tx in snapshot.itemsInTerminalStatsPeriod()) {
+        if (tx.type != "topUp") continue
+        if (posLedgerIsHiddenInternalCategory(tx.txCategory)) continue
+        sum += posLedgerPreferredDisplayAmount(tx).value
+    }
+    return sum
+}
+
+/** 与 x402sdk `posLedgerPaymentMethodLabel` 同语义 bucketing（Top-Up Overview）。 */
+private enum class PosTopUpOverviewBucket { Cash, Card, Usdc }
+
+private fun posLedgerTopUpLegFromDisplayJson(displayJson: String): String =
+    try {
+        org.json.JSONObject(displayJson).optString("topupPaymentLeg").trim().lowercase(Locale.US)
+    } catch (_: Exception) {
+        ""
+    }
+
+private fun posLedgerTopUpOverviewBucket(tx: PosLedgerItem): PosTopUpOverviewBucket {
+    if (tx.type != "topUp") return PosTopUpOverviewBucket.Card
+    val label = tx.paymentMethodLabel?.trim()?.lowercase(Locale.US).orEmpty()
+    when (label) {
+        "cash" -> return PosTopUpOverviewBucket.Cash
+        "usdc" -> return PosTopUpOverviewBucket.Usdc
+        "card", "bonus" -> return PosTopUpOverviewBucket.Card
+    }
+    if (label.isNotEmpty()) return PosTopUpOverviewBucket.Card
+
+    when (posLedgerTopUpLegFromDisplayJson(tx.displayJson)) {
+        "cash" -> return PosTopUpOverviewBucket.Cash
+        "credit", "bonus" -> return PosTopUpOverviewBucket.Card
+    }
+    val fiat6 = tx.amountFiat6.toDoubleOrNull() ?: 0.0
+    val usdc6 = tx.amountUSDC6.toDoubleOrNull() ?: 0.0
+    if (fiat6 <= 0.0 && usdc6 > 0.0) return PosTopUpOverviewBucket.Usdc
+    return PosTopUpOverviewBucket.Card
+}
+
+private data class PosTopUpOverviewBreakdown(
+    val cashTotal: Double,
+    val cardTotal: Double,
+    val usdcTotal: Double,
+    val cashCount: Int,
+    val cardCount: Int,
+    val usdcCount: Int,
+)
+
+private fun posTopUpOverviewBreakdownFromSnapshot(snapshot: PosLedgerSnapshot?): PosTopUpOverviewBreakdown {
+    if (snapshot == null) {
+        return PosTopUpOverviewBreakdown(
+            cashTotal = 150.0,
+            cardTotal = 200.0,
+            usdcTotal = 100.0,
+            cashCount = 8,
+            cardCount = 12,
+            usdcCount = 4,
+        )
+    }
+    var cash = 0.0
+    var card = 0.0
+    var usdc = 0.0
+    var cashC = 0
+    var cardC = 0
+    var usdcC = 0
+    for (tx in snapshot.itemsInTerminalStatsPeriod()) {
+        if (tx.type != "topUp") continue
+        if (posLedgerIsHiddenInternalCategory(tx.txCategory)) continue
+        val amt = posLedgerPreferredDisplayAmount(tx).value
+        when (posLedgerTopUpOverviewBucket(tx)) {
+            PosTopUpOverviewBucket.Cash -> {
+                cash += amt
+                cashC++
+            }
+            PosTopUpOverviewBucket.Card -> {
+                card += amt
+                cardC++
+            }
+            PosTopUpOverviewBucket.Usdc -> {
+                usdc += amt
+                usdcC++
+            }
+        }
+    }
+    return PosTopUpOverviewBreakdown(cash, card, usdc, cashC, cardC, usdcC)
+}
+
+private fun posTopUpOverviewTotal(b: PosTopUpOverviewBreakdown): Double =
+    b.cashTotal + b.cardTotal + b.usdcTotal
+
+private fun posTopUpOverviewTotalTxnCount(b: PosTopUpOverviewBreakdown): Int =
+    b.cashCount + b.cardCount + b.usdcCount
+
+private fun posLedgerIsHiddenInternalCategory(txCategory: String): Boolean =
+    posLedgerMergedDisplayHiddenCategories().contains(txCategory.trim().lowercase(Locale.US))
+
+/** Shared hidden service-fee ledger categories (`posLedgerMergedDisplayItems`). */
+private fun posLedgerMergedDisplayHiddenCategories(): Set<String> = setOf(
+    "0x02d119b2041653c3b6f7aef339e2560da8ba867b022a04aaa150d062e5212bb7",
+    "0x7067fa2b19fb81129d35576ad5fe635356a1405044d1c080a5ab341df6445776",
+)
+
+/** Transactions list subtitle: payer @tag or short address, plus payment method for top-up/charge. */
+private fun posLedgerHistorySubtitle(item: PosLedgerDisplayItem): String {
+    val tx = item.tx
+    if (tx.type == "tip") {
+        tx.note?.takeIf { it.isNotBlank() }?.let { return it }
+        val payer = tx.payer.trim()
+        if (payer.isEmpty() || payer.equals("0x0000000000000000000000000000000000000000", ignoreCase = true)) {
+            return "Member"
+        }
+        return posLedgerShortAddress(payer)
+    }
+    val method = tx.paymentMethodLabel?.trim()?.takeIf { it.isNotEmpty() }.orEmpty()
+    val tag = tx.payerBeamioTag?.trim()?.takeIf { it.isNotEmpty() }
+    val who =
+        if (tag != null) {
+            "@$tag"
+        } else {
+            val payer = tx.payer.trim()
+            if (payer.isEmpty() || payer.equals("0x0000000000000000000000000000000000000000", ignoreCase = true)) {
+                if (tx.type == "topUp") "Wallet" else "Customer"
+            } else {
+                posLedgerShortAddress(payer)
+            }
+        }
+    return if (method.isNotEmpty()) "$who · $method" else who
+}
+
+private fun posLedgerMoneyText(value: Double, currency: String): String {
+    val (prefix, amt, suffix) = formatBalanceWithCurrencyProtocol(value, currency)
+    return if (prefix.isNotEmpty()) "$prefix$amt$suffix" else "$amt$suffix"
+}
+
+private fun posLedgerShortAddress(raw: String): String {
+    val t = raw.trim()
+    return if (t.length >= 10) "${t.take(6)}…${t.takeLast(4)}" else t
+}
+
+private fun posLedgerTimeLine(timestamp: Long): String {
+    if (timestamp <= 0L) return "—"
+    val now = System.currentTimeMillis() / 1000L
+    val diff = (now - timestamp).coerceAtLeast(0L)
+    return when {
+        diff < 3600L -> "${diff / 60L}m ago"
+        diff < 86_400L -> "${diff / 3600L}h ago"
+        diff < 172_800L -> "Yesterday"
+        else -> java.text.SimpleDateFormat("MMM d, HH:mm", Locale.US).format(java.util.Date(timestamp * 1000L))
+    }
+}
+
+private fun posSalesOverviewFmtMoney(n: Double): String =
+    String.format(Locale.US, "%.2f", n)
+
+private fun posSalesOverviewFormatEpochSeconds(epochSeconds: Long): String {
+    val dFmt = java.text.SimpleDateFormat("MMM. d, yyyy", Locale.US)
+    val tFmt = java.text.SimpleDateFormat("h:mm a", Locale.US)
+    val d = java.util.Date(epochSeconds * 1000L)
+    return "${dFmt.format(d)} ${tFmt.format(d).lowercase(Locale.US)}"
+}
+
+/** Design mock only — used when `snapshot == null` (placeholder KPIs). */
+private fun posSalesOverviewDemoPeriodLine(): String {
+    val cal = java.util.Calendar.getInstance()
+    cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+    cal.set(java.util.Calendar.MINUTE, 0)
+    cal.set(java.util.Calendar.SECOND, 0)
+    cal.set(java.util.Calendar.MILLISECOND, 0)
+    val start = cal.time
+    cal.set(java.util.Calendar.HOUR_OF_DAY, 23)
+    cal.set(java.util.Calendar.MINUTE, 59)
+    cal.set(java.util.Calendar.SECOND, 59)
+    cal.set(java.util.Calendar.MILLISECOND, 999)
+    val end = cal.time
+    val dFmt = java.text.SimpleDateFormat("MMM. d, yyyy", Locale.US)
+    val tFmt = java.text.SimpleDateFormat("h:mm a", Locale.US)
+    val d0 = dFmt.format(start)
+    val d1 = dFmt.format(end)
+    val t0 = tFmt.format(start).lowercase(Locale.US)
+    val t1 = tFmt.format(end).lowercase(Locale.US)
+    return "$d0 $t0 — $d1 $t1"
+}
+
+/**
+ * Sales Overview header line: **latest Settlement (`lastTerminalReset`) → current time**.
+ * Stats use the same window via [PosLedgerSnapshot.itemsInTerminalStatsPeriod] (`timestamp > settlement`).
+ *
+ * If no settlement marker yet, start = oldest tx in that window (same items the totals sum); if empty, shows end time only.
+ */
+private fun posSalesOverviewSelectedPeriodLine(snapshot: PosLedgerSnapshot?, nowMs: Long): String {
+    if (snapshot == null) return posSalesOverviewDemoPeriodLine()
+    val nowSec = nowMs / 1000L
+    val endPart = posSalesOverviewFormatEpochSeconds(nowSec)
+    val resetSec = snapshot.lastTerminalReset?.timestamp
+    val periodItems = snapshot.itemsInTerminalStatsPeriod()
+    val startSec = resetSec ?: periodItems.minOfOrNull { it.timestamp }
+    if (startSec == null) return "— $endPart"
+    val startPart = posSalesOverviewFormatEpochSeconds(startSec)
+    return "$startPart — $endPart"
+}
+
+/** Indexer `currencyFiat` — USDC settlement lane（对齐 iOS `isExplicitUsdcAccountingCurrency`） */
+private fun posLedgerIsExplicitUsdcAccountingCurrency(tx: PosLedgerItem): Boolean =
+    tx.currencyFiat == 4
+
+private fun posLedgerChargeUsdcSettlementTotalInTerminalStatsPeriod(snapshot: PosLedgerSnapshot): Double {
+    var sum = 0.0
+    for (tx in snapshot.itemsInTerminalStatsPeriod()) {
+        if (tx.type != "charge") continue
+        if (posLedgerIsHiddenInternalCategory(tx.txCategory)) continue
+        if (!posLedgerIsExplicitUsdcAccountingCurrency(tx)) continue
+        sum += (tx.amountUSDC6.toDoubleOrNull() ?: 0.0) / 1_000_000.0
+    }
+    return sum
+}
+
+/** Charge 行本位金额（不含单独 tip 行）；用于 Sales Overview Gross。 */
+private fun posLedgerChargeBaseTotalForSalesOverview(snapshot: PosLedgerSnapshot): Double {
+    val period = snapshot.itemsInTerminalStatsPeriod().filter { !posLedgerIsHiddenInternalCategory(it.txCategory) }
+    val merged = posLedgerMergedDisplayItems(period)
+    var sum = 0.0
+    for (item in merged) {
+        if (item.tx.type != "charge") continue
+        sum += posLedgerPreferredDisplayAmount(item.tx).value
+    }
+    return sum
+}
+
+private fun posLedgerChargeCountForSalesOverview(snapshot: PosLedgerSnapshot): Int {
+    val period = snapshot.itemsInTerminalStatsPeriod().filter { !posLedgerIsHiddenInternalCategory(it.txCategory) }
+    return posLedgerMergedDisplayItems(period).count { it.tx.type == "charge" }
+}
+
+private data class PosSalesOverviewNumbers(
+    val grossSales: Double,
+    val refunds: Double,
+    val refundCount: Int,
+    val netSales: Double,
+    val usdcSubtotal: Double,
+    val taxesAndFees: Double,
+    val tips: Double,
+    val amountCollected: Double,
+    val transactionCount: Int,
+)
+
+/**
+ * `snapshot == null`：与 iOS / Web mock 相同占位展示。
+ * 否则：**最近一次 Settlement 之后**（与 [PosLedgerSnapshot.itemsInTerminalStatsPeriod] 一致）聚合记账（退款 / 税待 indexer）。
+ */
+private fun posSalesOverviewNumbersFromSnapshot(snapshot: PosLedgerSnapshot?): PosSalesOverviewNumbers {
+    if (snapshot == null) {
+        val gross = 352.48
+        val refunds = 20.99
+        val tips = 47.24
+        return PosSalesOverviewNumbers(
+            grossSales = gross,
+            refunds = refunds,
+            refundCount = 1,
+            netSales = (gross - refunds).coerceAtLeast(0.0),
+            usdcSubtotal = 120.0,
+            taxesAndFees = 0.0,
+            tips = tips,
+            amountCollected = 378.73,
+            transactionCount = 24,
+        )
+    }
+    val gross = posLedgerChargeBaseTotalForSalesOverview(snapshot)
+    val tips = posLedgerTipsDisplayTotalInTerminalStatsPeriod(snapshot)
+    val refunds = 0.0
+    val refundCount = 0
+    val net = (gross - refunds).coerceAtLeast(0.0)
+    val usdcSub = posLedgerChargeUsdcSettlementTotalInTerminalStatsPeriod(snapshot)
+    val taxes = 0.0
+    val txCount = posLedgerChargeCountForSalesOverview(snapshot)
+    val collected = net + tips
+    return PosSalesOverviewNumbers(
+        grossSales = gross,
+        refunds = refunds,
+        refundCount = refundCount,
+        netSales = net,
+        usdcSubtotal = usdcSub,
+        taxesAndFees = taxes,
+        tips = tips,
+        amountCollected = collected,
+        transactionCount = txCount,
+    )
+}
+
+@Composable
+private fun PosSalesOverviewScreen(
+    snapshot: PosLedgerSnapshot?,
+    terminalProfile: TerminalProfile?,
+    adminProfile: TerminalProfile?,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val haptic = LocalHapticFeedback.current
+    val numbers = remember(snapshot) { posSalesOverviewNumbersFromSnapshot(snapshot) }
+    val avgTicket = if (numbers.transactionCount > 0) numbers.amountCollected / numbers.transactionCount.toDouble() else 0.0
+    val brandBlue = Color(0xFF1562F0)
+    val surfaceBg = Color(0xFFF5F6F8)
+    val headerBg = Color.White.copy(alpha = 0.97f)
+    val profileUrl = adminProfile?.image?.trim()?.takeIf { it.isNotEmpty() }
+        ?: terminalProfile?.image?.trim()?.takeIf { it.isNotEmpty() }
+    val profileLetter =
+        (adminProfile?.accountName ?: terminalProfile?.accountName)?.trim()?.firstOrNull()?.uppercaseChar() ?: '?'
+    val periodNowMs = remember(snapshot) { System.currentTimeMillis() }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(surfaceBg)
+            .windowInsetsPadding(WindowInsets.statusBars)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(headerBg)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Surface(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clickable {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onClose()
+                    },
+                shape = CircleShape,
+                color = Color(0xFFE8EEFC),
+                border = BorderStroke(1.dp, brandBlue.copy(alpha = 0.15f))
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = brandBlue, modifier = Modifier.size(20.dp))
+                }
+            }
+            Text(
+                "Sales Overview",
+                modifier = Modifier.weight(1f),
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF0F2747),
+                textAlign = TextAlign.Center,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clickable { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
+                    shape = CircleShape,
+                    color = Color(0xFFE5E5EA),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.Filled.CalendarMonth, contentDescription = "Settlement window", tint = Color(0xFF636366), modifier = Modifier.size(22.dp))
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .border(2.dp, Color.White, CircleShape)
+                        .shadow(4.dp, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (!profileUrl.isNullOrEmpty()) {
+                        AsyncImage(
+                            model = profileUrl,
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(
+                                    Brush.linearGradient(
+                                        colors = listOf(brandBlue, Color(0xFF7C3AED)),
+                                        start = Offset.Zero,
+                                        end = Offset.Infinite,
+                                    )
+                                ),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(profileLetter.toString(), color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalDivider(color = Color(0xFFE5E5EA), thickness = 0.5.dp)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+                .padding(top = 16.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "SELECTED PERIOD",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 1.2.sp,
+                    color = Color(0xFF8E8E93),
+                )
+                Text(
+                    posSalesOverviewSelectedPeriodLine(snapshot, periodNowMs),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF3C3C43),
+                    lineHeight = 18.sp,
+                )
+            }
+
+            val cardShape = RoundedCornerShape(22.dp)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(Color(0xFFEEF3FB), Color(0xFFE4EAF5)),
+                        )
+                    )
+                    .border(1.dp, brandBlue.copy(alpha = 0.1f), cardShape)
+                    .shadow(8.dp, cardShape, ambientColor = Color(0xFF0F2747).copy(alpha = 0.08f))
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(0.dp),
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                    Text("Gross Sales", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF3C3C43))
+                    Text("$${posSalesOverviewFmtMoney(numbers.grossSales)}", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.Black)
+                }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(top = 14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Refunds", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF3C3C43))
+                        Box(
+                            modifier = Modifier
+                                .height(20.dp)
+                                .widthIn(min = 20.dp)
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(Color(0x669E9E9E))
+                                .padding(horizontal = 6.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                numbers.refundCount.toString(),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF636366),
+                            )
+                        }
+                    }
+                    Text(
+                        "(${'$'}${posSalesOverviewFmtMoney(numbers.refunds)})",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFE11D48),
+                    )
+                }
+                HorizontalDivider(Modifier.padding(vertical = 16.dp), color = Color(0x99C4C4C4), thickness = 1.dp)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Bottom) {
+                    Text("Net Sales", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2C2C2E))
+                    Text("$${posSalesOverviewFmtMoney(numbers.netSales)}", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = brandBlue)
+                }
+                HorizontalDivider(Modifier.padding(vertical = 16.dp), color = Color(0x99C4C4C4), thickness = 1.dp)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("USDC Subtotal", fontSize = 14.sp, color = Color(0xFF636366))
+                        Text("$${posSalesOverviewFmtMoney(numbers.usdcSubtotal)}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF2C2C2E))
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Taxes & Fees", fontSize = 14.sp, color = Color(0xFF636366))
+                        Text("$${posSalesOverviewFmtMoney(numbers.taxesAndFees)}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF2C2C2E))
+                    }
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Tips", fontSize = 14.sp, color = Color(0xFF636366))
+                        Text("$${posSalesOverviewFmtMoney(numbers.tips)}", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF2C2C2E))
+                    }
+                }
+                Button(
+                    onClick = { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 18.dp)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(999.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = brandBlue),
+                    elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp),
+                ) {
+                    Text(
+                        "AMOUNT COLLECTED: ${'$'}${posSalesOverviewFmtMoney(numbers.amountCollected)}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = 0.3.sp,
+                        color = Color.White,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Icon(Icons.Filled.AutoAwesome, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                }
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.White)
+                        .border(1.dp, Color(0xFFC9C9CC).copy(alpha = 0.5f), RoundedCornerShape(20.dp))
+                        .shadow(2.dp, RoundedCornerShape(20.dp))
+                        .padding(16.dp),
+                ) {
+                    Text("TRANSACTIONS", fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = Color(0xFF8E8E93))
+                    Row(
+                        modifier = Modifier.padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(numbers.transactionCount.toString(), fontSize = 26.sp, fontWeight = FontWeight.ExtraBold, color = Color.Black)
+                        Icon(Icons.Filled.Receipt, contentDescription = null, tint = brandBlue, modifier = Modifier.size(22.dp))
+                    }
+                }
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color.White)
+                        .border(1.dp, Color(0xFFC9C9CC).copy(alpha = 0.5f), RoundedCornerShape(20.dp))
+                        .shadow(2.dp, RoundedCornerShape(20.dp))
+                        .padding(16.dp),
+                ) {
+                    Text("AVERAGE TICKET", fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, color = Color(0xFF8E8E93))
+                    Text(
+                        "$${posSalesOverviewFmtMoney(avgTicket)}",
+                        modifier = Modifier.padding(top = 8.dp),
+                        fontSize = 26.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = Color.Black,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PosTopUpOverviewBreakdownRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    amount: Double,
+    txnCount: Int,
+    brandBlue: Color,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color.White)
+            .border(1.dp, Color(0xFFE8ECF0), RoundedCornerShape(18.dp))
+            .shadow(2.dp, RoundedCornerShape(18.dp))
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Surface(
+            modifier = Modifier.size(44.dp),
+            shape = CircleShape,
+            color = Color(0xFFE8EEFC),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(icon, contentDescription = null, tint = brandBlue, modifier = Modifier.size(24.dp))
+            }
+        }
+        Column(Modifier.weight(1f)) {
+            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = brandBlue)
+            Text(subtitle, fontSize = 12.sp, color = Color(0xFF8E8E93), modifier = Modifier.padding(top = 2.dp))
+        }
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                "$${posSalesOverviewFmtMoney(amount)}",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = brandBlue,
+            )
+            Text(
+                "$txnCount TXNS",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = brandBlue,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun PosTopUpOverviewScreen(
+    snapshot: PosLedgerSnapshot?,
+    @Suppress("UNUSED_PARAMETER") terminalProfile: TerminalProfile?,
+    @Suppress("UNUSED_PARAMETER") adminProfile: TerminalProfile?,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val haptic = LocalHapticFeedback.current
+    val breakdown = remember(snapshot) { posTopUpOverviewBreakdownFromSnapshot(snapshot) }
+    val total = remember(breakdown) { posTopUpOverviewTotal(breakdown) }
+    val totalTopUpTxns = remember(breakdown) { posTopUpOverviewTotalTxnCount(breakdown) }
+    val periodNowMs = remember(snapshot) { System.currentTimeMillis() }
+    val brandBlue = Color(0xFF1562F0)
+    val surfaceBg = Color(0xFFF5F6F8)
+    val headerBg = Color.White.copy(alpha = 0.97f)
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(surfaceBg)
+            .windowInsetsPadding(WindowInsets.statusBars)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(headerBg),
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Surface(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onClose()
+                        },
+                    shape = CircleShape,
+                    color = Color(0xFFE8EEFC),
+                    border = BorderStroke(1.dp, brandBlue.copy(alpha = 0.15f)),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = brandBlue, modifier = Modifier.size(20.dp))
+                    }
+                }
+                Text(
+                    "Top-Up Overview",
+                    modifier = Modifier.weight(1f),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF0F2747),
+                    textAlign = TextAlign.Center,
+                )
+                Surface(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clickable { haptic.performHapticFeedback(HapticFeedbackType.LongPress) },
+                    shape = CircleShape,
+                    color = Color(0xFFF2F2F7),
+                    border = BorderStroke(0.5.dp, Color(0xFFC9C9CC).copy(alpha = 0.6f)),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(Icons.Filled.MoreVert, contentDescription = "More options", tint = Color(0xFF636366), modifier = Modifier.size(22.dp))
+                    }
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    "SELECTED PERIOD",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    letterSpacing = 1.2.sp,
+                    color = Color(0xFF8E8E93),
+                )
+                Text(
+                    posSalesOverviewSelectedPeriodLine(snapshot, periodNowMs),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    color = Color(0xFF3C3C43),
+                    lineHeight = 18.sp,
+                )
+            }
+        }
+        HorizontalDivider(color = Color(0xFFE5E5EA), thickness = 0.5.dp)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+                .padding(top = 16.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            val heroShape = RoundedCornerShape(22.dp)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(200.dp)
+                    .clip(heroShape)
+                    .background(
+                        Brush.linearGradient(
+                            colors = listOf(Color(0xFF5B94FA), Color(0xFF1562F0), Color(0xFF0E4BBF)),
+                            start = Offset.Zero,
+                            end = Offset.Infinite,
+                        ),
+                    )
+                    .shadow(10.dp, heroShape),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 20.dp, vertical = 18.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "TOTAL TOP-UPS",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.4.sp,
+                            color = Color.White.copy(alpha = 0.92f),
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(999.dp),
+                            color = Color(0x66000000),
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF5AE58D)),
+                                )
+                                Text(
+                                    "LIVE",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.8.sp,
+                                    color = Color.White.copy(alpha = 0.95f),
+                                )
+                            }
+                        }
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.Bottom,
+                            horizontalArrangement = Arrangement.Start,
+                        ) {
+                            Text(
+                                "$",
+                                fontSize = 28.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White.copy(alpha = 0.95f),
+                                modifier = Modifier.padding(end = 6.dp, bottom = 4.dp),
+                            )
+                            Text(
+                                posSalesOverviewFmtMoney(total),
+                                fontSize = 38.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color.White,
+                            )
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(
+                            Icons.Filled.Receipt,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.95f),
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Text(
+                            "$totalTopUpTxns Transactions processed",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color.White.copy(alpha = 0.92f),
+                        )
+                    }
+                }
+            }
+
+            Text(
+                "Payment Breakdown",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF3C3C43),
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                PosTopUpOverviewBreakdownRow(
+                    icon = Icons.Filled.Payments,
+                    title = "Cash Top-Ups",
+                    subtitle = "Retail locations",
+                    amount = breakdown.cashTotal,
+                    txnCount = breakdown.cashCount,
+                    brandBlue = brandBlue,
+                )
+                PosTopUpOverviewBreakdownRow(
+                    icon = Icons.Filled.CreditCard,
+                    title = "Card Top-Ups",
+                    subtitle = "Debit & Credit",
+                    amount = breakdown.cardTotal,
+                    txnCount = breakdown.cardCount,
+                    brandBlue = brandBlue,
+                )
+                PosTopUpOverviewBreakdownRow(
+                    icon = Icons.Filled.SwapHoriz,
+                    title = "USDC Top-Ups",
+                    subtitle = "Web3 Wallet",
+                    amount = breakdown.usdcTotal,
+                    txnCount = breakdown.usdcCount,
+                    brandBlue = brandBlue,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun POSTransactionsScreen(
+    snapshot: PosLedgerSnapshot?,
+    loading: Boolean,
+    refreshing: Boolean,
+    error: String?,
+    onClose: () -> Unit,
+    onSalesOverviewClick: () -> Unit,
+    onTopUpOverviewClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val haptic = LocalHapticFeedback.current
+    val items = remember(snapshot) {
+        val rows = snapshot?.itemsInTerminalStatsPeriod().orEmpty()
+        posLedgerMergedDisplayItems(rows)
+    }
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFFF2F2F7))
+            .windowInsetsPadding(WindowInsets.statusBars)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Surface(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clickable(onClick = onClose),
+                shape = CircleShape,
+                color = Color.White,
+                border = BorderStroke(0.5.dp, Color.Black.copy(alpha = 0.06f))
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Color.Black, modifier = Modifier.size(18.dp))
+                }
+            }
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Transactions", fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+                Text("Top-Ups & charges since last clear", fontSize = 11.sp, color = Color(0xFF8E8E93))
+            }
+            if (loading || refreshing) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color(0xFF1562F0))
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedButton(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onSalesOverviewClick()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp),
+                shape = RoundedCornerShape(999.dp),
+                border = BorderStroke(1.dp, Color(0xFF1562F0)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1562F0)),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+            ) {
+                Icon(Icons.Filled.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Sales Overview", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            }
+            OutlinedButton(
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    onTopUpOverviewClick()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp),
+                shape = RoundedCornerShape(999.dp),
+                border = BorderStroke(1.dp, Color(0xFF1562F0)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF1562F0)),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+            ) {
+                Icon(Icons.Filled.Payments, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Top-Up Overview", fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        Crossfade(targetState = items.isEmpty(), label = "transactions-body", modifier = Modifier.weight(1f)) { isEmpty ->
+            if (isEmpty) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(Icons.Filled.Layers, contentDescription = null, modifier = Modifier.size(40.dp), tint = Color(0xFFB8B8BE))
+                        Text("No transactions since last clear", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFF6E6E73), textAlign = TextAlign.Center)
+                        if (!error.isNullOrBlank()) {
+                            Text(error, fontSize = 11.sp, color = Color(0xFFD97706), textAlign = TextAlign.Center, modifier = Modifier.padding(top = 4.dp))
+                        }
+                    }
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 16.dp)
+                        .padding(top = 4.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items.forEach { item ->
+                        POSTransactionRowView(item)
+                    }
+                    if (!error.isNullOrBlank()) {
+                        Text(error, fontSize = 11.sp, color = Color(0xFFD97706), modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun POSTransactionRowView(item: PosLedgerDisplayItem) {
+    val tx = item.tx
+    val tint = when (tx.type) {
+        "topUp" -> Color(0xFF34C759)
+        "tip" -> Color(0xFFF43F5E)
+        else -> Color(0xFF1562F0)
+    }
+    val icon = when (tx.type) {
+        "topUp" -> Icons.Filled.ArrowUpward
+        "tip" -> Icons.Filled.Favorite
+        else -> Icons.Filled.ArrowDownward
+    }
+    val title = when (tx.type) {
+        "topUp" -> "Top-Up"
+        "tip" -> "Tip"
+        else -> "Charge"
+    }
+    val base = posLedgerPreferredDisplayAmount(tx)
+    val tipTotals = posLedgerTipTotalsByCurrency(item)
+    val total = base.value + (tipTotals[base.currencyCode] ?: 0.0)
+    val sign = if (tx.type == "topUp") "+" else "−"
+    val amountLine = sign + posLedgerMoneyText(total, base.currencyCode)
+    val secondary = posLedgerHistorySubtitle(item)
+    val tipLine = if (tx.type == "charge") {
+        val preferredTip = tipTotals[base.currencyCode] ?: tipTotals.values.firstOrNull() ?: 0.0
+        val tipCurrency = if (tipTotals.containsKey(base.currencyCode)) base.currencyCode else tipTotals.keys.firstOrNull().orEmpty()
+        if (preferredTip > 0.000001 && tipCurrency.isNotBlank()) "incl. ${posLedgerMoneyText(preferredTip, tipCurrency)} tip" else null
+    } else null
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.White)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(tint.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, modifier = Modifier.size(18.dp), tint = tint)
+        }
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
+            Text(secondary, fontSize = 11.sp, color = Color(0xFF8E8E93), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(amountLine, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = if (tx.type == "topUp") Color(0xFF34C759) else Color.Black)
+            if (tipLine != null) {
+                Text(tipLine, fontSize = 10.sp, fontStyle = FontStyle.Italic, color = Color(0xFF8E8E93))
+            }
+            Text(posLedgerTimeLine(tx.timestamp), fontSize = 10.sp, color = Color(0xFF8E8E93))
+        }
+    }
+}
+
 @Composable
 fun NdefScreen(
     uidText: String,
@@ -11175,6 +14077,9 @@ fun NdefScreen(
     adminProfile: TerminalProfile? = null,
     chargeAmount: Double? = null,
     topUpAmount: Double? = null,
+    tipAmount: Double? = null,
+    bUnitBalance: Double? = null,
+    bUnitLoaded: Boolean = false,
     chargeStatsRpcWarning: Boolean = false,
     topUpStatsRpcWarning: Boolean = false,
     /** Program / infrastructure BeamioUserCard metadata `name` (`cards[].cardName`) for home black card */
@@ -11187,6 +14092,7 @@ fun NdefScreen(
     onReadClick: () -> Unit,
     onTopupClick: () -> Unit,
     onPaymentClick: () -> Unit,
+    onHistoryClick: (() -> Unit)? = null,
     onCopyUrlClick: () -> Unit,
     contentAboveCharge: (@Composable () -> Unit)? = null,
     modifier: Modifier = Modifier
@@ -11194,345 +14100,586 @@ fun NdefScreen(
     LaunchedEffect(walletAddress) {
         Log.d("Home", "[Home Debug] charge panel ID address (walletAddress)=${walletAddress ?: "null"}")
     }
-    Column(
+    val haptic = LocalHapticFeedback.current
+    val context = LocalContext.current
+    val titleLine = homeHeaderTitleLine(terminalProfile, walletAddress)
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.statusBars),
-        verticalArrangement = Arrangement.spacedBy(0.dp)
+            .background(Color.White)
+            .windowInsetsPadding(WindowInsets.statusBars)
     ) {
-        // Header: B icon + beamio tag (left) | admin BeamioCapsule (right)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp)
-                .padding(top = 16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Image(
-                        painter = painterResource(R.drawable.ic_launcher_adaptive),
-                        contentDescription = "App icon",
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .clip(CircleShape),
-                        contentScale = ContentScale.Crop
-                    )
-                }
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    var accountForTag = sanitizeProfileNamePart(terminalProfile?.accountName)
-                    while (accountForTag.startsWith("@")) accountForTag = accountForTag.removePrefix("@").trim()
-                    val titleLine = accountForTag.takeIf { it.isNotEmpty() }?.let { "@$it" }
-                        ?: walletAddress?.let { if (it.length >= 10) "${it.take(6)}…${it.takeLast(4)}" else it }
-                        ?: "Terminal"
-                    Text(titleLine, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                }
-            }
-            // Right: admin BeamioCapsule（与 iOS 一致：有可展示身份时才显示；fallbackAddress 不传）
-            if (adminProfile != null && homeAdminCapsuleHasPresentableIdentity(adminProfile)) {
-                BeamioCapsuleCompact(
-                    profile = adminProfile,
-                    fallbackAddress = null,
-                    modifier = Modifier
-                )
-            }
-        }
-
-        // Content area (weight fills remaining height, compact)
+        val tight = maxHeight < 680.dp
+        val compact = maxHeight < 760.dp
+        val outerPadding = if (tight) 14.dp else 20.dp
+        val sectionGap = if (tight) 12.dp else if (compact) 16.dp else 20.dp
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .padding(horizontal = 16.dp, vertical = 8.dp)
+            modifier = Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
-            // Summary card (Charges | Top-Ups) - compact
-            Card(
+            HomeTopHeader(
+                titleLine = titleLine,
+                adminProfile = adminProfile,
+                tight = tight,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.Black),
-                shape = RoundedCornerShape(16.dp)
+                    .height(if (tight) 54.dp else 64.dp)
+                    .padding(horizontal = outerPadding)
+            )
+            HorizontalDivider(color = Color(0xFFE5E5EA).copy(alpha = 0.55f), thickness = 0.5.dp)
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = outerPadding)
+                    .padding(top = if (tight) 14.dp else 22.dp, bottom = if (tight) 14.dp else 22.dp),
+                verticalArrangement = Arrangement.spacedBy(sectionGap)
             ) {
+                HomeHeroSummary(
+                    chargeAmount = chargeAmount,
+                    tipAmount = tipAmount,
+                    chargeStatsRpcWarning = chargeStatsRpcWarning,
+                    compact = compact,
+                    tight = tight,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(if (tight) 10.dp else 14.dp)
+                ) {
+                    HomeDataCard(
+                        title = "Period Top-Ups",
+                        value = dashboardCurrencyText(topUpAmount),
+                        warning = topUpStatsRpcWarning,
+                        titleTint = Color(0xFF8E8E93),
+                        valueTint = Color.Black,
+                        compact = compact,
+                        tight = tight,
+                        modifier = Modifier.weight(1f)
+                    )
+                    HomeDataCard(
+                        title = "B-Units",
+                        value = if (!bUnitLoaded) "…" else bUnitBalance?.let { formatBUnitBalanceForHome(it) } ?: "—",
+                        warning = false,
+                        titleTint = Color(0xFFD97706),
+                        valueTint = Color.Black,
+                        compact = compact,
+                        tight = tight,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                if (contentAboveCharge != null) {
+                    contentAboveCharge()
+                }
+
+                val actionGap = if (tight) 10.dp else 14.dp
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(12.dp)
+                        .weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(actionGap)
                 ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(bottom = 4.dp)) {
-                                Box(
-                                    modifier = Modifier.size(18.dp).background(Color(0xFF1562f0).copy(alpha = 0.2f), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.Filled.ArrowDownward, null, Modifier.size(10.dp), tint = Color(0xFF1562f0))
-                                }
-                                Text("Charges", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.55f))
-                                Text("Today", fontSize = 9.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1562f0), modifier = Modifier.background(Color(0xFF1562f0).copy(alpha = 0.15f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
-                            }
-                            if (chargeAmount != null) {
-                                Row(verticalAlignment = Alignment.Bottom) {
-                                    val s = "%.2f".format(chargeAmount)
-                                    val dot = s.indexOf('.')
-                                    val numPart = if (dot >= 0) s.substring(0, dot) else s
-                                    val decPart = if (dot >= 0) s.substring(dot) else ""
-                                    Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                    Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.alignByBaseline()
-                                    ) {
-                                        Text(decPart, fontSize = 14.sp, color = Color.White.copy(alpha = 0.55f), modifier = Modifier.alignByBaseline())
-                                        if (chargeStatsRpcWarning) {
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Icon(
-                                                Icons.Filled.Warning,
-                                                contentDescription = "Charge stats sync failed",
-                                                modifier = Modifier.size(14.dp),
-                                                tint = Color(0xFFFFC107)
-                                            )
-                                        }
-                                    }
-                                }
-                            } else {
-                                HomeDashboardStatLoadingPlaceholder(alignEnd = false)
-                            }
+                    HomeChargeHeroButton(
+                        tight = tight,
+                        compact = compact,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1.5f),
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onPaymentClick()
                         }
-                        Box(
-                            modifier = Modifier
-                                .width(1.dp)
-                                .height(88.dp)
-                                .background(Color.White.copy(alpha = 0.1f))
-                        )
-                        Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(bottom = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                Spacer(modifier = Modifier.weight(1f))
-                                Box(
-                                    modifier = Modifier.size(18.dp).background(Color(0xFF34C759).copy(alpha = 0.2f), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(Icons.Filled.ArrowUpward, null, Modifier.size(10.dp), tint = Color(0xFF34C759))
-                                }
-                                Text("Top-Ups", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color.White.copy(alpha = 0.55f))
-                            }
-                            if (topUpAmount != null) {
-                                Row(
-                                    horizontalArrangement = Arrangement.End,
-                                    verticalAlignment = Alignment.Bottom,
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    val s = "%.2f".format(topUpAmount)
-                                    val dot = s.indexOf('.')
-                                    val numPart = if (dot >= 0) s.substring(0, dot) else s
-                                    val decPart = if (dot >= 0) s.substring(dot) else ""
-                                    Text("$", fontSize = 22.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                    Text(numPart, fontSize = 44.sp, fontWeight = FontWeight.SemiBold, color = Color.White, modifier = Modifier.alignByBaseline())
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.alignByBaseline()
-                                    ) {
-                                        Text(decPart, fontSize = 14.sp, color = Color.White.copy(alpha = 0.55f), modifier = Modifier.alignByBaseline())
-                                        if (topUpStatsRpcWarning) {
-                                            Spacer(modifier = Modifier.width(4.dp))
-                                            Icon(
-                                                Icons.Filled.Warning,
-                                                contentDescription = "Top-up stats sync failed",
-                                                modifier = Modifier.size(14.dp),
-                                                tint = Color(0xFFFFC107)
-                                            )
-                                        }
-                                    }
-                                }
+                    )
+
+                    HomeActionArea(
+                        tight = tight,
+                        onReadClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onReadClick()
+                        },
+                        onTopupClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onTopupClick()
+                        },
+                        onHistoryClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            if (onHistoryClick != null) {
+                                onHistoryClick()
                             } else {
-                                HomeDashboardStatLoadingPlaceholder(alignEnd = true)
+                                Toast.makeText(context, "Transactions are not available yet", Toast.LENGTH_SHORT).show()
                             }
-                        }
-                    }
-                    val programLine = merchantProgramCardName?.trim().orEmpty()
-                    if (programLine.isNotEmpty()) {
-                        Text(
-                            text = programLine,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White.copy(alpha = 0.88f),
-                            maxLines = 2,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 10.dp)
-                        )
-                    }
-                    HomeDashboardBonusDiscountSection(
-                        rechargeBonusRules = rechargeBonusRules,
-                        infraRoutingDiscountSummary = infraRoutingDiscountSummary
+                        },
+                        onLinkAppClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onLinkAppClick()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(2f)
+                    )
+                }
+
+                if (readUrlText.isNotBlank() || readParamText.isNotBlank()) {
+                    HomeDebugNdefFooter(
+                        readUrlText = readUrlText,
+                        readParamText = readParamText,
+                        onCopyUrlClick = onCopyUrlClick,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }
+        }
+    }
+}
 
-            if (contentAboveCharge != null) {
-                Box(modifier = Modifier.padding(bottom = 8.dp)) {
-                    contentAboveCharge()
+private fun homeHeaderTitleLine(profile: TerminalProfile?, walletAddress: String?): String {
+    var accountForTag = sanitizeProfileNamePart(profile?.accountName)
+    while (accountForTag.startsWith("@")) accountForTag = accountForTag.removePrefix("@").trim()
+    if (accountForTag.isNotEmpty()) return "@$accountForTag"
+    val wallet = walletAddress?.trim().orEmpty()
+    if (wallet.length >= 10) return "${wallet.take(6)}…${wallet.takeLast(4)}"
+    return wallet.ifEmpty { "Terminal" }
+}
+
+private fun dashboardCurrencyPrefix(currency: String): String {
+    return when (currency.trim().uppercase(Locale.US)) {
+        "CAD" -> "CA$"
+        "USD", "USDC" -> "$"
+        "EUR" -> "€"
+        "JPY" -> "JP¥"
+        "TWD" -> "NT$"
+        "CNY" -> "CN¥"
+        "HKD" -> "HK$"
+        "SGD" -> "SG$"
+        "" -> "$"
+        else -> "${currency.trim().uppercase(Locale.US)} "
+    }
+}
+
+/** Home dashboard money: always two fraction digits (Total Due, Subtotal, Tip, Period Top-Ups). */
+private fun formatDashboardAmountTwoDecimals(value: Double): String =
+    String.format(Locale.US, "%.2f", value.coerceAtLeast(0.0))
+
+private fun formatDashboardTotalDueAmount(value: Double, currency: String = "CAD"): String {
+    val amount = value.coerceAtLeast(0.0)
+    val prefix = dashboardCurrencyPrefix(currency)
+    return when {
+        amount > 10_000_000.0 -> "$prefix ${String.format(Locale.US, "%.2f", amount / 1_000_000.0)}M"
+        amount > 10_000.0 -> "$prefix ${String.format(Locale.US, "%.2f", amount / 1_000.0)}K"
+        else -> "$prefix ${formatDashboardAmountTwoDecimals(amount)}"
+    }
+}
+
+private fun dashboardCurrencyText(value: Double?): String {
+    return value?.let { "$${formatDashboardAmountTwoDecimals(it)}" } ?: "…"
+}
+
+private fun formatBUnitBalanceForHome(value: Double): String {
+    return String.format(Locale.US, "%.2f", value.coerceAtLeast(0.0))
+}
+
+@Composable
+private fun HomeTopHeader(
+    titleLine: String,
+    adminProfile: TerminalProfile?,
+    tight: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.weight(1f)
+        ) {
+            Image(
+                painter = painterResource(R.drawable.ic_launcher_adaptive),
+                contentDescription = "App icon",
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
+            )
+            Text(
+                titleLine,
+                fontSize = if (tight) 15.sp else 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF6E6E73),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (adminProfile != null && homeAdminCapsuleHasPresentableIdentity(adminProfile)) {
+            BeamioCapsuleCompact(
+                profile = adminProfile,
+                fallbackAddress = null,
+                modifier = Modifier.padding(start = 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun HomeHeroSummary(
+    chargeAmount: Double?,
+    tipAmount: Double?,
+    chargeStatsRpcWarning: Boolean,
+    compact: Boolean,
+    tight: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val totalText = chargeAmount?.let { formatDashboardTotalDueAmount(it) } ?: "…"
+    val subtotalText = chargeAmount?.let { formatDashboardTotalDueAmount((it - (tipAmount ?: 0.0)).coerceAtLeast(0.0)) } ?: "…"
+    val tipText = tipAmount?.let { formatDashboardTotalDueAmount(it) } ?: if (chargeAmount == null) "…" else "—"
+    Column(
+        modifier = modifier.padding(vertical = if (tight) 8.dp else 14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(if (tight) 6.dp else 8.dp)
+    ) {
+        Text(
+            "TOTAL DUE",
+            fontSize = if (tight) 11.sp else 13.sp,
+            fontWeight = FontWeight.ExtraBold,
+            letterSpacing = if (tight) 2.sp else 2.8.sp,
+            color = Color(0xFF8E8E93),
+            maxLines = 1
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                totalText,
+                fontSize = if (tight) 44.sp else if (compact) 54.sp else 64.sp,
+                lineHeight = if (tight) 48.sp else if (compact) 58.sp else 68.sp,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = (-2.2).sp,
+                color = Color.Black,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.weight(1f, fill = false)
+            )
+            if (chargeStatsRpcWarning) {
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    Icons.Filled.Warning,
+                    contentDescription = "Charge stats sync failed",
+                    modifier = Modifier.size(if (tight) 18.dp else 20.dp),
+                    tint = Color(0xFFFFC107)
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Subtotal $subtotalText", fontSize = if (tight) 12.sp else 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFF8E8E93), maxLines = 1)
+            Text(" | ", fontSize = if (tight) 12.sp else 14.sp, color = Color(0xFF8E8E93).copy(alpha = 0.55f))
+            Text("Tip $tipText", fontSize = if (tight) 12.sp else 14.sp, fontWeight = FontWeight.Medium, color = Color(0xFF8E8E93), maxLines = 1)
+        }
+    }
+}
+
+@Composable
+private fun HomeDataCard(
+    title: String,
+    value: String,
+    warning: Boolean,
+    titleTint: Color,
+    valueTint: Color,
+    compact: Boolean,
+    tight: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier.height(if (tight) 76.dp else if (compact) 86.dp else 96.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = RoundedCornerShape(24.dp),
+        border = BorderStroke(1.dp, Color(0xFFE5E5EA).copy(alpha = 0.65f)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                title.uppercase(Locale.US),
+                fontSize = if (tight) 9.sp else 10.sp,
+                fontWeight = FontWeight.ExtraBold,
+                letterSpacing = 1.3.sp,
+                color = titleTint,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(if (tight) 5.dp else 7.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center) {
+                Text(
+                    value,
+                    fontSize = if (tight) 19.sp else if (compact) 21.sp else 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = valueTint,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (warning) {
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Filled.Warning, contentDescription = "Stats sync failed", modifier = Modifier.size(14.dp), tint = Color(0xFFFFC107))
                 }
             }
+        }
+    }
+}
 
-            // Link App (same white card + row layout as Charge / Top-Up / Check Balance)
-            Card(
-                onClick = onLinkAppClick,
-                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(16.dp)
+@Composable
+private fun HomeChargeHeroButton(
+    tight: Boolean,
+    compact: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val chargeBlue = Color(0xFF1562F0)
+    val heroShape = RoundedCornerShape(22.dp)
+    Card(
+        onClick = onClick,
+        modifier = modifier
+            .fillMaxHeight()
+            .shadow(
+            elevation = 18.dp,
+            shape = heroShape,
+            ambientColor = chargeBlue.copy(alpha = 0.26f),
+            spotColor = chargeBlue.copy(alpha = 0.26f)
+        ),
+        colors = CardDefaults.cardColors(containerColor = chargeBlue),
+        shape = heroShape,
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(Color.White.copy(alpha = 0.16f), Color.Transparent)
+                    )
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(if (tight) 8.dp else 12.dp),
+                modifier = Modifier.padding(horizontal = if (tight) 14.dp else 18.dp)
             ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .background(Color(0xFF7C3AED).copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Filled.Link, null, Modifier.size(20.dp), tint = Color(0xFF7C3AED))
-                            }
-                            Column {
-                                Text("Link App", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                                Text("Scan customer card to link", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                            }
-                        }
-                        Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
-                    }
-                }
-            }
-
-            // Charge
-            Card(
-                onClick = onPaymentClick,
-                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
+                val chargeTitleSp = ((if (tight) 24f else if (compact) 30f else 36f) * 0.7f).sp
+                Text(
+                    "CHARGE",
+                    fontSize = chargeTitleSp,
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = (-0.6).sp,
+                    color = Color.White,
+                    maxLines = 1
+                )
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Box(
-                            modifier = Modifier.size(40.dp).background(Color(0xFF1562f0).copy(alpha = 0.1f), RoundedCornerShape(10.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Filled.QrCode2, null, Modifier.size(20.dp), tint = Color(0xFF1562f0))
-                        }
-                        Column {
-                            Text("Charge", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Accept NFC or QR code", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                        }
-                    }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
-                }
+                    Icon(
+                        Icons.Filled.Contactless,
+                        contentDescription = null,
+                        modifier = Modifier.size(if (tight) 16.dp else 19.dp),
+                        tint = Color.White.copy(alpha = 0.86f)
+                    )
+                    Text(
+                        "TAP TO PAY OR SCAN",
+                        fontSize = if (tight) 12.sp else 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 1.sp,
+                        color = Color.White.copy(alpha = 0.86f),
+                        maxLines = 1
+                    )
                 }
             }
-            Card(
-                onClick = onTopupClick,
-                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 6.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Box(
-                            modifier = Modifier.size(40.dp).background(Color(0xFF34C759).copy(alpha = 0.1f), CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Filled.Add, null, Modifier.size(20.dp), tint = Color(0xFF34C759))
-                        }
-                        Column {
-                            Text("Top-Up / Mint", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Load balance or new card", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                        }
-                    }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
-                }
-                }
-            }
-            Card(
+        }
+    }
+}
+
+@Composable
+private fun HomeActionArea(
+    tight: Boolean,
+    onReadClick: () -> Unit,
+    onTopupClick: () -> Unit,
+    onHistoryClick: () -> Unit,
+    onLinkAppClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val gap = if (tight) 10.dp else 14.dp
+    Column(
+        modifier = modifier.fillMaxHeight(),
+        verticalArrangement = Arrangement.spacedBy(gap)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(gap)
+        ) {
+            HomeActionGridButton(
+                title = "Check Balance",
+                subtitle = null,
+                icon = Icons.Filled.Search,
+                iconTint = Color(0xFF1562F0),
                 onClick = onReadClick,
-                modifier = Modifier.fillMaxWidth().weight(1f).padding(bottom = 8.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(12.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Box(
-                            modifier = Modifier.size(40.dp).background(Color(0xFFf4f4f5), CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Filled.Search, null, Modifier.size(20.dp), tint = Color.Black)
-                        }
-                        Column {
-                            Text("Check Balance", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.Black)
-                            Text("Read member profile", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = Color(0xFF86868b))
-                        }
-                    }
-                    Icon(Icons.Filled.ChevronRight, null, Modifier.size(18.dp), tint = Color(0xFFc7c7cc))
-                }
-                }
-            }
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+            HomeActionGridButton(
+                title = "Top-up",
+                subtitle = null,
+                icon = Icons.Filled.Add,
+                iconTint = Color(0xFF7C3AED),
+                onClick = onTopupClick,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(gap)
+        ) {
+            HomeActionGridButton(
+                title = "History",
+                subtitle = "Terminal charges & activity",
+                icon = Icons.AutoMirrored.Filled.Subject,
+                iconTint = Color(0xFF1562F0),
+                onClick = onHistoryClick,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+            HomeActionGridButton(
+                title = "Link App",
+                subtitle = "Pair customer Pass app",
+                icon = Icons.Filled.Link,
+                iconTint = Color(0xFF1562F0),
+                onClick = onLinkAppClick,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+            )
+        }
+    }
+}
 
-            if (readUrlText.isNotBlank()) {
-                Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = readUrlText, modifier = Modifier.weight(1f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    IconButton(onClick = onCopyUrlClick, modifier = Modifier.size(32.dp)) { Text("📋", fontSize = 12.sp) }
+@Composable
+private fun HomeActionGridButton(
+    title: String,
+    subtitle: String?,
+    icon: ImageVector,
+    iconTint: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val tileShape = RoundedCornerShape(24.dp)
+    val iosSeparatorStroke = Color(0xFF3C3C43).copy(alpha = 0.16f)
+    Card(
+        onClick = onClick,
+        modifier = modifier
+            .fillMaxHeight()
+            .shadow(
+            elevation = 8.dp,
+            shape = tileShape,
+            ambientColor = Color.Black.copy(alpha = 0.06f),
+            spotColor = Color.Black.copy(alpha = 0.06f)
+        ),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        shape = tileShape,
+        border = BorderStroke(1.dp, iosSeparatorStroke),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 8.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(iconTint.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp),
+                    tint = iconTint
+                )
+            }
+            Spacer(Modifier.height(if (subtitle != null) 8.dp else 12.dp))
+            Text(
+                title,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.Black,
+                textAlign = TextAlign.Center,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (subtitle != null) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    subtitle,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color(0xFF86868B),
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    lineHeight = 13.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HomeDebugNdefFooter(
+    readUrlText: String,
+    readParamText: String,
+    onCopyUrlClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier) {
+        if (readUrlText.isNotBlank()) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = readUrlText, modifier = Modifier.weight(1f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                IconButton(onClick = onCopyUrlClick, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Filled.ContentCopy, contentDescription = "Copy URL", modifier = Modifier.size(14.dp), tint = Color(0xFF64748B))
                 }
             }
-            if (readParamText.isNotBlank()) Text(readParamText, fontSize = 10.sp, color = Color(0xFF64748b), modifier = Modifier.padding(top = 4.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        if (readParamText.isNotBlank()) {
+            Text(readParamText, fontSize = 10.sp, color = Color(0xFF64748B), modifier = Modifier.padding(top = 4.dp), maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -11590,6 +14737,8 @@ internal fun ScanMethodSelectionScreen(
     onScanMethodChange: (String) -> Unit,
     pendingAction: String,
     totalAmount: String,
+    /** Scan-method top-up overlay: card currency for amount prefix (when [pendingAction] is `topup`). */
+    topupCardCurrency: String? = null,
     paymentStatus: PaymentStatus? = null,
     paymentRoutingSteps: List<RoutingStep> = emptyList(),
     paymentError: String = "",
@@ -11636,6 +14785,25 @@ internal fun ScanMethodSelectionScreen(
     linkAppLockedShowCancel: Boolean = false,
     linkAppCancelInProgress: Boolean = false,
     onLinkAppCancelLock: () -> Unit = {},
+    chargeUsdcDeepLinkUrl: String = "",
+    chargeUsdcQrBitmap: Bitmap? = null,
+    chargeUsdcQrGenerating: Boolean = false,
+    chargeUsdcSessionProgressLabel: String = "",
+    onCopyChargeUsdcUrl: () -> Unit = {},
+    /** USDC charge: `nfcCard` | `usdc` — drives payer-method picker. */
+    paymentChargeMethodRaw: String = "nfcCard",
+    usdcChargePayerMode: String? = null,
+    nfcAdapterReady: Boolean = true,
+    onUsdcPickBeamioApp: () -> Unit = {},
+    onUsdcPickBeamioNfc: () -> Unit = {},
+    onUsdcPickOtherWallet: () -> Unit = {},
+    topupUsdcDeepLinkUrl: String = "",
+    topupUsdcQrBitmap: Bitmap? = null,
+    topupUsdcQrGenerating: Boolean = false,
+    topupUsdcSessionProgressLabel: String = "",
+    onCopyTopupUsdcUrl: () -> Unit = {},
+    /** 非空时替换 NFC 等待区底部英文提示（USDC top-up 等待贴卡 mint） */
+    nfcInstructionOverride: String = "",
     modifier: Modifier = Modifier
 ) {
     val showPaymentRouting = pendingAction == "payment" && (
@@ -11649,6 +14817,7 @@ internal fun ScanMethodSelectionScreen(
     /** 贴卡动画/扫码进行中仍可切换 Tap Card ↔ Scan QR */
     val showMethodToggle = !showPaymentSuccess && !showPaymentRouting && !showPaymentError &&
         !topupQrSigningInProgress && !topupNfcExecuteInProgress && topupQrExecuteError.isEmpty() &&
+        !(pendingAction == "topup" && (topupUsdcQrGenerating || topupUsdcDeepLinkUrl.isNotEmpty())) &&
         !(pendingAction == "payment" && paymentQrParseError.isNotEmpty()) &&
         !(pendingAction == "payment" && paymentQrInterpreting)
     val effectiveShowMethodToggle = showMethodToggle && !hideMethodToggle
@@ -11657,6 +14826,7 @@ internal fun ScanMethodSelectionScreen(
     val scanMethodTopBarLoading = showPaymentRouting ||
         (pendingAction == "payment" && paymentQrInterpreting) ||
         (pendingAction == "topup" && (topupQrSigningInProgress || topupNfcExecuteInProgress)) ||
+        (pendingAction == "topup" && topupUsdcQrGenerating) ||
         nfcFetchingInfo ||
         (linkAppLockedShowCancel && linkAppCancelInProgress)
 
@@ -11721,7 +14891,7 @@ internal fun ScanMethodSelectionScreen(
                         tierName = paymentTierName,
                         cardType = paymentCardType,
                         passCard = paymentPassCard,
-                        settlementViaQr = scanMethod == "qr",
+                        settlementViaQr = scanMethod == "qr" || chargeUsdcDeepLinkUrl.isNotEmpty(),
                         customerBeamioTag = paymentCustomerBeamioTag,
                         customerWalletAddress = paymentCustomerWalletAddress,
                         chargeTaxPercent = paymentChargeTaxPercent,
@@ -11875,6 +15045,268 @@ internal fun ScanMethodSelectionScreen(
                             }
                         }
                     }
+                } else if (pendingAction == "payment" && paymentChargeMethodRaw == "usdc" && usdcChargePayerMode == null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Card(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onUsdcPickBeamioApp()
+                                },
+                                modifier = Modifier
+                                    .width(scanSize)
+                                    .height(56.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F1FF)),
+                                border = BorderStroke(1.dp, Color(0xFF1562f0).copy(alpha = 0.35f))
+                            ) {
+                                Row(
+                                    Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Image(
+                                        painter = painterResource(R.drawable.ic_launcher_adaptive),
+                                        contentDescription = "App icon",
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(
+                                        "Pay with Beamio APP",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color(0xFF1562f0)
+                                    )
+                                }
+                            }
+                            Card(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onUsdcPickBeamioNfc()
+                                },
+                                enabled = nfcAdapterReady,
+                                modifier = Modifier
+                                    .width(scanSize)
+                                    .height(56.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (nfcAdapterReady) Color(0xFFE6F9F0) else Color(0xFFf0f0f0),
+                                    disabledContainerColor = Color(0xFFf0f0f0)
+                                ),
+                                border = BorderStroke(
+                                    1.dp,
+                                    (if (nfcAdapterReady) Color(0xFF059669) else Color(0xFFcccccc)).copy(alpha = 0.4f)
+                                )
+                            ) {
+                                Row(
+                                    Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Image(
+                                        painter = painterResource(R.drawable.ic_launcher_adaptive),
+                                        contentDescription = "App icon",
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .clip(CircleShape),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(
+                                        "Pay with Beamio NFC",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (nfcAdapterReady) Color(0xFF047857) else Color(0xFF86868b)
+                                    )
+                                }
+                            }
+                            if (!nfcAdapterReady) {
+                                Text(
+                                    "Turn on NFC in system settings to use Beamio NFC.",
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFb45309),
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            Card(
+                                onClick = {
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    onUsdcPickOtherWallet()
+                                },
+                                modifier = Modifier
+                                    .width(scanSize)
+                                    .height(56.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = Color.Transparent,
+                                    contentColor = Color.Black
+                                ),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.12f))
+                            ) {
+                                Row(
+                                    Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    Image(
+                                        painter = painterResource(R.drawable.pay_with_others_icon),
+                                        contentDescription = null,
+                                        modifier = Modifier
+                                            .height(34.dp)
+                                            .widthIn(max = 132.dp),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                    Text(
+                                        "Pay with Others",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.Black
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else if (pendingAction == "payment" && usdcChargePayerMode == "qr" && (chargeUsdcQrGenerating || chargeUsdcDeepLinkUrl.isNotEmpty())) {
+                    var chargeUrlCopied by remember(chargeUsdcDeepLinkUrl) { mutableStateOf(false) }
+                    LaunchedEffect(chargeUrlCopied) {
+                        if (!chargeUrlCopied) return@LaunchedEffect
+                        delay(2000)
+                        chargeUrlCopied = false
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Card(
+                                modifier = Modifier.size(scanSize),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        if (chargeUsdcQrGenerating) "Generating USDC payment QR…" else "USDC payment QR",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.Black,
+                                        textAlign = TextAlign.Center
+                                    )
+                                    Text(
+                                        "Customer scans this QR to pay with USDC.",
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF86868b),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
+                                    )
+                                    if (chargeUsdcQrGenerating && chargeUsdcQrBitmap == null) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier
+                                                .size(96.dp)
+                                                .padding(vertical = 10.dp),
+                                            color = Color(0xFF2775CA),
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        chargeUsdcQrBitmap?.let { bmp ->
+                                            Image(
+                                                bitmap = bmp.asImageBitmap(),
+                                                contentDescription = "USDC charge QR",
+                                                modifier = Modifier
+                                                    .size(198.dp)
+                                                    .padding(vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                    if (chargeUsdcSessionProgressLabel.isNotBlank()) {
+                                        Text(
+                                            chargeUsdcSessionProgressLabel,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF2775CA),
+                                            textAlign = TextAlign.Center,
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            if (chargeUsdcDeepLinkUrl.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .width(scanSize)
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(Color.White, RoundedCornerShape(999.dp))
+                                        .border(1.dp, Color.Black.copy(alpha = 0.12f), RoundedCornerShape(999.dp))
+                                        .clickable {
+                                            onCopyChargeUsdcUrl()
+                                            chargeUrlCopied = true
+                                        }
+                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "USDC URL",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF86868b)
+                                        )
+                                        Text(
+                                            chargeUsdcDeepLinkUrl,
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF2775CA),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                    }
+                                    Crossfade(
+                                        targetState = chargeUrlCopied,
+                                        label = "chargeUsdcUrlCopyIcon"
+                                    ) { copied ->
+                                        Icon(
+                                            imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                                            contentDescription = if (copied) "Copied" else "Copy link",
+                                            tint = if (copied) Color(0xFF22c55e) else Color(0xFF2775CA),
+                                            modifier = Modifier
+                                                .padding(start = 8.dp)
+                                                .size(22.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 } else if (pendingAction == "linkApp" && linkAppDeepLinkUrl.isNotEmpty()) {
                     var linkUrlCopied by remember(linkAppDeepLinkUrl) { mutableStateOf(false) }
                     LaunchedEffect(linkUrlCopied) {
@@ -11977,6 +15409,128 @@ internal fun ScanMethodSelectionScreen(
                                             imageVector = Icons.Filled.ContentCopy,
                                             contentDescription = "Copy link",
                                             tint = Color(0xFF1562f0),
+                                            modifier = Modifier
+                                                .padding(start = 8.dp)
+                                                .size(22.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (pendingAction == "topup" && (topupUsdcQrGenerating || topupUsdcDeepLinkUrl.isNotEmpty())) {
+                    var topupUrlCopied by remember(topupUsdcDeepLinkUrl) { mutableStateOf(false) }
+                    LaunchedEffect(topupUrlCopied) {
+                        if (!topupUrlCopied) return@LaunchedEffect
+                        delay(2000)
+                        topupUrlCopied = false
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .wrapContentHeight()
+                    ) {
+                        Column(
+                            modifier = Modifier.align(Alignment.Center),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Card(
+                                modifier = Modifier.size(scanSize),
+                                shape = RoundedCornerShape(32.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color.White),
+                                border = BorderStroke(2.dp, Color.Black.copy(alpha = 0.1f))
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        if (topupUsdcQrGenerating) "Generating USDC top-up QR…" else "USDC top-up QR",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = Color.Black,
+                                        textAlign = TextAlign.Center
+                                    )
+                                    Text(
+                                        "Customer scans this QR to pay with USDC.",
+                                        fontSize = 11.sp,
+                                        color = Color(0xFF86868b),
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier.padding(top = 4.dp, bottom = 6.dp)
+                                    )
+                                    if (topupUsdcQrGenerating && topupUsdcQrBitmap == null) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier
+                                                .size(96.dp)
+                                                .padding(vertical = 10.dp),
+                                            color = Color(0xFF2775CA),
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        topupUsdcQrBitmap?.let { bmp ->
+                                            Image(
+                                                bitmap = bmp.asImageBitmap(),
+                                                contentDescription = "USDC top-up QR",
+                                                modifier = Modifier
+                                                    .size(198.dp)
+                                                    .padding(vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                    if (topupUsdcSessionProgressLabel.isNotBlank()) {
+                                        Text(
+                                            topupUsdcSessionProgressLabel,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF2775CA),
+                                            textAlign = TextAlign.Center,
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            if (topupUsdcDeepLinkUrl.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .width(scanSize)
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(Color.White, RoundedCornerShape(999.dp))
+                                        .border(1.dp, Color.Black.copy(alpha = 0.12f), RoundedCornerShape(999.dp))
+                                        .clickable {
+                                            onCopyTopupUsdcUrl()
+                                            topupUrlCopied = true
+                                        }
+                                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            "USDC top-up URL",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF86868b)
+                                        )
+                                        Text(
+                                            topupUsdcDeepLinkUrl,
+                                            fontSize = 12.sp,
+                                            color = Color(0xFF2775CA),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                    }
+                                    Crossfade(
+                                        targetState = topupUrlCopied,
+                                        label = "topupUsdcUrlCopyIcon"
+                                    ) { copied ->
+                                        Icon(
+                                            imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                                            contentDescription = if (copied) "Copied" else "Copy link",
+                                            tint = if (copied) Color(0xFF22c55e) else Color(0xFF2775CA),
                                             modifier = Modifier
                                                 .padding(start = 8.dp)
                                                 .size(22.dp)
@@ -12107,7 +15661,9 @@ internal fun ScanMethodSelectionScreen(
                                         tint = Color(0xFF86868b).copy(alpha = 0.1f)
                                     )
                                     Text(
-                                        "Hold the customer's NTAG 424 DNA card near the NFC sensor.",
+                                        nfcInstructionOverride.ifBlank {
+                                            "Hold the customer's NTAG 424 DNA card near the NFC sensor."
+                                        },
                                         fontSize = 12.sp,
                                         color = Color(0xFF86868b),
                                         textAlign = TextAlign.Center,
@@ -12466,6 +16022,13 @@ internal fun ScanMethodSelectionScreen(
                     } else {
                         totalAmount.toDoubleOrNull() ?: 0.0
                     }
+                    val overlayCurrencyCode = when (pendingAction) {
+                        "payment" -> paymentCardCurrency?.trim().orEmpty().ifEmpty { "CAD" }
+                        "topup" -> topupCardCurrency?.trim().orEmpty().ifEmpty { "CAD" }
+                        else -> "CAD"
+                    }
+                    val overlayAmountLine =
+                        "${dashboardCurrencyPrefix(overlayCurrencyCode)}${formatUsdAmountWithGrouping(overlayMoney)}"
                     Text(
                         if (pendingAction == "payment") "Total Amount" else "Top-Up Amount",
                         fontSize = 13.sp,
@@ -12473,7 +16036,7 @@ internal fun ScanMethodSelectionScreen(
                         color = if (pendingAction == "topup") Color(0xFF1562f0) else Color(0xFF86868b)
                     )
                     Text(
-                        "$${formatUsdAmountWithGrouping(overlayMoney)}",
+                        overlayAmountLine,
                         fontSize = 52.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (pendingAction == "topup") Color(0xFF1562f0) else Color.Black,
@@ -12816,6 +16379,26 @@ private fun beamioAmountPadCanContinue(amount: String): Boolean {
     return v > 0.0
 }
 
+/** Amount-well trailing USDC mark：`muted` 时为灰阶略透明（Charge 未选中）；否则完整 PNG。 */
+@Composable
+private fun PosAmountWellUsdcLogo(
+    modifier: Modifier = Modifier,
+    muted: Boolean,
+) {
+    Image(
+        painter = painterResource(R.drawable.usdc_circle_logo),
+        contentDescription = "USDC",
+        modifier = modifier.clip(CircleShape),
+        contentScale = ContentScale.Fit,
+        colorFilter = if (muted) {
+            ColorFilter.colorMatrix(ColorMatrix().apply { setToSaturation(0f) })
+        } else {
+            null
+        },
+        alpha = if (muted) 0.52f else 1f,
+    )
+}
+
 @Composable
 private fun TopupAmountWell(
     amountRaw: String,
@@ -12834,6 +16417,10 @@ private fun TopupAmountWell(
     newBalanceLine: String? = null,
     newBalanceAmountColor: Color = Color(0xFF1562F0),
     onMethodTap: (() -> Unit)? = null,
+    /** Charge: USDC 选项置于金额右侧（与 Top-up 支付方式列同一槽位）；蓝 = 启用，淡灰 = 未启用 */
+    chargeUsdcTrailing: Boolean = false,
+    chargeUsdcActive: Boolean = false,
+    onChargeUsdcTap: (() -> Unit)? = null,
 ) {
     val amountDisplay = remember(amountRaw) { beamioAmountPadFormattedDisplay(amountRaw) }
     val textMeasurer = rememberTextMeasurer()
@@ -12970,43 +16557,87 @@ private fun TopupAmountWell(
             }
         }
         val method = selectedMethod
-        if (method != null && onMethodTap != null) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
-                modifier = Modifier
-                    .widthIn(min = if (compact) 64.dp else 72.dp)
-                    .clip(RoundedCornerShape(12.dp))
-                    .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onMethodTap()
-                    }
-                    .padding(horizontal = 4.dp, vertical = 2.dp)
-            ) {
-                Text(
-                    method.displayTitle(),
-                    fontSize = if (compact) 11.sp else 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = method.accentColor(),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Box(
-                    modifier = Modifier.size(methodIconSize),
-                    contentAlignment = Alignment.Center
+        when {
+            method != null && onMethodTap != null -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
+                    modifier = Modifier
+                        .widthIn(min = if (compact) 64.dp else 72.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onMethodTap()
+                        }
+                        .padding(horizontal = 4.dp, vertical = 2.dp)
                 ) {
+                    Text(
+                        method.displayTitle(),
+                        fontSize = if (compact) 11.sp else 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = method.accentColor(),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                     Box(
-                        modifier = Modifier
-                            .matchParentSize()
-                            .clip(CircleShape)
-                            .background(methodAccentColor.copy(alpha = 0.14f))
+                        modifier = Modifier.size(methodIconSize),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (method == TopupPaymentMethodOption.USDC) {
+                            PosAmountWellUsdcLogo(
+                                modifier = Modifier.fillMaxSize(),
+                                muted = false,
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .matchParentSize()
+                                    .clip(CircleShape)
+                                    .background(methodAccentColor.copy(alpha = 0.14f))
+                            )
+                            Icon(
+                                method.icon(),
+                                contentDescription = method.displayTitle(),
+                                modifier = Modifier.size((methodIconSize.value * 0.46f).dp),
+                                tint = methodAccentColor
+                            )
+                        }
+                    }
+                }
+            }
+            chargeUsdcTrailing && onChargeUsdcTap != null -> {
+                val usdcAccent = Color(0xFF2775CA)
+                val usdcMuted = Color(0xFFB0B4BC)
+                val usdcTint = if (chargeUsdcActive) usdcAccent else usdcMuted
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 8.dp),
+                    modifier = Modifier
+                        .widthIn(min = if (compact) 64.dp else 72.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            onChargeUsdcTap()
+                        }
+                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        "USDC",
+                        fontSize = if (compact) 11.sp else 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = usdcTint,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Icon(
-                        method.icon(),
-                        contentDescription = method.displayTitle(),
-                        modifier = Modifier.size((methodIconSize.value * 0.46f).dp),
-                        tint = methodAccentColor
-                    )
+                    Box(
+                        modifier = Modifier.size(methodIconSize),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        PosAmountWellUsdcLogo(
+                            modifier = Modifier.fillMaxSize(),
+                            muted = !chargeUsdcActive,
+                        )
+                    }
                 }
             }
         }
@@ -13417,14 +17048,21 @@ private fun ChargeAmountPadFullPageContent(
     amount: String,
     onPadClick: (String) -> Unit,
     onBack: () -> Unit,
-    onContinue: () -> Unit,
+    onContinue: (String) -> Unit,
+    chargePolicy: BeamioPosTerminalPolicy = BeamioPosTerminalPolicy.ALL,
+    chargeUsdcEnabled: Boolean = false,
+    onChargeUsdcEnabledChange: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val view = LocalView.current
     val canContinue = beamioAmountPadCanContinue(amount)
-    val continueBtnColor = Color.Black
-    val dollarGrey = Color(0xFF86868b)
-    val amountBlack = Color.Black
+    val usdcAllowed = chargePolicy.allowPayerUsdcInCharge
+    val selectedMethodRaw = if (usdcAllowed && chargeUsdcEnabled) "usdc" else "nfcCard"
+    val primaryBlue = Color(0xFF1562F0)
+    val usdcAccent = Color(0xFF2775CA)
+    val continueBtnColor = primaryBlue
+    val dollarGrey = if (selectedMethodRaw == "usdc") usdcAccent else Color(0xFF86868b)
+    val amountBlack = if (selectedMethodRaw == "usdc") usdcAccent else Color.Black
 
     BoxWithConstraints(
         modifier = modifier
@@ -13461,6 +17099,13 @@ private fun ChargeAmountPadFullPageContent(
                         minAmountFontSize = 11.sp,
                         amountStartInset = amountStartInset,
                         wellBackground = Color(0xFFC7F0E0),
+                        chargeUsdcTrailing = usdcAllowed,
+                        chargeUsdcActive = chargeUsdcEnabled,
+                        onChargeUsdcTap = if (usdcAllowed) {
+                            { onChargeUsdcEnabledChange(!chargeUsdcEnabled) }
+                        } else {
+                            null
+                        },
                     )
                 }
                 BackButtonIcon(
@@ -13490,7 +17135,7 @@ private fun ChargeAmountPadFullPageContent(
             val padV = if (compact) 17.dp else 19.dp
             val padH = 24.dp
             Button(
-                onClick = onContinue,
+                onClick = { onContinue(selectedMethodRaw) },
                 enabled = canContinue,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -13523,10 +17168,13 @@ private fun ChargeAmountScreen(
     amount: String,
     onPadClick: (String) -> Unit,
     onBack: () -> Unit,
-    onContinue: () -> Unit,
+    onContinue: (String) -> Unit,
     /** `methodRaw`: `creditCard` | `cash` | `bonus` | `usdc` —与 iOS 一致 */
     onTopupContinue: (String, Boolean, Int, String) -> Unit = { _, _, _, _ -> },
     topupPolicy: BeamioPosTerminalPolicy = BeamioPosTerminalPolicy.ALL,
+    chargePolicy: BeamioPosTerminalPolicy = BeamioPosTerminalPolicy.ALL,
+    chargeUsdcEnabled: Boolean = false,
+    onChargeUsdcEnabledChange: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     if (mode == "topup") {
@@ -13547,11 +17195,14 @@ private fun ChargeAmountScreen(
         onPadClick = onPadClick,
         onBack = onBack,
         onContinue = onContinue,
+        chargePolicy = chargePolicy,
+        chargeUsdcEnabled = chargeUsdcEnabled,
+        onChargeUsdcEnabledChange = onChargeUsdcEnabledChange,
         modifier = modifier
     )
 }
 
-/** Transaction status — insufficient balance (layout aligned with verra-home home1.html). */
+/** Transaction status — insufficient balance (layout aligned with POS web SPA home1.html). */
 @Composable
 private fun InsufficientBalanceScreen(
     model: InsufficientBalanceUiModel,

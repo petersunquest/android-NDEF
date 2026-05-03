@@ -75,11 +75,14 @@ object BeamioOnboardingApi {
         }
     }
 
-    /** `isAccountNameAvailable(string)` on CONET AccountRegistry; returns null on RPC/parse failure. */
+    /** `isAccountNameAvailable(string)` on CONET AccountRegistry; returns null on RPC/parse failure.
+     * Must use the same bytes as registration: registry hashes `keccak256(bytes(name))` case-sensitively.
+     * Do not lowercase — e.g. `rrr7_POS_0001` taken does not imply `rrr7_pos_0001` taken.
+     */
     fun isBeamioAccountNameAvailableSync(normalizedHandle: String): Boolean? {
-        val h = normalizedHandle.trim().lowercase()
-        if (h.isEmpty()) return false
-        val data = encodeIsAccountNameAvailableCalldata(h) ?: return null
+        val name = BeamioTagRules.normalizeInput(normalizedHandle)
+        if (name.isEmpty() || !BeamioTagRules.ALLOWED_REGEX.matches(name)) return false
+        val data = encodeIsAccountNameAvailableCalldata(name) ?: return null
         return try {
             val reqBody = """{"jsonrpc":"2.0","method":"eth_call","params":[{"to":"$ACCOUNT_REGISTRY","data":"$data"},"latest"],"id":1}"""
             val conn = java.net.URL(CONET_RPC).openConnection() as HttpURLConnection
@@ -137,7 +140,7 @@ object BeamioOnboardingApi {
     fun addUserSync(accountName: String, walletChecksummed: String, signMessage0x: String): String? {
         return try {
             val body = JSONObject().apply {
-                put("accountName", accountName.trim().lowercase())
+                put("accountName", BeamioTagRules.normalizeInput(accountName))
                 put("wallet", walletChecksummed)
                 put("signMessage", signMessage0x)
                 put("recover", JSONArray())

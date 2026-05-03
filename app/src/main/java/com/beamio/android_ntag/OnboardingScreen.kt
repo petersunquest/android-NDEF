@@ -1,5 +1,7 @@
 package com.beamio.android_ntag
 
+import java.util.Locale
+
 import android.app.Activity
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -182,29 +184,41 @@ fun OnboardingScreen(
 
         when (step) {
             1 -> {
-                val trimmedTag = beamioTag.trim().replace(Regex("^@+"), "")
-                val formatValid = trimmedTag.length in 3..20 && trimmedTag.matches(Regex("^[a-zA-Z0-9_.]+\$"))
+                val trimmedTag = BeamioTagRules.normalizeInput(beamioTag)
+                val formatValid = BeamioTagRules.ALLOWED_REGEX.matches(trimmedTag)
                 LaunchedEffect(beamioTag) {
                     if (!formatValid || trimmedTag.length < 3) {
                         tagStatus = "idle"
                         tagError = ""
                         return@LaunchedEffect
                     }
-                    if (tagStatus == "valid" && trimmedTag == lastValidatedTag) return@LaunchedEffect
+                    if (tagStatus == "valid" && trimmedTag.equals(lastValidatedTag, ignoreCase = true)) return@LaunchedEffect
                     delay(3000)
                     tagStatus = "checking"
                     val available = withContext(Dispatchers.IO) {
-                        BeamioWalletService.checkBeamioAccountAvailable(trimmedTag)
+                        BeamioOnboardingApi.isBeamioAccountNameAvailableSync(trimmedTag)
                     }
-                    tagStatus = if (available) "valid" else "invalid"
-                    tagError = if (available) "" else "@$trimmedTag is already taken"
-                    if (available) lastValidatedTag = trimmedTag
+                    when (available) {
+                        true -> {
+                            tagStatus = "valid"
+                            tagError = ""
+                            lastValidatedTag = trimmedTag.lowercase(Locale.US)
+                        }
+                        false -> {
+                            tagStatus = "invalid"
+                            tagError = "@$trimmedTag is already taken"
+                        }
+                        null -> {
+                            tagStatus = "invalid"
+                            tagError = "Network error. Try again."
+                        }
+                    }
                 }
                 OutlinedTextField(
                     value = beamioTag,
                     onValueChange = {
-                        beamioTag = it.trim().replace(Regex("^@+"), "")
-                        tagValid = beamioTag.length in 3..20 && beamioTag.matches(Regex("^[a-zA-Z0-9_.]+\$"))
+                        beamioTag = BeamioTagRules.normalizeInput(it)
+                        tagValid = BeamioTagRules.ALLOWED_REGEX.matches(beamioTag)
                         tagStatus = "idle"
                         tagError = ""
                         lastValidatedTag = ""

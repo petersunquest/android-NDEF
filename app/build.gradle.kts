@@ -23,7 +23,7 @@ android {
         minSdk = 24
         targetSdk = 35
         versionCode = 8
-        versionName = "1.0.3"
+        versionName = "1.0.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Native .so crash/ANR symbolication for Play (symbols extracted into bundle metadata / zip).

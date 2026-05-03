@@ -85,11 +85,7 @@ private val HeroImageUrl =
 
 private val OnboardBrandBlue = Color(0xFF1562F0)
 
-private fun normalizeTagQuery(raw: String): String {
-    var s = raw.trim()
-    while (s.startsWith("@")) s = s.removePrefix("@")
-    return s.trim()
-}
+private fun normalizeTagQuery(raw: String): String = BeamioTagRules.normalizeInput(raw)
 
 /**
  * Align iOS `POSViewModel.assemblePosTerminalBeamioTag`: `{parent}_POS_{nnnn}` within 20 chars
@@ -139,10 +135,9 @@ private suspend fun isBeamioTagNameVerifiedAvailable(candidate: String): Boolean
 internal suspend fun resolveFirstAvailablePosTerminalTag(parentRaw: String): String {
     val parent = normalizeTagQuery(parentRaw)
     if (parent.isEmpty()) return ""
-    val tagRegex = Regex("^[a-zA-Z0-9_.]{3,20}$")
     for (n in 1..9999) {
         val candidate = assemblePosTerminalBeamioTag(parentRaw, n)
-        if (!candidate.matches(tagRegex)) continue
+        if (!candidate.matches(BeamioTagRules.ALLOWED_REGEX)) continue
         when (isBeamioTagNameVerifiedAvailable(candidate)) {
             true -> return candidate
             false -> continue
@@ -180,7 +175,7 @@ private suspend fun welcomeFetchSearchResults(programCardAddress: String, keywor
 }
 
 /**
- * Terminal Setup splash — align iOS `VerraEntrySplashView`: hero, @BeamioTag search, Next Phase.
+ * Terminal Setup splash — align iOS POS entry splash: hero, @BeamioTag search, Next Phase.
  */
 @Composable
 fun WelcomePage(
@@ -685,40 +680,60 @@ fun OnboardingScreen(
     var tagError by remember { mutableStateOf("") }
     var lastCheckedTag by remember { mutableStateOf("") }
     var submitError by remember { mutableStateOf("") }
-    /** Set when [beamioTag] was filled only after on-chain availability was **true**; skips debounced re-check. */
-    var chainVerifiedSuggestTag by remember(parentBeamioTagFromWelcome) { mutableStateOf<String?>(null) }
     var suggestionResolveError by remember(parentBeamioTagFromWelcome) { mutableStateOf("") }
 
     LaunchedEffect(parentBeamioTagFromWelcome) {
-        val p = parentBeamioTagFromWelcome.trim()
+        val stem = parentBeamioTagFromWelcome.trim()
         suggestionResolveError = ""
-        chainVerifiedSuggestTag = null
-        if (p.isEmpty()) {
+        lastCheckedTag = ""
+        if (stem.isEmpty()) {
             beamioTag = ""
             suggestionResolving = false
+            tagStatus = OnboardTagStatus.Idle
             return@LaunchedEffect
         }
         suggestionResolving = true
         tagStatus = OnboardTagStatus.Idle
         tagError = ""
-        val resolved = resolveFirstAvailablePosTerminalTag(p)
+        val resolved = resolveFirstAvailablePosTerminalTag(stem)
         suggestionResolving = false
-        if (resolved.isNotEmpty()) {
-            chainVerifiedSuggestTag = resolved
-            beamioTag = resolved
-        } else {
+        if (resolved.isEmpty()) {
             beamioTag = ""
             tagStatus = OnboardTagStatus.Invalid
             suggestionResolveError =
                 "Could not verify an available terminal handle. Check your connection and try again, or enter a handle manually."
+            return@LaunchedEffect
+        }
+        val confirm = withContext(Dispatchers.IO) {
+            BeamioOnboardingApi.isBeamioAccountNameAvailableSync(resolved)
+        }
+        when (confirm) {
+            true -> {
+                beamioTag = resolved
+                lastCheckedTag = resolved.trim().lowercase(Locale.US)
+                tagStatus = OnboardTagStatus.Valid
+                tagError = ""
+                suggestionResolveError = ""
+            }
+            false -> {
+                beamioTag = ""
+                tagStatus = OnboardTagStatus.Invalid
+                suggestionResolveError = "@$resolved is already taken. Try again or choose a handle manually."
+            }
+            null -> {
+                beamioTag = ""
+                tagStatus = OnboardTagStatus.Invalid
+                suggestionResolveError =
+                    "Could not verify handle on-chain. Check your connection and try again, or enter a handle manually."
+            }
         }
     }
 
     fun localValidateTag(v: String): Pair<Boolean, String> {
         val t = normalizeTagQuery(v)
         if (t.isEmpty()) return false to "Please enter a business handle"
-        if (!t.matches(Regex("^[a-zA-Z0-9_.]{3,20}$"))) {
-            return false to "Use 3–20 letters, numbers, dots, or underscores"
+        if (!t.matches(BeamioTagRules.ALLOWED_REGEX)) {
+            return false to BeamioTagRules.RULE_HINT
         }
         return true to t
     }
@@ -733,18 +748,19 @@ fun OnboardingScreen(
     val confirmMismatch = confirmPassword.isNotEmpty() && password != confirmPassword
 
     LaunchedEffect(beamioTag) {
-        val norm = normalizeTagQuery(beamioTag)
-        val skipDebounce = chainVerifiedSuggestTag != null && norm == chainVerifiedSuggestTag
-        if (skipDebounce) {
-            chainVerifiedSuggestTag = null
-            tagStatus = OnboardTagStatus.Valid
-            tagError = ""
-            lastCheckedTag = norm
+        val canon = normalizeTagQuery(beamioTag)
+        val canonLc = canon.lowercase(Locale.US)
+        if (canon.length > 2 &&
+            canonLc == lastCheckedTag.lowercase(Locale.US) &&
+            tagStatus == OnboardTagStatus.Valid &&
+            tagError.isEmpty() &&
+            suggestionResolveError.isEmpty()
+        ) {
             return@LaunchedEffect
         }
         tagError = ""
-        if (norm.length <= 2) {
-            if (norm.isEmpty()) {
+        if (canonLc.length <= 2) {
+            if (canonLc.isEmpty()) {
                 if (suggestionResolveError.isEmpty()) {
                     tagStatus = OnboardTagStatus.Idle
                 }
@@ -755,23 +771,24 @@ fun OnboardingScreen(
         }
         tagStatus = OnboardTagStatus.Idle
         delay(3000)
-        if (normalizeTagQuery(beamioTag) != norm) return@LaunchedEffect
-        val loc = localValidateTag(norm)
+        val afterWait = normalizeTagQuery(beamioTag)
+        if (afterWait.lowercase(Locale.US) != canonLc) return@LaunchedEffect
+        val loc = localValidateTag(afterWait)
         if (!loc.first) return@LaunchedEffect
         tagStatus = OnboardTagStatus.Checking
         val available = withContext(Dispatchers.IO) {
-            BeamioOnboardingApi.isBeamioAccountNameAvailableSync(norm)
+            BeamioOnboardingApi.isBeamioAccountNameAvailableSync(afterWait)
         }
-        if (normalizeTagQuery(beamioTag) != norm) return@LaunchedEffect
+        if (normalizeTagQuery(beamioTag).lowercase(Locale.US) != canonLc) return@LaunchedEffect
         when (available) {
             false -> {
                 tagStatus = OnboardTagStatus.Invalid
-                tagError = "@$norm is already taken"
+                tagError = "@$afterWait is already taken"
             }
             true -> {
                 tagStatus = OnboardTagStatus.Valid
                 tagError = ""
-                lastCheckedTag = norm
+                lastCheckedTag = afterWait.lowercase(Locale.US)
             }
             null -> {
                 tagStatus = OnboardTagStatus.Invalid
@@ -811,7 +828,7 @@ fun OnboardingScreen(
             Text("Create your business identity", fontSize = 28.sp, fontWeight = FontWeight.Black, color = Color.Black)
             Spacer(modifier = Modifier.height(12.dp))
             Text(
-                "Choose your Verra handle and set the password that protects your business workspace.",
+                "Choose your Beamio handle and set the password that protects your business workspace.",
                 fontSize = 16.sp,
                 color = MktOnSurfaceVariant,
             )
@@ -947,7 +964,7 @@ fun OnboardingScreen(
             TextButton(onClick = {
                 Toast.makeText(
                     ctx,
-                    "Use Verra Business on the web to restore an existing workspace.",
+                    "Use Beamio Business on the web to restore an existing workspace.",
                     Toast.LENGTH_LONG,
                 ).show()
                 onBackToWelcome()
@@ -1056,7 +1073,7 @@ fun OnboardingScreen(
                     CircularProgressIndicator(modifier = Modifier.size(48.dp), color = OnboardBrandBlue)
                     Text("Creating your business workspace…", fontSize = 22.sp, fontWeight = FontWeight.Black, textAlign = TextAlign.Center)
                     Text(
-                        "We're preparing your business identity and getting your Verra workspace ready.",
+                        "We're preparing your business identity and getting your Beamio workspace ready.",
                         fontSize = 15.sp,
                         color = MktOnSurfaceVariant,
                         textAlign = TextAlign.Center,
