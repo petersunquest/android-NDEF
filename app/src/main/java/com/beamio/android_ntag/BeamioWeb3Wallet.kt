@@ -16,7 +16,7 @@ import java.security.SecureRandom
  */
 object BeamioWeb3Wallet {
     /** 必须与 x402sdk chainAddresses.BASE_CARD_FACTORY 一致，否则 EIP-712 digest 不同，服务端 recoverAddress 会得到错误 signer */
-    private const val BASE_CARD_FACTORY = "0x2eb245646de404b2dce87e01c6282c131778bb05"
+    private const val BASE_CARD_FACTORY = "0x52cc9e977ca3ea33c69383a41f87f32a71140a52"
     private const val BASE_CHAIN_ID = 8453L
 
     /** secp256k1 curve order; avoids `Keys.createEcKeyPair()` → JCA `ECDSA` + provider `BC` (broken on many Android builds). */
@@ -40,20 +40,32 @@ object BeamioWeb3Wallet {
         return "0x" + Keys.getAddress(kp)
     }
 
+    /** 缺省仅作向后兼容；须优先使用 `nfcTopupPrepare`/burn-prepare 返回的卡级 `factoryGateway`。 */
+    fun fallbackFactoryForEip712Hex(): String = BASE_CARD_FACTORY
+
+    private fun normalizeHexAddr(addr: String): String {
+        val x = addr.trim().removePrefix("0x").lowercase().ifEmpty { return BASE_CARD_FACTORY }
+        if (x.length != 40 || !x.all { it in '0'..'9' || it in 'a'..'f' }) return BASE_CARD_FACTORY
+        return "0x$x"
+    }
+
     /**
      * 对 ExecuteForAdmin 进行 EIP-712 离线签名。
-     * @param cardAddr 卡地址
-     * @param data executeForAdmin 的 data（hex）
-     * @param deadline 过期时间戳
-     * @param nonce 0x 开头的 hex
-     * @return adminSignature 十六进制签名，格式与 ethers 一致
+     * @param verifyingContract 必须与卡链上 `factoryGateway()` 一致（由 prepare 返回）。
      */
-    fun signExecuteForAdmin(cardAddr: String, data: String, deadline: Long, nonce: String): String {
+    fun signExecuteForAdmin(
+        cardAddr: String,
+        data: String,
+        deadline: Long,
+        nonce: String,
+        verifyingContract: String = BASE_CARD_FACTORY,
+    ): String {
         val kp = keyPair ?: throw IllegalStateException("Wallet not initialized")
         val dataBytes = Numeric.hexStringToByteArray(if (data.startsWith("0x")) data else "0x$data")
         val dataHash = org.web3j.crypto.Hash.sha3(dataBytes)
         val dataHashHex = Numeric.toHexString(dataHash)
         val nonceHex = if (nonce.startsWith("0x")) nonce else "0x$nonce"
+        val vcJson = normalizeHexAddr(verifyingContract)
         val json = """
             {
                 "types": {
@@ -75,7 +87,7 @@ object BeamioWeb3Wallet {
                     "name": "BeamioUserCardFactory",
                     "version": "1",
                     "chainId": $BASE_CHAIN_ID,
-                    "verifyingContract": "$BASE_CARD_FACTORY"
+                    "verifyingContract": "$vcJson"
                 },
                 "message": {
                     "cardAddress": "$cardAddr",
