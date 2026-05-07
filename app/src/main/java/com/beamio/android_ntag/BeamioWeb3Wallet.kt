@@ -16,7 +16,7 @@ import java.security.SecureRandom
  */
 object BeamioWeb3Wallet {
     /** 必须与 x402sdk chainAddresses.BASE_CARD_FACTORY 一致，否则 EIP-712 digest 不同，服务端 recoverAddress 会得到错误 signer */
-    private const val BASE_CARD_FACTORY = "0x52cc9e977ca3ea33c69383a41f87f32a71140a52"
+    private const val BASE_CARD_FACTORY = "0xba92e9122cdff1e8dd817ee55bce7c7f6c9bfc9b"
     private const val BASE_CHAIN_ID = 8453L
 
     /** secp256k1 curve order; avoids `Keys.createEcKeyPair()` → JCA `ECDSA` + provider `BC` (broken on many Android builds). */
